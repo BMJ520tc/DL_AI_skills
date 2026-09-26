@@ -1,0 +1,46 @@
+"""任务管理 API（模块详细设计 2.1）。"""
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
+from app.services import task_manager
+
+router = APIRouter(prefix="/api/tasks", tags=["tasks"])
+
+
+class TaskCreate(BaseModel):
+    task_type: str
+    project_id: str | None = None
+    params: dict | None = None
+
+
+@router.post("")
+def create_task(body: TaskCreate) -> dict:
+    task_id = task_manager.create_task(body.task_type, body.project_id, body.params)
+    return {"task_id": task_id, "status": "queued"}
+
+
+@router.get("")
+def list_tasks(limit: int = 100, offset: int = 0) -> list[dict]:
+    return task_manager.list_tasks(limit, offset)
+
+
+@router.get("/{task_id}")
+def get_task(task_id: str) -> dict:
+    task = task_manager.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return task
+
+
+@router.post("/{task_id}/cancel")
+def cancel_task(task_id: str) -> dict:
+    if not task_manager.cancel_task(task_id):
+        raise HTTPException(status_code=409, detail="only queued task can be cancelled")
+    return {"status": "cancelled"}
+
+
+@router.post("/{task_id}/retry")
+def retry_task(task_id: str) -> dict:
+    if not task_manager.retry_task(task_id):
+        raise HTTPException(status_code=409, detail="only failed task can be retried")
+    return {"status": "queued"}

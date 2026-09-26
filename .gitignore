@@ -1,0 +1,27 @@
+# 运行时数据（整体不进版本管理，架构六.3）
+data/
+
+# 基底项目（独立 git 仓库，作为上游参考，便于合并上游更新，不纳入主仓库）
+DL-Playground-main/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Node / 前端
+node_modules/
+dist/
+.vite/
+
+# 环境与凭证
+.env
+.env.*
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store

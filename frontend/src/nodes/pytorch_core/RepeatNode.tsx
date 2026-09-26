@@ -1,0 +1,57 @@
+import { type FieldSpec } from "../../node_gen/BaseClass";
+import { estimateElementwiseCost } from "../../utils/computeUtils";
+import { createLayerComponent } from "../../node_gen/CreateNodeComponent.tsx";
+
+type RepeatData = { repeats: string };
+
+function parseRepeats(raw: string): number[] | null {
+    const parts = raw.split(",").map(p => p.trim()).filter(Boolean);
+    if (!parts.length) return null;
+    const nums: number[] = [];
+    for (const p of parts) {
+        const n = Number(p);
+        if (!Number.isInteger(n) || n <= 0) return null;
+        nums.push(n);
+    }
+    return nums;
+}
+
+export class RepeatNode {
+    static label = "Repeat";
+    static paramSchema: Record<string, FieldSpec> = {
+        repeats: { required: true, type: "text", label: "重复次数（逗号分隔）", defaultValue: "1,1" }
+    };
+
+    static shapeVerifier(data: RepeatData, inputShapes: number[][]) {
+        if (inputShapes.length !== 1) return { ok: false as const, error: "Repeat 期望一个输入" };
+        const shape = inputShapes[0];
+        if (!Array.isArray(shape) || !shape.length) return { ok: false as const, error: "输入形状必须已定义" };
+        const reps = parseRepeats(data.repeats || "");
+        if (!reps) return { ok: false as const, error: "重复次数必须是正整数" };
+        if (reps.length !== shape.length) return { ok: false as const, error: "重复次数长度必须与秩一致" };
+        return { ok: true as const };
+    }
+
+    static shapeCompute(data: RepeatData, inputShapes: number[][]) {
+        const shape = inputShapes[0] || [];
+        const reps = parseRepeats(data.repeats || "") || [];
+        return shape.map((dim, idx) => dim * reps[idx]);
+    }
+
+    static estimateCost(_data: RepeatData, _inputShapes: number[][], outputShape: number[]) {
+        return estimateElementwiseCost(outputShape);
+    }
+
+    static getInitCode() {
+        return "# repeat handled in forward";
+    }
+
+    static getForwardCode(data: RepeatData, _name: string, inputs: Array<string>, outputs: Array<string>) {
+        const out = outputs[0] || "x";
+        const inputVar = inputs[0] || "x";
+        const reps = data.repeats || "";
+        return `${out} = ${inputVar}.repeat(${reps})`;
+    }
+
+    static Component = createLayerComponent<RepeatData>(RepeatNode.label, RepeatNode.paramSchema);
+}

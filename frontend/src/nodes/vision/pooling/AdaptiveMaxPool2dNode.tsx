@@ -1,0 +1,51 @@
+import { getParamValue, type FieldSpec } from "../../../node_gen/BaseClass";
+import { estimatePoolCost, toNumber } from "../../../utils/computeUtils";
+import { createLayerComponent } from "../../../node_gen/CreateNodeComponent.tsx";
+
+type AdaptivePoolData = { output_size: number };
+
+export class AdaptiveMaxPool2dNode {
+    static label = "AdaptiveMaxPool2d";
+    static paramSchema: Record<string, FieldSpec> = {
+        output_size: { required: true, type: "number", label: "输出大小", defaultValue: 1, step: 1 }
+    };
+
+    static shapeVerifier(data: AdaptivePoolData, inputShapes: number[][]) {
+        if (inputShapes.length !== 1) return { ok: false as const, error: "AdaptiveMaxPool2d 期望一个输入" };
+        const shape = inputShapes[0];
+        if (shape.length !== 4) return { ok: false as const, error: "输入必须是 [batch, channels, height, width]" };
+        const out = getParamValue(this, data, "output_size") as number;
+        if (!Number.isInteger(out) || out <= 0) return { ok: false as const, error: "输出大小必须是正整数" };
+        return { ok: true as const };
+    }
+
+    static shapeCompute(data: AdaptivePoolData, inputShapes: number[][]) {
+        const [n, c] = inputShapes[0];
+        const out = getParamValue(this, data, "output_size") as number;
+        return [n, c, out, out];
+    }
+
+    static estimateCost(_data: AdaptivePoolData, inputShapes: number[][], outputShape: number[]) {
+        const inputShape = inputShapes[0] || [];
+        const inH = toNumber(inputShape[2], 0);
+        const inW = toNumber(inputShape[3], 0);
+        const outH = toNumber(outputShape[2], 0);
+        const outW = toNumber(outputShape[3], 0);
+        const kernelH = outH ? Math.floor(inH / outH) : 0;
+        const kernelW = outW ? Math.floor(inW / outW) : 0;
+        return estimatePoolCost(outputShape, kernelH * kernelW);
+    }
+
+    static getInitCode(data: AdaptivePoolData, name: string) {
+        const out = getParamValue(AdaptiveMaxPool2dNode.paramSchema, data, "output_size");
+        return `self.${name} = nn.AdaptiveMaxPool2d(${out})`;
+    }
+
+    static getForwardCode(_data: AdaptivePoolData, name: string, inputs: Array<string>, outputs: Array<string>) {
+        const inputVar = inputs[0] || "x";
+        const outputVar = outputs[0] || "x";
+        return `${outputVar} = self.${name}(${inputVar})`;
+    }
+
+    static Component = createLayerComponent<AdaptivePoolData>(AdaptiveMaxPool2dNode.label, AdaptiveMaxPool2dNode.paramSchema);
+}

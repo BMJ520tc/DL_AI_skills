@@ -1,0 +1,77 @@
+import { getParamValue, type FieldSpec } from "../../node_gen/BaseClass";
+import { estimateAttentionCost } from "../../utils/computeUtils";
+import { createLayerComponent } from "../../node_gen/CreateNodeComponent.tsx";
+
+type MhaData = {
+    embed_dim: number;
+    num_heads: number;
+};
+
+export class MultiheadAttentionNode {
+    static label = "MultiheadAttention";
+    static paramSchema: Record<string, FieldSpec> = {
+        embed_dim: { required: true, type: "number", label: "嵌入维度", defaultValue: 128, step: 1 },
+        num_heads: { required: true, type: "number", label: "注意力头数", defaultValue: 8, step: 1 }
+    };
+    static handles = { targets: ["query", "key", "value", "mask"], sources: ["out-0"] };
+
+    static shapeVerifier(data: MhaData, inputShapes: number[][]) {
+        if (inputShapes.length < 1 || inputShapes.length > 4) return { ok: false as const, error: "期望 1-4 个输入 (q[,k,v,mask])" };
+        const q = inputShapes[0];
+        if (q.length !== 3) return { ok: false as const, error: "Query 必须是 [batch, seq, dim]" };
+        const embed = getParamValue(this, data, "embed_dim") as number;
+        const heads = getParamValue(this, data, "num_heads") as number;
+        if (q[2] !== embed) return { ok: false as const, error: `期望 embed_dim ${embed}, got ${q[2]}` };
+        if (heads <= 0 || embed % heads !== 0) return { ok: false as const, error: "embed_dim 必须能被 num_heads 整除" };
+        const kShape = inputShapes[1] || q;
+        const vShape = inputShapes[2] || q;
+        if (JSON.stringify(kShape) !== JSON.stringify(q)) return { ok: false as const, error: "Key 必须与 query 形状匹配" };
+        if (JSON.stringify(vShape) !== JSON.stringify(q)) return { ok: false as const, error: "Value 必须与 query 形状匹配" };
+        const mask = inputShapes[3];
+        if (mask) {
+            if (mask.length === 3) {
+                const [b, t, s] = mask;
+                if (b !== q[0] || t !== q[1] || s !== kShape[1]) return { ok: false as const, error: "掩码必须是 [batch, tgt_seq, src_seq]" };
+            } else if (mask.length === 2) {
+                const [t, s] = mask;
+                if (t !== q[1] || s !== kShape[1]) return { ok: false as const, error: "掩码必须与序列长度匹配" };
+            } else {
+                return { ok: false as const, error: "掩码必须是 2D 或 3D" };
+            }
+        }
+        return { ok: true as const };
+    }
+
+    static shapeCompute(data: MhaData, inputShapes: number[][]) {
+        const [b, t] = inputShapes[0];
+        const embed = getParamValue(this, data, "embed_dim") as number;
+        return [b, t, embed];
+    }
+
+    static estimateCost(data: MhaData, inputShapes: number[][]) {
+        const input = inputShapes[0] || [];
+        const embed = getParamValue(this, data, "embed_dim") as number;
+        const heads = getParamValue(this, data, "num_heads") as number;
+        return estimateAttentionCost(input, embed, heads);
+    }
+
+    static getInitCode(data: MhaData, name: string) {
+        const embed = getParamValue(MultiheadAttentionNode.paramSchema, data, "embed_dim");
+        const heads = getParamValue(MultiheadAttentionNode.paramSchema, data, "num_heads");
+        return `self.${name} = nn.MultiheadAttention(embed_dim=${embed}, num_heads=${heads}, batch_first=True)`;
+    }
+
+    static getForwardCode(_data: MhaData, name: string, inputs: Array<string>, outputs: Array<string>) {
+        const q = inputs[0] || "x";
+        const k = inputs[1] || q;
+        const v = inputs[2] || q;
+        const mask = inputs[3];
+        const out = outputs[0] || "x";
+        const maskArg = mask ? `, attn_mask=${mask}` : "";
+        return `${out}, _ = self.${name}(${q}, ${k}, ${v}${maskArg})`;
+    }
+
+    static Component = createLayerComponent<MhaData>(MultiheadAttentionNode.label, MultiheadAttentionNode.paramSchema, {
+        handles: { targets: ["query", "key", "value", "mask"], sources: ["out-0"] }
+    });
+}

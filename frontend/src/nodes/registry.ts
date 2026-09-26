@@ -1,0 +1,247 @@
+import { type LayerDefinition } from "../node_gen/BaseClass";
+import { LAYER_REGISTRY, registerLayer } from "../utils/layerRegistry";
+import { ModuleListNode } from "./control_flow/ModuleList";
+import { RepeatLayerNode } from "./control_flow/RepeatLayer";
+import { LinearLayerNode } from "./dense/LinearLayer";
+import { InputNode } from "./inputs/InputNode";
+import { BCELossNode } from "./losses/BCELossNode";
+import { CrossEntropyLossNode } from "./losses/CrossEntropyLossNode";
+import { MSELossNode } from "./losses/MSELossNode";
+import { AccuracyNode } from "./metrics/AccuracyNode";
+import { ModuleRefNode } from "./ModuleRefNode";
+import {
+    ELUNode,
+    GELUNode,
+    HardSigmoidNode,
+    HardSwishNode,
+    LeakyReLUNode,
+    ReLUNode,
+    SELUNode,
+    SigmoidNode,
+    SoftplusNode,
+    SoftsignNode,
+    TanhNode,
+} from "./pytorch_core/activations";
+import { AddNode } from "./pytorch_core/AddNode";
+import { ArgMaxNode, ArgMinNode, MaxNode, MinNode, ProdNode } from "./pytorch_core/ArgExtremaNodes";
+import { ClipNode } from "./pytorch_core/ClipNode";
+import { ConcatNode } from "./pytorch_core/ConcatNode";
+import { OnesNode, RandNode, ZerosNode } from "./pytorch_core/ConstantTensorNodes";
+import { makeElementwiseBinary } from "./pytorch_core/ElementwiseBinaryNode";
+import { FlattenNode } from "./pytorch_core/FlattenNode";
+import { PassLayerNode } from "./pytorch_core/Identity";
+import { MatMulNode } from "./pytorch_core/MatMulNode";
+import {
+    BatchNorm2dNode,
+    GroupNormNode,
+    InstanceNorm2dNode,
+    LayerNormNode,
+    RMSNormNode,
+} from "./pytorch_core/NormNodes";
+import { PowNode } from "./pytorch_core/PowNode";
+import { makeReduction } from "./pytorch_core/ReductionNode";
+import { AlphaDropoutNode, DropoutNode, SpatialDropout2dNode, StochasticDepthNode } from "./pytorch_core/RegNodes";
+import { RepeatNode } from "./pytorch_core/RepeatNode";
+import { ReshapeNode } from "./pytorch_core/ReshapeNode";
+import { LogSoftmaxNode, SoftmaxNode } from "./pytorch_core/SoftmaxNode";
+import { TransposeNode } from "./pytorch_core/TransposeNode";
+import { makeUnaryElementwise } from "./pytorch_core/UnaryElementwiseNode";
+import { EmbeddingNode } from "./sequence/EmbeddingNode";
+import { GRUNode } from "./sequence/GRUNode";
+import { LSTMNode } from "./sequence/LSTMNode";
+import { MultiheadAttentionNode } from "./sequence/MultiheadAttentionNode";
+import { PositionalEncodingNode } from "./sequence/PositionalEncodingNode";
+import { RNNNode } from "./sequence/RNNNode";
+import { ResidualBlockNode } from "./vision/blocks/ResidualBlock";
+import { Conv1dNode } from "./vision/conv/Conv1dNode";
+import { Conv2dNode } from "./vision/conv/Conv2dNode";
+import { Conv3dNode } from "./vision/conv/Conv3dNode";
+import { ConvTranspose2dNode } from "./vision/conv/ConvTranspose2dNode";
+import { DepthwiseConv2dNode } from "./vision/conv/DepthwiseConv2dNode";
+import { PointwiseConv2dNode } from "./vision/conv/PointwiseConv2dNode";
+import { UpsampleNode } from "./vision/conv/UpsampleNode";
+import { AdaptiveAvgPool2dNode } from "./vision/pooling/AdaptiveAvgPool2dNode";
+import { AdaptiveMaxPool2dNode } from "./vision/pooling/AdaptiveMaxPool2dNode";
+import { AvgPool1dNode } from "./vision/pooling/AvgPool1dNode";
+import { AvgPool2dNode } from "./vision/pooling/AvgPool2dNode";
+import { AvgPool3dNode } from "./vision/pooling/AvgPool3dNode";
+import { GlobalAvgPool2dNode } from "./vision/pooling/GlobalAvgPool2dNode";
+import { GlobalMaxPool2dNode } from "./vision/pooling/GlobalMaxPool2dNode";
+import { MaxPool1dNode } from "./vision/pooling/MaxPool1dNode";
+import { MaxPool2dNode } from "./vision/pooling/MaxPool2dNode";
+import { MaxPool3dNode } from "./vision/pooling/MaxPool3dNode";
+
+export type NodeGroup = {
+    label: string;
+    nodes: Record<string, any>;
+};
+
+// Node catalog grouped by modality/usage. This keeps the registry modular and
+// mirrors the folder layout so it is easy to extend.
+export const NODE_GROUPS: Record<string, NodeGroup> = {
+    inputs: {
+        label: "输入",
+        nodes: { input_layer: InputNode },
+    },
+    torch_ops: {
+        label: "Torch 运算",
+        nodes: (() => {
+            const SubNode = makeElementwiseBinary("Sub", "-");
+            const MulNode = makeElementwiseBinary("Mul", "*");
+            const DivNode = makeElementwiseBinary("Div", "/");
+            const ExpNode = makeUnaryElementwise("Exp", input => `torch.exp(${input})`);
+            const LogNode = makeUnaryElementwise("Log", input => `torch.log(${input})`);
+            const SqrtNode = makeUnaryElementwise("Sqrt", input => `torch.sqrt(${input})`);
+            const SumNode = makeReduction("Sum", "sum");
+            const MeanNode = makeReduction("Mean", "mean");
+
+            return {
+                add_layer: AddNode,
+                concat_layer: ConcatNode,
+                sub_layer: SubNode,
+                mul_layer: MulNode,
+                div_layer: DivNode,
+                exp_layer: ExpNode,
+                log_layer: LogNode,
+                sqrt_layer: SqrtNode,
+                pow_layer: PowNode,
+                clip_layer: ClipNode,
+                matmul_layer: MatMulNode,
+                sum_layer: SumNode,
+                mean_layer: MeanNode,
+                prod_layer: ProdNode,
+                max_layer: MaxNode,
+                min_layer: MinNode,
+                argmax_layer: ArgMaxNode,
+                argmin_layer: ArgMinNode,
+                repeat_layer: RepeatNode,
+            };
+        })(),
+    },
+    tensor_shape: {
+        label: "张量形状",
+        nodes: {
+            reshape_layer: ReshapeNode,
+            transpose_layer: TransposeNode,
+            flatten_layer: FlattenNode,
+            pass_layer: PassLayerNode,
+        },
+    },
+    tensor_create: {
+        label: "张量创建",
+        nodes: { zeros_layer: ZerosNode, ones_layer: OnesNode, rand_layer: RandNode },
+    },
+    activations: {
+        label: "激活函数",
+        nodes: {
+            relu_layer: ReLUNode,
+            leakyrelu_layer: LeakyReLUNode,
+            gelu_layer: GELUNode,
+            elu_layer: ELUNode,
+            selu_layer: SELUNode,
+            tanh_layer: TanhNode,
+            sigmoid_layer: SigmoidNode,
+            softplus_layer: SoftplusNode,
+            softsign_layer: SoftsignNode,
+            hardswish_layer: HardSwishNode,
+            hardsigmoid_layer: HardSigmoidNode,
+            softmax_layer: SoftmaxNode,
+            logsoftmax_layer: LogSoftmaxNode,
+        },
+    },
+    normalization: {
+        label: "归一化",
+        nodes: {
+            batchnorm2d_layer: BatchNorm2dNode,
+            instancenorm2d_layer: InstanceNorm2dNode,
+            groupnorm_layer: GroupNormNode,
+            layernorm_layer: LayerNormNode,
+            rmsnorm_layer: RMSNormNode,
+        },
+    },
+    regularization: {
+        label: "正则化",
+        nodes: {
+            dropout_layer: DropoutNode,
+            spatialdropout2d_layer: SpatialDropout2dNode,
+            alphadropout_layer: AlphaDropoutNode,
+            stochasticdepth_layer: StochasticDepthNode,
+        },
+    },
+    dense: {
+        label: "线性 / 全连接",
+        nodes: { linear_layer: LinearLayerNode },
+    },
+    vision_conv: {
+        label: "视觉 - 卷积",
+        nodes: {
+            conv1d_layer: Conv1dNode,
+            conv2d_layer: Conv2dNode,
+            conv3d_layer: Conv3dNode,
+            depthwiseconv2d_layer: DepthwiseConv2dNode,
+            pointwiseconv2d_layer: PointwiseConv2dNode,
+            convtranspose2d_layer: ConvTranspose2dNode,
+            upsample_layer: UpsampleNode,
+            residual_block: ResidualBlockNode,
+        },
+    },
+    vision_pool: {
+        label: "视觉 - 池化",
+        nodes: {
+            maxpool1d_layer: MaxPool1dNode,
+            maxpool2d_layer: MaxPool2dNode,
+            maxpool3d_layer: MaxPool3dNode,
+            avgpool1d_layer: AvgPool1dNode,
+            avgpool2d_layer: AvgPool2dNode,
+            avgpool3d_layer: AvgPool3dNode,
+            adaptiveavgpool2d_layer: AdaptiveAvgPool2dNode,
+            adaptivemaxpool2d_layer: AdaptiveMaxPool2dNode,
+            globalavgpool2d_layer: GlobalAvgPool2dNode,
+            globalmaxpool2d_layer: GlobalMaxPool2dNode,
+        },
+    },
+    sequence: {
+        label: "序列 / 注意力",
+        nodes: {
+            embedding_layer: EmbeddingNode,
+            rnn_layer: RNNNode,
+            lstm_layer: LSTMNode,
+            gru_layer: GRUNode,
+            multihead_attention_layer: MultiheadAttentionNode,
+            positional_encoding_layer: PositionalEncodingNode,
+        },
+    },
+    losses: {
+        label: "损失函数",
+        nodes: {
+            mse_loss: MSELossNode,
+            cross_entropy_loss: CrossEntropyLossNode,
+            bce_loss: BCELossNode,
+        },
+    },
+    metrics: {
+        label: "评估指标",
+        nodes: {
+            accuracy_metric: AccuracyNode,
+        },
+    },
+    control: {
+        label: "控制流",
+        nodes: {
+            repeat_layer: RepeatLayerNode,
+            module_list: ModuleListNode,
+        },
+    },
+};
+
+Object.values(NODE_GROUPS).forEach(group => {
+    Object.entries(group.nodes).forEach(([key, Class]) => {
+        registerLayer(key, Class as LayerDefinition<any>);
+    });
+});
+
+// 2. Register Special Nodes (like ModuleRef)
+registerLayer("module_ref", ModuleRefNode);
+
+// 3. Re-export the populated registry for convenience
+export { LAYER_REGISTRY };
