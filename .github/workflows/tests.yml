@@ -1,0 +1,50 @@
+name: tests
+
+# 收口任务 F2：把已本地验证过的两条命令序列固化为 CI（GB-6「无自动化测试与 CI」）。
+# 注意：workflow 本身尚未在 GitHub Runner 上跑过；其中每条命令均已在本地实测通过
+# （backend 50 项用例、canvas 导出 + py_compile），详见 docs/阶段验收记录.md 七。
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  backend:
+    name: backend tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+      - name: Run test suite
+        run: python scripts/run_tests.py
+
+  canvas-export:
+    name: canvas export -> python compiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+      - name: Export canvas graph to PyTorch code
+        working-directory: frontend
+        run: |
+          npx esbuild scripts/gb1_export_harness.ts --bundle --platform=node \
+            --format=cjs --outfile=/tmp/gb1_harness.cjs --log-level=warning
+          node /tmp/gb1_harness.cjs --out /tmp/exported_model.py
+          node /tmp/gb1_harness.cjs --out /tmp/exported_nolabel.py --no-labels
+      - name: Verify exported code compiles
+        run: python -m py_compile /tmp/exported_model.py /tmp/exported_nolabel.py

@@ -179,9 +179,15 @@ export function compileGraphToScript(
     });
 
     const getVarName = (base: string) => sanitizeIdent(`${variablePrefix}${base}`);
-    const edgeLabel = (edge: Edge, fallback: string) => {
-        const base = (edge.data as any)?.label || fallback;
-        return getVarName(base);
+    // 边的变量名：优先用画布写入的 label（onConnect 固定写 `out_<source>[_<handle>]`）；
+    // 没有 label 的边（导入的图 / 历史数据 / 结构化项目）退回按边 id 生成稳定唯一名——
+    // 若像原先那样按「消费侧/生产侧各自的下标」兜底，同一根边两侧会得到不同名字，
+    // 导出的 forward 会引用未定义变量、代码不可编译（GB-1 验证暴露）。
+    const edgeVarName = (edge: Edge): string => {
+        const label = (edge.data as any)?.label;
+        if (label) return getVarName(label);
+        const stable = edge.id ? sanitizeIdent(`edge_${edge.id}`) : getVarName("edge");
+        return sanitizeIdent(`${variablePrefix}${stable}`);
     };
 
     const seedLines: { text: string; span?: Omit<CodeSpan, "line"> }[] = [];
@@ -191,8 +197,8 @@ export function compileGraphToScript(
             const parentIsPresent = n.parentId && nodes.some(p => p.id === n.parentId);
             if (parentIsPresent) return;
             const outs = outgoingEdges[n.id] ?? [];
-            outs.forEach((e, idx) => {
-                const name = edgeLabel(e, `in_${n.id}_${idx}`);
+            outs.forEach(e => {
+                const name = edgeVarName(e);
                 seedLines.push({
                     text: `        ${name} = x  # input passthrough`,
                     span: { kind: "forward", nodeId: n.id, edgeIds: [e.id] },
@@ -232,7 +238,7 @@ export function compileGraphToScript(
         if (shouldGenerateForward) {
             const inEdges = incomingEdges[node.id];
             const inputNames =
-                inEdges.length === 0 ? ["x"] : inEdges.map((e, idx) => edgeLabel(e, `in_${e.source || idx}`));
+                inEdges.length === 0 ? ["x"] : inEdges.map(e => edgeVarName(e));
 
             const outEdges = outgoingEdges[node.id];
             const handlesSpec =
@@ -241,14 +247,11 @@ export function compileGraphToScript(
             const outputNames = (sourceHandles || []).length
                 ? sourceHandles.map((handleId, idx) => {
                       const matching = outEdges.find(e => e.sourceHandle === handleId);
-                      const base = matching
-                          ? edgeLabel(matching, `out_${node.id}_${handleId}`)
-                          : `out_${node.id}_${idx}`;
-                      return sanitizeIdent(base);
+                      return matching ? edgeVarName(matching) : sanitizeIdent(`out_${node.id}_${handleId ?? idx}`);
                   })
                 : outEdges.length === 0
                   ? [sanitizeIdent(`out_${node.id}`)]
-                  : outEdges.map((e, idx) => edgeLabel(e, `out_${node.id}_${idx}`));
+                  : outEdges.map(e => edgeVarName(e));
             nodeOutputMap[node.id] = outputNames;
             const forward_line = ClassRef.getForwardCode(node.data, layerName, inputNames, outputNames);
 
