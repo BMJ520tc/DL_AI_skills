@@ -30,6 +30,10 @@ TASK_TIMEOUTS: dict[str, float] = {
     "baseline": 3600,
     "align": 1800,
     "compare": 900,
+    "pdf_parse": 1800,
+    "extract_items": 1800,
+    "reproduce": 7200,
+    "conclusion": 900,
 }
 
 

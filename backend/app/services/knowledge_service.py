@@ -17,6 +17,10 @@ _TABLE_PK = {
     "knowledge": ("knowledge", "knowledge_id"),
     "dataset": ("dataset_registry", "dataset_id"),
     "module": ("module", "module_id"),
+    # 论文数据子表（数据设计四.3）：随所属 paper 存取，便于通用知识库 API 检索
+    "experiment_item": ("experiment_item", "item_id"),
+    "reproduction_result": ("reproduction_result", "result_id"),
+    "credibility_conclusion": ("credibility_conclusion", "conclusion_id"),
 }
 
 
@@ -170,6 +174,273 @@ def record_paper(paper: dict) -> str:
     finally:
         conn.close()
     return paper_id
+
+
+def update_paper(paper_id: str, **fields) -> bool:
+    """更新论文记录（模块二 4.1~4.4 推进 status，写 markdown_path/section_index）。
+
+    允许更新的列限定在 paper 表内，避免调用方拼出非法列名。
+    status 变化同步统一索引摘要（title/summary 未变，仅更新时间戳即可）。
+    """
+    allowed = {"title", "authors", "abstract", "source", "url", "published_date",
+               "license", "pdf_path", "markdown_path", "section_index", "status"}
+    sets, args = [], []
+    for key, val in fields.items():
+        if key not in allowed:
+            raise ValueError(f"paper 不支持的字段: {key}")
+        col = key
+        if key in ("authors", "section_index") and val is not None:
+            val = json.dumps(val, ensure_ascii=False)
+        sets.append(f"{col} = ?")
+        args.append(val)
+    if not sets:
+        return False
+    sets.append("updated_at = ?")
+    args.extend([_now(), paper_id])
+
+    conn = get_connection()
+    try:
+        cur = conn.execute(f"UPDATE paper SET {', '.join(sets)} WHERE paper_id = ?", args)
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def record_experiment_items(paper_id: str, items: list[dict]) -> list[str]:
+    """写入实验条目（模块二 4.2）：先清掉该论文的旧条目再重建，保证重抽取幂等。
+
+    条目不对应 unified_index 独立数据类型（数据设计三.1 枚举为 paper/run/knowledge/
+    module/dataset），其检索随所属 paper 条目进行。
+    """
+    now = _now()
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM experiment_item WHERE paper_id = ?", (paper_id,))
+        item_ids = []
+        for it in items:
+            item_id = it.get("item_id") or uuid.uuid4().hex
+            conn.execute(
+                """
+                INSERT INTO experiment_item(item_id, paper_id, section_ref, dataset_name,
+                    split_method, metric_name, metric_value_reported, metric_unit,
+                    hyperparams, baselines, status, schema_version)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '1.0')
+                """,
+                (
+                    item_id,
+                    paper_id,
+                    it.get("section_ref"),
+                    it.get("dataset_name"),
+                    it.get("split_method"),
+                    it.get("metric_name"),
+                    _as_text(it.get("metric_value_reported")),
+                    it.get("metric_unit"),
+                    json.dumps(it.get("hyperparams"), ensure_ascii=False) if it.get("hyperparams") else None,
+                    json.dumps(it.get("baselines"), ensure_ascii=False) if it.get("baselines") else None,
+                    it.get("status", "extracted"),
+                ),
+            )
+            item_ids.append(item_id)
+        conn.commit()
+    finally:
+        conn.close()
+    return item_ids
+
+
+def _as_text(value) -> Optional[str]:
+    """报告值可能是数字/字符串/对象，统一存文本（schema 列为 TEXT）。"""
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return str(value)
+    return json.dumps(value, ensure_ascii=False)
+
+
+def list_experiment_items(paper_id: str) -> list[dict]:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM experiment_item WHERE paper_id = ? ORDER BY rowid", (paper_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_experiment_item(item_id: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM experiment_item WHERE item_id = ?", (item_id,)).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+def update_experiment_item(item_id: str, **fields) -> bool:
+    """用户编辑实验条目（模块二 4.2：用户在界面确认或修改后条目生效）。"""
+    allowed = {"section_ref", "dataset_name", "split_method", "metric_name",
+               "metric_value_reported", "metric_unit", "hyperparams", "baselines", "status"}
+    sets, args = [], []
+    for key, val in fields.items():
+        if key not in allowed:
+            raise ValueError(f"experiment_item 不支持的字段: {key}")
+        if key in ("hyperparams", "baselines") and val is not None:
+            val = json.dumps(val, ensure_ascii=False)
+        if key == "metric_value_reported" and val is not None:
+            val = _as_text(val)
+        sets.append(f"{key} = ?")
+        args.append(val)
+    if not sets:
+        return False
+    args.append(item_id)
+    conn = get_connection()
+    try:
+        cur = conn.execute(f"UPDATE experiment_item SET {', '.join(sets)} WHERE item_id = ?", args)
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def confirm_experiment_item(item_id: str) -> bool:
+    """实验条目确认：extracted → confirmed（模块详细设计 4.2「确认后条目生效」）。"""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "UPDATE experiment_item SET status = 'confirmed' WHERE item_id = ? AND status = 'extracted'",
+            (item_id,),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def record_reproduction_result(result: dict) -> str:
+    """写入复现对照记录（模块二 4.3/4.4，数据设计四.3）。"""
+    result_id = result.get("result_id") or uuid.uuid4().hex
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO reproduction_result(result_id, item_id, run_id, metric_value_actual,
+                deviation, passed_threshold, verdict, evidence_path, schema_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, '1.0')
+            """,
+            (
+                result_id,
+                result["item_id"],
+                result.get("run_id"),
+                _as_text(result.get("metric_value_actual")),
+                result.get("deviation"),
+                result.get("passed_threshold"),
+                result.get("verdict"),
+                result.get("evidence_path"),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return result_id
+
+
+def update_reproduction_result(result_id: str, **fields) -> bool:
+    """4.4 逐条对照写回 deviation/passed_threshold/verdict。"""
+    allowed = {"run_id", "metric_value_actual", "deviation", "passed_threshold", "verdict", "evidence_path"}
+    sets, args = [], []
+    for key, val in fields.items():
+        if key not in allowed:
+            raise ValueError(f"reproduction_result 不支持的字段: {key}")
+        if key == "metric_value_actual" and val is not None:
+            val = _as_text(val)
+        sets.append(f"{key} = ?")
+        args.append(val)
+    if not sets:
+        return False
+    args.append(result_id)
+    conn = get_connection()
+    try:
+        cur = conn.execute(f"UPDATE reproduction_result SET {', '.join(sets)} WHERE result_id = ?", args)
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def clear_reproduction_results(paper_id: str) -> int:
+    """清除某论文的全部复现对照记录（重跑复现前调用，避免旧记录使结论重复计入）。"""
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "DELETE FROM reproduction_result WHERE item_id IN "
+            "(SELECT item_id FROM experiment_item WHERE paper_id = ?)",
+            (paper_id,),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def list_reproduction_results(paper_id: str) -> list[dict]:
+    """列出某论文各条目的复现对照（join experiment_item 带出报告值口径）。"""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT r.*, i.metric_name, i.metric_value_reported, i.metric_unit,
+                   i.dataset_name, i.section_ref
+            FROM reproduction_result r
+            JOIN experiment_item i ON i.item_id = r.item_id
+            WHERE i.paper_id = ?
+            ORDER BY i.rowid
+            """,
+            (paper_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def record_credibility_conclusion(paper_id: str, conclusion: dict) -> str:
+    """写入可信度结论（模块二 4.4）：同论文重算则先删旧结论，保持一论文一结论。"""
+    conclusion_id = conclusion.get("conclusion_id") or uuid.uuid4().hex
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM credibility_conclusion WHERE paper_id = ?", (paper_id,))
+        conn.execute(
+            """
+            INSERT INTO credibility_conclusion(conclusion_id, paper_id, overall_verdict,
+                summary, item_results, created_at, schema_version)
+            VALUES (?, ?, ?, ?, ?, ?, '1.0')
+            """,
+            (
+                conclusion_id,
+                paper_id,
+                conclusion.get("overall_verdict"),
+                conclusion.get("summary"),
+                json.dumps(conclusion.get("item_results"), ensure_ascii=False)
+                if conclusion.get("item_results") is not None else None,
+                _now(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return conclusion_id
+
+
+def get_credibility_conclusion(paper_id: str) -> Optional[dict]:
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM credibility_conclusion WHERE paper_id = ? ORDER BY created_at DESC LIMIT 1",
+            (paper_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
 
 
 def register_dataset(ds: dict) -> str:
@@ -327,7 +598,8 @@ def list_items(data_type: str, limit: int = 100, offset: int = 0) -> list[dict]:
     table, _ = table_pk
     conn = get_connection()
     try:
-        rows = conn.execute(f"SELECT * FROM {table} ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+        # experiment_item/reproduction_result 无 created_at，统一按插入顺序倒序
+        rows = conn.execute(f"SELECT * FROM {table} ORDER BY rowid DESC LIMIT ? OFFSET ?", (limit, offset)).fetchall()
     finally:
         conn.close()
     return [dict(r) for r in rows]
