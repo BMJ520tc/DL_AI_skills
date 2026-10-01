@@ -25,6 +25,11 @@ TASK_TIMEOUTS: dict[str, float] = {
     "agent_task": 900,
     "verify": 600,
     "analyze": 600,
+    "extract_addresses": 1800,
+    "preprocess": 1800,
+    "baseline": 3600,
+    "align": 1800,
+    "compare": 900,
 }
 
 

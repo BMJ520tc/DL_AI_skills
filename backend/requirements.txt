@@ -3,3 +3,7 @@ uvicorn[standard]>=0.29
 pydantic>=2.6
 claude-agent-sdk==0.2.160
 docker
+pandas
+numpy
+Pillow
+openpyxl

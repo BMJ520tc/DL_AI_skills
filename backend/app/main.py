@@ -9,8 +9,11 @@ from fastapi import FastAPI
 
 from app.config import CLAUDE_CLI_PATH, ensure_data_dirs
 from app.db.connection import init_db
-from app.services import task_manager, agent_service, env_manager, analysis_service
-from app.api import tasks, projects, knowledge, agents, environments, search, analysis
+from app.services import (
+    task_manager, agent_service, env_manager, analysis_service,
+    preprocess_service, baseline_service, dataset_service, compare_service, download_service,
+)
+from app.api import tasks, projects, knowledge, agents, environments, search, analysis, preprocess, datasets
 
 
 @asynccontextmanager
@@ -19,8 +22,13 @@ async def lifespan(app: FastAPI):
     init_db()
     _validate_claude()
     agent_service.register()
+    download_service.register()
     env_manager.register()
     analysis_service.register()
+    preprocess_service.register()
+    baseline_service.register()
+    dataset_service.register()
+    compare_service.register()
     await task_manager.start()
     yield
     await task_manager.stop()
@@ -49,6 +57,8 @@ app.include_router(agents.router)
 app.include_router(environments.router)
 app.include_router(search.router)
 app.include_router(analysis.router)
+app.include_router(preprocess.router)
+app.include_router(datasets.router)
 
 
 @app.get("/api/health")

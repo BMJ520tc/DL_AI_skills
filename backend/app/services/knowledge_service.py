@@ -216,6 +216,57 @@ def register_dataset(ds: dict) -> str:
     return dataset_id
 
 
+def update_alignment(
+    dataset_id: str,
+    alignment: dict,
+    *,
+    fields: Optional[list] = None,
+    labels: Optional[list] = None,
+) -> bool:
+    """更新数据集的字段映射/序列长度/标签归并（模块详细设计 5.1、5.3）。
+
+    alignment 不参与检索，故不动 unified_index。返回是否命中记录。
+    """
+    sets = ["alignment = ?", "updated_at = ?"]
+    args: list = [json.dumps(alignment or {}, ensure_ascii=False), _now()]
+    if fields is not None:
+        sets.append("fields = ?")
+        args.append(json.dumps(fields, ensure_ascii=False))
+    if labels is not None:
+        sets.append("labels = ?")
+        args.append(json.dumps(labels, ensure_ascii=False))
+    args.append(dataset_id)
+
+    conn = get_connection()
+    try:
+        cur = conn.execute(f"UPDATE dataset_registry SET {', '.join(sets)} WHERE dataset_id = ?", args)
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def upsert_dataset(ds: dict) -> str:
+    """登记数据集：按 name+local_path 命中则更新（含 alignment），否则新建（数据设计八.2）。"""
+    name, local_path = ds.get("name"), ds.get("local_path")
+    if name and local_path:
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT dataset_id FROM dataset_registry WHERE name = ? AND local_path = ?",
+                (name, local_path),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is not None:
+            update_alignment(
+                row["dataset_id"], ds.get("alignment") or {},
+                fields=ds.get("fields"), labels=ds.get("labels"),
+            )
+            return row["dataset_id"]
+    return register_dataset(ds)
+
+
 def search(
     types: Optional[list[str]] = None,
     task_type: Optional[str] = None,
@@ -280,6 +331,67 @@ def list_items(data_type: str, limit: int = 100, offset: int = 0) -> list[dict]:
     finally:
         conn.close()
     return [dict(r) for r in rows]
+
+
+def find_datasets(
+    local_path_prefix: Optional[str] = None,
+    task_type: Optional[str] = None,
+    format: Optional[str] = None,
+    exclude_id: Optional[str] = None,
+    limit: int = 50,
+) -> list[dict]:
+    """按路径前缀/任务类型/格式列出数据集（模块三 5.3 检索与自带数据定位）。"""
+    sql = "SELECT * FROM dataset_registry WHERE 1=1"
+    args: list = []
+    if local_path_prefix:
+        sql += " AND local_path LIKE ?"
+        args.append(local_path_prefix.replace("%", "") + "%")
+    if task_type:
+        sql += " AND task_type = ?"
+        args.append(task_type)
+    if format:
+        sql += " AND format = ?"
+        args.append(format)
+    if exclude_id:
+        sql += " AND dataset_id != ?"
+        args.append(exclude_id)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    args.append(limit)
+
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, args).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def list_runs(project_id: str, run_type: str, status: str = "success", limit: int = 50) -> list[dict]:
+    """列出某项目指定类型的全部运行记录（模块三 5.5 取基准与跨数据集评估结果）。"""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM run_record WHERE project_id = ? AND run_type = ? AND status = ? "
+            "ORDER BY started_at DESC LIMIT ?",
+            (project_id, run_type, status, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_latest_run(project_id: str, run_type: str, status: str = "success") -> Optional[dict]:
+    """取某项目最近一次指定类型的运行记录（模块三 5.2/5.4 取基准与评估结果）。"""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM run_record WHERE project_id = ? AND run_type = ? AND status = ? "
+            "ORDER BY started_at DESC LIMIT 1",
+            (project_id, run_type, status),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
 
 
 def record_knowledge(k: dict) -> str:

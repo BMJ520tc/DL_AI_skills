@@ -3,8 +3,10 @@
 论文检索（arXiv）、仓库与数据集地址抽取（agent）、克隆与下载。
 PubMed/bioRxiv 检索为后续接入点，阶段1 仅实现 arXiv。
 """
+import asyncio
 import http.client
 import json
+import re
 import subprocess
 import time
 import urllib.parse
@@ -12,8 +14,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional
 
-from app.config import PAPERS_DIR
-from app.services import agent_service, knowledge_service
+from app.config import DATASETS_DIR, PAPERS_DIR
+from app.services import agent_service, knowledge_service, task_manager
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 _ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
@@ -107,13 +109,104 @@ def clone_repo(repo_url: str, target_dir: Path) -> None:
     subprocess.run(["git", "clone", "--depth", "1", repo_url, str(target_dir)], check=True, capture_output=True)
 
 
+EXTRACT_TASK_TYPE = "extract_addresses"
+
+# 数据集地址 → (来源, 源内 id)，用于下载与登记
+_DATASET_URL_PATTERNS = (
+    (re.compile(r"zenodo\.org/(?:records?|record)/(\d+)"), "zenodo"),
+    (re.compile(r"figshare\.com/articles/(?:[^/]+/)*(\d+)"), "figshare"),
+    (re.compile(r"kaggle\.com/datasets/([\w.-]+/[\w.-]+)"), "kaggle"),
+)
+
+
 def extract_addresses(paper_text: str, cwd: Optional[str] = None) -> str:
+    """触发地址抽取任务：抽出仓库与数据集地址，并对数据集下载登记（3.2 步骤 3）。"""
+    return task_manager.create_task(
+        EXTRACT_TASK_TYPE, params={"paper_text": paper_text, "cwd": cwd}
+    )
+
+
+def _as_url(value) -> str:
+    """把 agent 输出的一项规整成 URL 字符串。
+
+    结构化输出经 result.json 兜底、不经 schema 校验，条目可能是
+    `{"url": ...}` 这类对象而非纯字符串，这里做容错取值。
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("url", "link", "href", "address", "dataset"):
+            inner = value.get(key)
+            if isinstance(inner, str) and inner:
+                return inner
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _parse_dataset_url(raw) -> Optional[tuple[str, str]]:
+    url = _as_url(raw)
+    for pattern, source in _DATASET_URL_PATTERNS:
+        m = pattern.search(url)
+        if m:
+            return source, m.group(1)
+    return None
+
+
+def _register_extracted(datasets: list) -> tuple[list[dict], list[dict]]:
+    """下载并登记抽出的数据集；失效地址只记录、不阻断（3.2 异常与边界）。
+
+    只有下载成功的数据集才登记——登记表里放不可用的条目会污染模块三的检索与对齐。
+    """
+    registered: list[dict] = []
+    failed: list[dict] = []
+    for raw in datasets:
+        url = _as_url(raw)
+        parsed = _parse_dataset_url(url)
+        if parsed is None:
+            failed.append({"url": url, "reason": "无法识别的数据集地址（支持 zenodo/figshare/kaggle）"})
+            continue
+        source, source_id = parsed
+        dest = DATASETS_DIR / f"{source}_{source_id}"
+        try:
+            files = download_dataset(source, source_id, dest)
+        except Exception as e:  # noqa: BLE001 —— 单个地址失败不影响其余
+            failed.append({"url": url, "reason": str(e)})
+            continue
+        dataset_id = knowledge_service.register_dataset({
+            "name": f"{source}:{source_id}",
+            "url": url,
+            "source": source,
+            "task_type": None,
+            "format": None,
+            "fields": None,
+            "labels": None,
+            "alignment": None,
+            "local_path": str(dest),
+        })
+        registered.append({"url": url, "dataset_id": dataset_id, "n_files": len(files)})
+    return registered, failed
+
+
+async def _run_extract(params: dict, task_id: str) -> None:
     prompt = (
         "请从以下论文内容中抽取代码仓库地址（GitHub/GitLab）和数据集地址（Zenodo/Figshare/Kaggle）。\n\n"
-        f"{paper_text[:8000]}\n\n"
+        f"{params.get('paper_text', '')[:8000]}\n\n"
         "只输出真实出现的 URL，不要臆造不存在的地址。"
     )
-    return agent_service.submit(prompt, cwd=cwd, output_schema=ADDRESS_SCHEMA, max_turns=15)
+    result = await agent_service.run_sync(
+        prompt, cwd=params.get("cwd"), output_schema=ADDRESS_SCHEMA, max_turns=15
+    )
+    data = result.get("structured_output") or {}
+    repositories = [_as_url(item) for item in (data.get("repositories") or [])]
+    registered, failed = await asyncio.to_thread(_register_extracted, data.get("datasets") or [])
+
+    # 仓库地址只列出（多仓库论文由用户选择主仓库，3.2 异常与边界）；
+    # 克隆由 3.3 任意项目加载在用户指定 source 后执行。
+    task_manager.update_progress(task_id, {
+        "repositories": repositories,
+        "datasets_registered": registered,
+        "datasets_failed": failed,
+    })
 
 
 def search_pubmed(query: str, max_results: int = 10) -> list[dict]:
@@ -220,3 +313,7 @@ def download_dataset(source: str, source_id: str, dest: Path) -> list[Path]:
     if source == "kaggle":
         raise RuntimeError("Kaggle 数据集下载需配置 API key，暂未实现")
     raise ValueError(f"不支持的数据集来源: {source}（zenodo/figshare/kaggle）")
+
+
+def register() -> None:
+    task_manager.register_handler(EXTRACT_TASK_TYPE, _run_extract)
