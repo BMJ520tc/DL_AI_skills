@@ -26,13 +26,16 @@ def _parse(path: Path):
 
 
 def _is_module_class(node: ast.ClassDef) -> bool:
+    """识别 nn.Module 子类，兼容 nn.Module / torch.nn.Module / t.nn.Module /
+    from torch.nn import Module 后的裸 Module。"""
     for base in node.bases:
-        if (
-            isinstance(base, ast.Attribute)
-            and base.attr == "Module"
-            and isinstance(base.value, ast.Name)
-            and base.value.id == "nn"
-        ):
+        if isinstance(base, ast.Attribute) and base.attr == "Module":
+            v = base.value
+            if isinstance(v, ast.Name) and v.id == "nn":
+                return True
+            if isinstance(v, ast.Attribute) and v.attr == "nn":
+                return True
+        if isinstance(base, ast.Name) and base.id == "Module":
             return True
     return False
 

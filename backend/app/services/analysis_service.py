@@ -8,6 +8,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -94,7 +95,8 @@ def get_report(project_id: str) -> Optional[dict]:
     return json.loads(report_path.read_text(encoding="utf-8"))
 
 
-def _project_python(ws: Path) -> str:
+def _project_python(ws: Path) -> Optional[str]:
+    """项目独立环境的解释器；环境未就绪返回 None（不退回宿主解释器，见 2.3 独立环境）。"""
     for candidate in (
         ws / "env" / "Scripts" / "python.exe",  # Windows venv
         ws / "env" / "python.exe",              # conda 环境（Windows）
@@ -102,7 +104,7 @@ def _project_python(ws: Path) -> str:
     ):
         if candidate.exists():
             return str(candidate)
-    return sys.executable
+    return None
 
 
 CMD_SCHEMA = {
@@ -112,15 +114,23 @@ CMD_SCHEMA = {
 }
 
 
-def _locate_command(source: Path) -> Optional[list[str]]:
-    """3.5 候选命令定位，优先级：README → 脚本目录 → setup.py console_scripts。"""
-    cmd = _extract_from_readme(source)
-    if cmd:
-        return cmd
-    for name in ("train.py", "main.py", "run.py"):
+ENTRY_SCRIPTS = ("train.py", "main.py", "run.py")
+
+
+def _candidate_commands(source: Path) -> list[list[str]]:
+    """3.5 候选命令列表，按优先级：README → 脚本目录；脚本目录先试 --help
+    （快速验证环境/导入可用），再直接运行。全部失败则交 agent 构造（见 _run_verify）。"""
+    cands: list[list[str]] = []
+    readme = _extract_from_readme(source)
+    if readme:
+        cands.append(readme)
+    for name in ENTRY_SCRIPTS:
         if (source / name).exists():
-            return [name]
-    return None
+            cands.append([name, "--help"])
+    for name in ENTRY_SCRIPTS:
+        if (source / name).exists() and [name] not in cands:
+            cands.append([name])
+    return cands
 
 
 def _extract_from_readme(source: Path) -> Optional[list[str]]:
@@ -129,12 +139,13 @@ def _extract_from_readme(source: Path) -> Optional[list[str]]:
         if not p.exists():
             continue
         text = p.read_text(encoding="utf-8", errors="ignore")
-        m = re.search(r"(?:python|python3)\s+(-m\s+[\w.]+)", text)
-        if m:
-            return ["-m", m.group(1)]
-        m = re.search(r"(?:python|python3)\s+([\w./-]+\.py(?:\s+[^\n\r`]*)?)", text)
+        # 只取同一行内的脚本 token，避免 \s 跨行吞入后续 markdown 文本
+        m = re.search(r"(?:python|python3)[ \t]+(-m[ \t]+[\w.]+)", text)
         if m:
             return m.group(1).split()
+        m = re.search(r"(?:python|python3)[ \t]+([\w./-]+\.py)", text)
+        if m:
+            return [m.group(1)]
     return None
 
 
@@ -148,45 +159,136 @@ async def _agent_construct_command(source: Path) -> Optional[list[str]]:
     return cmd.split() if cmd else None
 
 
-async def _run_verify(params: dict, task_id: str) -> None:
-    project_id = params["project_id"]
-    project = project_manager.get_project(project_id)
-    ws = Path(project["workspace_path"])
-    source = ws / "source"
+GRACE_S = 60  # 启动判定宽限期（秒）：训练型项目启动满该时长且无导入/环境错误即判通过
 
-    cmd = _locate_command(source)
-    if cmd is None:
-        cmd = await _agent_construct_command(source)
-    if cmd is None:
-        knowledge_service.record_run(
-            {"project_id": project_id, "task_id": task_id, "run_type": "smoke_run",
-             "command": None, "status": "failed", "error": "无法定位最小可运行命令"}
-        )
-        raise RuntimeError("无法定位最小可运行命令")
+_ENV_ERROR_PATTERNS = (
+    "ModuleNotFoundError",
+    "ImportError",
+    "No module named",
+    "is not recognized",   # Windows 命令未找到
+    "command not found",
+)
 
-    python = _project_python(ws)
+
+def _detect_env_error(text: str) -> Optional[str]:
+    for pat in _ENV_ERROR_PATTERNS:
+        if pat in text:
+            return pat
+    return None
+
+
+def _run_with_grace(full_cmd: list[str], cwd: str, grace_s: int) -> dict:
+    """运行命令并在宽限期内判定通过与否（3.5「跑通判定随项目类型」）。
+
+    - 宽限期内退出且退出码 0 → 通过（快速脚本走此路径）；
+    - 宽限期内退出且非 0 → 失败（附输出尾部）；
+    - 宽限期满仍在运行且无导入/环境错误 → 视为「启动成功」，终止进程后判通过（训练型项目）；
+    - 宽限期满仍在运行但输出含导入/环境错误 → 失败。
+    """
+    proc = subprocess.Popen(
+        full_cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="ignore"
+    )
+    buf: list[str] = []
+
+    def _reader() -> None:
+        try:
+            for line in proc.stdout:
+                buf.append(line)
+        except (ValueError, OSError):
+            pass
+
+    th = threading.Thread(target=_reader, daemon=True)
+    th.start()
+    try:
+        proc.wait(timeout=grace_s)
+        th.join(timeout=5)
+        out = "".join(buf)
+        ok = proc.returncode == 0
+        return {"ok": ok, "error": None if ok else (out[-2000:] or f"退出码 {proc.returncode}"),
+                "mode": "exited"}
+    except subprocess.TimeoutExpired:
+        th.join(timeout=2)
+        out = "".join(buf)
+        env_err = _detect_env_error(out)
+        proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        if env_err:
+            return {"ok": False, "error": f"启动即报错({env_err}):\n{out[-1500:]}", "mode": "startup_error"}
+        return {"ok": True, "error": None, "mode": "started"}
+
+
+async def _try_command(python: str, cmd: list[str], source: Path, grace_s: int = GRACE_S) -> dict:
+    """运行一条候选命令，返回 {ok, error, mode, command, started_at, finished_at}。"""
     full_cmd = [python, *cmd]
     started = _now()
-    proc = await asyncio.to_thread(
-        subprocess.run, full_cmd, capture_output=True, text=True, timeout=300, cwd=str(source)
-    )
-    ok = proc.returncode == 0
-    error = None if ok else (proc.stderr or proc.stdout)[-2000:]
+    try:
+        result = await asyncio.to_thread(_run_with_grace, full_cmd, str(source), grace_s)
+    except Exception as e:  # noqa: BLE001
+        result = {"ok": False, "error": str(e), "mode": "exception"}
+    result["command"] = " ".join(full_cmd)
+    result["started_at"] = started
+    result["finished_at"] = _now()
+    return result
 
+
+def _record_smoke(project_id: str, task_id: str, result: dict) -> None:
     knowledge_service.record_run(
         {
             "project_id": project_id,
             "task_id": task_id,
             "run_type": "smoke_run",
-            "command": " ".join(full_cmd),
-            "status": "success" if ok else "failed",
-            "error": error,
-            "started_at": started,
-            "finished_at": _now(),
+            "command": result.get("command"),
+            "params": {"mode": result.get("mode")} if result.get("mode") else None,
+            "status": "success" if result.get("ok") else "failed",
+            "error": result.get("error"),
+            "started_at": result.get("started_at"),
+            "finished_at": result.get("finished_at"),
         }
     )
-    if not ok:
-        raise RuntimeError(f"最小命令运行失败: {error}")
+
+
+async def _run_verify(params: dict, task_id: str) -> None:
+    project_id = params["project_id"]
+    project = project_manager.get_project(project_id)
+    ws = Path(project["workspace_path"])
+    source = ws / "source"
+    python = _project_python(ws)
+    if python is None:
+        _record_smoke(
+            project_id, task_id,
+            {"command": None, "ok": False,
+             "error": "项目环境未就绪：未找到独立环境解释器（env 未创建成功）",
+             "started_at": _now(), "finished_at": _now()},
+        )
+        raise RuntimeError("项目环境未就绪，无法在独立环境运行最小命令")
+
+    last_error: Optional[str] = None
+    for cmd in _candidate_commands(source):
+        result = await _try_command(python, cmd, source)
+        _record_smoke(project_id, task_id, result)
+        if result["ok"]:
+            return
+        last_error = result["error"]
+
+    # 全部候选失败 → agent 构造命令（3.5）
+    agent_cmd = await _agent_construct_command(source)
+    if agent_cmd:
+        result = await _try_command(python, agent_cmd, source)
+        _record_smoke(project_id, task_id, result)
+        if result["ok"]:
+            return
+        last_error = result["error"]
+
+    _record_smoke(
+        project_id, task_id,
+        {"command": None, "ok": False,
+         "error": f"全部候选命令失败: {last_error}" if last_error else "无法定位最小可运行命令",
+         "started_at": _now(), "finished_at": _now()},
+    )
+    raise RuntimeError(f"最小命令运行失败: {last_error or '无法定位最小可运行命令'}")
 
 
 async def _run_analyze(params: dict, task_id: str) -> None:

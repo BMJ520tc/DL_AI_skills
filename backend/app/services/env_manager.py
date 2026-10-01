@@ -68,14 +68,33 @@ async def _run_env_create(params: dict, task_id: str) -> None:
         raise RuntimeError("项目带 Dockerfile，需容器环境；本机未安装 docker，暂不支持")
 
     env_dir = ws / "env"
+    created_at = _now()
     if env_type == "conda":
-        await _create_conda_env(source, env_dir)
+        cmd = _conda_create_cmd(source, env_dir)
     else:
-        await asyncio.to_thread(
-            subprocess.run, [sys.executable, "-m", "venv", str(env_dir)], check=True, capture_output=True
+        cmd = [sys.executable, "-m", "venv", str(env_dir)]
+    try:
+        await asyncio.to_thread(subprocess.run, cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        err = (e.stderr or b"")
+        err = err.decode(errors="ignore")[-2000:] if isinstance(err, bytes) else str(err)[-2000:]
+        knowledge_service.record_run(
+            {"project_id": project_id, "task_id": task_id, "run_type": "env_install",
+             "environment": {"type": env_type}, "params": {"step": "env_create"},
+             "command": " ".join(cmd), "status": "failed", "error": err,
+             "started_at": created_at, "finished_at": _now()}
         )
+        project_manager.update_status(project_id, "env_failed")
+        raise RuntimeError(f"环境创建失败({env_type}): {err}")
 
-    ok = await _install_with_fix(source, env_dir, project_id, task_id)
+    knowledge_service.record_run(
+        {"project_id": project_id, "task_id": task_id, "run_type": "env_install",
+         "environment": {"type": env_type}, "params": {"step": "env_create"},
+         "command": " ".join(cmd), "status": "success",
+         "started_at": created_at, "finished_at": _now()}
+    )
+
+    ok = await _install_with_fix(source, env_dir, project_id, task_id, env_type)
     if ok:
         project_manager.update_status(project_id, "env_ready")
     else:
@@ -83,26 +102,27 @@ async def _run_env_create(params: dict, task_id: str) -> None:
         raise RuntimeError("环境安装失败（依赖修正循环耗尽）")
 
 
-async def _create_conda_env(source: Path, env_dir: Path) -> None:
-    """conda 环境创建：environment.yml 优先，否则建基础环境 + 后续 pip 装依赖。"""
+def _conda_create_cmd(source: Path, env_dir: Path) -> list[str]:
+    """conda 环境创建命令：environment.yml/yaml 优先，否则建基础环境 + 后续 pip 装依赖。"""
     if CONDA_PATH is None:
         raise RuntimeError("未找到 conda 可执行文件")
-    env_yml = source / "environment.yml"
-    if env_yml.exists():
-        cmd = [CONDA_PATH, "env", "create", "-f", str(env_yml), "-p", str(env_dir), "-y"]
-    else:
-        cmd = [CONDA_PATH, "create", "-p", str(env_dir), "python=3.11", "-y"]
-    await asyncio.to_thread(subprocess.run, cmd, check=True, capture_output=True)
+    for name in ("environment.yml", "environment.yaml"):
+        env_yml = source / name
+        if env_yml.exists():
+            return [CONDA_PATH, "env", "create", "-f", str(env_yml), "-p", str(env_dir), "-y"]
+    return [CONDA_PATH, "create", "-p", str(env_dir), "python=3.11", "-y"]
 
 
-async def _install_with_fix(source: Path, env_dir: Path, project_id: str, task_id: str) -> bool:
-    pip = str(env_dir / "Scripts" / "pip.exe")
+async def _install_with_fix(
+    source: Path, env_dir: Path, project_id: str, task_id: str, env_type: str
+) -> bool:
+    pip = _env_pip(env_dir)
     req_file = _find_requirements(source)
-    versions = detect_versions(source)
+    versions = detect_versions(source, _env_python(env_dir))
 
     for attempt in range(1, 4):
         result = await asyncio.to_thread(_try_install, pip, req_file)
-        _record_install(project_id, task_id, attempt, result, versions)
+        _record_install(project_id, task_id, attempt, result, versions, env_type)
         if result["ok"]:
             return True
         if attempt >= 3:
@@ -110,6 +130,20 @@ async def _install_with_fix(source: Path, env_dir: Path, project_id: str, task_i
         advice = await _agent_fix_advice(source, result["error"])
         req_file = _apply_advice(req_file, advice)
     return False
+
+
+def _env_python(env_dir: Path) -> str:
+    for c in (env_dir / "Scripts" / "python.exe", env_dir / "python.exe", env_dir / "bin" / "python"):
+        if c.exists():
+            return str(c)
+    return sys.executable
+
+
+def _env_pip(env_dir: Path) -> str:
+    for c in (env_dir / "Scripts" / "pip.exe", env_dir / "bin" / "pip"):
+        if c.exists():
+            return str(c)
+    return str(env_dir / "Scripts" / "pip.exe")
 
 
 def _find_requirements(source: Path) -> Optional[Path]:
@@ -131,9 +165,24 @@ def _detect_cuda() -> Optional[str]:
         return None
 
 
-def detect_versions(source: Path) -> dict:
+def _python_version(python_exe: Optional[str]) -> str:
+    """取目标环境解释器版本（非宿主），失败则回退宿主版本。"""
+    if python_exe:
+        try:
+            proc = subprocess.run(
+                [python_exe, "-c", "import sys;print(sys.version.split()[0])"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return sys.version.split()[0]
+
+
+def detect_versions(source: Path, python_exe: Optional[str] = None) -> dict:
     """版本判断（需求一.2、2.3）：解析依赖清单与代码 import 确定语言/框架/CUDA 版本。"""
-    info: dict = {"python": sys.version.split()[0], "frameworks": [], "cuda": _detect_cuda()}
+    info: dict = {"python": _python_version(python_exe), "frameworks": [], "cuda": _detect_cuda()}
 
     req = source / "requirements.txt"
     if req.exists():
@@ -174,14 +223,16 @@ def _try_install(pip: str, req_file: Optional[Path]) -> dict:
     return {"ok": ok, "error": error, "command": " ".join(cmd), "started_at": started, "finished_at": _now()}
 
 
-def _record_install(project_id: str, task_id: str, attempt: int, result: dict, versions: dict) -> None:
+def _record_install(
+    project_id: str, task_id: str, attempt: int, result: dict, versions: dict, env_type: str
+) -> None:
     knowledge_service.record_run(
         {
             "project_id": project_id,
             "task_id": task_id,
             "run_type": "env_install",
-            "environment": {"type": "venv", **versions},
-            "params": {"attempt": attempt},
+            "environment": {"type": env_type, **versions},
+            "params": {"attempt": attempt, "step": "pip_install"},
             "command": result.get("command"),
             "status": "success" if result["ok"] else "failed",
             "error": result.get("error"),
