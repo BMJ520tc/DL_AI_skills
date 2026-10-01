@@ -1,10 +1,8 @@
 """环境管理（模块详细设计 2.3）。
 
-决策树: Dockerfile → 容器; environment.yml → conda; 否则 venv。
+决策树: Dockerfile → 容器（可选扩展，需本机 docker）; environment.yml → conda; 否则 venv。
 依赖修正循环: 安装失败 → agent 判断 → 降级/替换/移除 → 重试（上限 3 次）。
-每次安装尝试写 run_record(env_install)，报错入 error 字段（供蒸馏知识提炼，需求六.1）。
-
-本机无 conda/docker，仅 venv 分支可落地测试；conda/container 分支保留决策与提示。
+环境创建步骤与每次安装尝试写 run_record(env_install)，报错入 error 字段（供蒸馏知识提炼，需求六.1）。
 """
 import asyncio
 import re
@@ -65,7 +63,7 @@ async def _run_env_create(params: dict, task_id: str) -> None:
     env_type = detect_env_type(ws)
 
     if env_type == "container":
-        raise RuntimeError("项目带 Dockerfile，需容器环境；本机未安装 docker，暂不支持")
+        raise RuntimeError("项目带 Dockerfile，需容器环境；容器为可选扩展，未检测到 docker（本机未安装或未启动）")
 
     env_dir = ws / "env"
     created_at = _now()
