@@ -74,6 +74,11 @@ CONDA_PATH = _detect_conda()
 
 SCHEMA_VERSION = "1.0"
 
+# 环境自建时的 pip 索引：PIP_INDEX_URL 显式指定主索引（未设则用 pip 自身配置）；
+# 主索引取不到版本（如镜像 403）时回退到 PIP_FALLBACK_INDEX 重试，不与依赖冲突混为一谈。
+PIP_INDEX_URL = os.getenv("PIP_INDEX_URL")
+PIP_FALLBACK_INDEX = os.getenv("PIP_FALLBACK_INDEX", "https://pypi.org/simple")
+
 
 def ensure_data_dirs() -> None:
     """确保 data/ 下各运行时目录存在。"""
