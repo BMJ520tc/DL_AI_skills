@@ -1,0 +1,4 @@
+# 后端测试依赖（运行时依赖见 requirements.txt）
+# 安装：D:\python.exe -m pip install -r backend/requirements-dev.txt
+pytest>=8
+httpx>=0.27          # fastapi.testclient 依赖（TestClient 走真实 lifespan）

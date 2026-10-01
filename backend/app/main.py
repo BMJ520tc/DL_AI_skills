@@ -6,8 +6,9 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import CLAUDE_CLI_PATH, ensure_data_dirs
+from app.config import CLAUDE_CLI_PATH, CORS_ORIGINS, CORS_ORIGIN_REGEX, ensure_data_dirs
 from app.db.connection import init_db
 from app.services import (
     task_manager, agent_service, env_manager, analysis_service,
@@ -39,6 +40,16 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="DL-AI-skills", lifespan=lifespan)
+
+# 前端开发态跨域：Vite dev server（任意本机端口）直连后端时必需；生产走同源/反代（架构三.1）。
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_origin_regex=CORS_ORIGIN_REGEX,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _validate_claude() -> None:

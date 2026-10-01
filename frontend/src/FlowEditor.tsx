@@ -1,12 +1,13 @@
 import { ReactFlowProvider } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import React, { useMemo, useRef } from "react";
+import React, { useMemo, useRef, useState } from "react";
 
 // Components
 import DiagramView from "./components/DiagramView";
 import DiagnosticsPanel from "./components/DiagnosticsPanel";
 import ComputePanel from "./components/ComputePanel";
 import TraceView from "./components/TraceView";
+import KnowledgeSearchPanel from "./components/KnowledgeSearchPanel";
 import { EditorToolbar } from "./features/editor/components/EditorToolbar";
 import { EditorSidebar } from "./features/editor/components/EditorSidebar";
 import { CodePanel } from "./features/editor/components/CodePanel";
@@ -129,6 +130,9 @@ function FlowContent() {
     // Helper for generating code toggle
     const handleGenerateCode = () => layout.setShowLiveCode(v => !v);
 
+    // 知识库检索面板开关（独立于画布状态，不影响既有编辑流程）
+    const [showKnowledge, setShowKnowledge] = useState(false);
+
     // File Upload (ref needed)
     const uploadInputRef = useRef<HTMLInputElement>(null);
     const triggerUpload = () => uploadInputRef.current?.click();
@@ -216,6 +220,7 @@ function FlowContent() {
                     failureCount={trace.shapeResult?.failures?.length ?? 0}
                     onToggleDiagnostics={() => layout.setShowDiagnostics(v => !v)}
                     onToggleComputePanel={() => layout.setShowComputePanel(v => !v)}
+                    onOpenKnowledge={() => setShowKnowledge(true)}
                     statusSlot={
                         trace.shapeResult && trace.shapeResult.ok ? (
                             <div
@@ -383,6 +388,8 @@ function FlowContent() {
                     }}
                 />
             )}
+
+            {showKnowledge && <KnowledgeSearchPanel onClose={() => setShowKnowledge(false)} />}
         </div>
     );
 }

@@ -17,7 +17,6 @@ import shutil
 import statistics
 import sys
 import tarfile
-import tempfile
 import zipfile
 from collections import Counter
 from pathlib import Path
@@ -35,6 +34,14 @@ IMAGE_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
 TABLE_EXT = {".csv", ".tsv", ".xlsx", ".xls"}
 UNSUPPORTED_EXT = {".fasta", ".fa", ".fna", ".pdb", ".ent"}
 ARCHIVE_EXT = {".zip", ".tar", ".gz", ".tgz"}
+
+# 图片目录中「划分」层级的目录名（不是类别名）；真实数据集的
+# <root>/train/<class>/*.jpg 结构会把 train 误当标签，故需跳过并还原为 split。
+SPLIT_DIR_NAMES = {
+    "train": "train", "training": "train",
+    "test": "test", "testing": "test",
+    "val": "val", "valid": "val", "validation": "val", "dev": "val", "eval": "val",
+}
 
 MISSING = {"", "na", "n/a", "nan", "null", "none", "?", "-"}
 
@@ -112,6 +119,26 @@ def _read_excel(path: Path) -> tuple[list[dict], list[str]]:
     return rows, header
 
 
+def _image_label_and_split(p: Path, root: Path) -> tuple[str, str]:
+    """从图片所在目录推导 (label, split)。
+
+    目录层级可能是 ``<root>/<split>/<class>/``、``<root>/<class>/<split>/``、
+    只有 ``<root>/<class>/`` 或完全扁平（类别写在文件名里，如 ``dog.0.jpg``）：
+    取沿途第一个「非 split 名」的目录作为 label，出现过的 split 名归一到 train/test/val；
+    没有类别目录时退回文件名首个分隔符前的词，仍取不到则 unknown。
+    """
+    label, split = "", ""
+    for part in p.parent.relative_to(root).parts:
+        canonical = SPLIT_DIR_NAMES.get(part.casefold())
+        if canonical:
+            split = split or canonical
+        elif not label:
+            label = part
+    if not label:
+        label = re.split(r"[._\-\s]", p.stem)[0].strip() or "unknown"
+    return label, split
+
+
 def _read_image_dir(path: Path) -> tuple[list[dict], list[str]]:
     try:
         from PIL import Image
@@ -122,9 +149,7 @@ def _read_image_dir(path: Path) -> tuple[list[dict], list[str]]:
     for p in sorted(path.rglob("*")):
         if p.suffix.lower() not in IMAGE_EXT:
             continue
-        # 目录名作标签（path/<label>/<img>），根目录下的图片标为 unknown
-        rel_parent = p.parent.relative_to(path)
-        label = rel_parent.parts[0] if rel_parent.parts else "unknown"
+        label, split = _image_label_and_split(p, path)
         width = height = None
         mode = None
         try:
@@ -132,8 +157,14 @@ def _read_image_dir(path: Path) -> tuple[list[dict], list[str]]:
                 width, height, mode = im.width, im.height, im.mode
         except OSError:
             continue
-        rows.append({"path": str(p), "label": label, "width": width, "height": height, "mode": mode})
-    return rows, ["path", "label", "width", "height", "mode"]
+        row = {"path": str(p), "label": label, "width": width, "height": height, "mode": mode}
+        if split:
+            row["split"] = split
+        rows.append(row)
+    columns = ["path", "label", "width", "height", "mode"]
+    if any("split" in r for r in rows):
+        columns.insert(1, "split")
+    return rows, columns
 
 
 def _read_one(path: Path) -> tuple[list[dict], list[str]]:
@@ -423,69 +454,75 @@ def run(input_path: Path, out_dir: Path, dataset_name: str, task_type: str) -> d
     if fmt == "unknown":
         return _fail(fmt, f"无法识别格式: {input_path.name}")
 
-    tmp: Path | None = None
-    try:
-        if fmt == "archive":
-            tmp = Path(tempfile.mkdtemp(prefix="preprocess_"))
-            _extract_archive(input_path, tmp)
-            inner = sorted(p for p in tmp.rglob("*") if p.is_file())
-            if not inner:
-                return _fail(fmt, "压缩包内没有文件")
-            # 递归一次：优先取表格，其次取图片/子目录
-            table = next((p for p in inner if p.suffix.lower() in TABLE_EXT), None)
-            if table is not None:
-                rows, columns = _read_one(table)
-                fmt = detect_format(table)
-            else:
-                img_parent = next((p.parent for p in inner if p.suffix.lower() in IMAGE_EXT), None)
-                if img_parent is None:
-                    return _fail(fmt, "压缩包内没有可识别的表格或图片")
-                img_root = tmp / img_parent.relative_to(tmp).parts[0] if img_parent != tmp else tmp
-                rows, columns = _read_image_dir(img_root)
-                fmt = "image_dir"
+    if fmt == "archive":
+        # 解压到产出目录下的 _files/：图片类数据集的统一 CSV 里 input 必须指向可持续访问的路径，
+        # 若解压到临时目录，本次运行结束即被清理，CSV 中的图片路径会全部失效（真实数据集暴露的问题）。
+        extract_dir = out_dir / "_files"
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir, ignore_errors=True)
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        _extract_archive(input_path, extract_dir)
+        inner = sorted(p for p in extract_dir.rglob("*") if p.is_file())
+        if not inner:
+            return _fail(fmt, "压缩包内没有文件")
+        # 递归一次：优先取表格，其次取图片/子目录
+        table = next((p for p in inner if p.suffix.lower() in TABLE_EXT), None)
+        if table is not None:
+            rows, columns = _read_one(table)
+            fmt = detect_format(table)
         else:
-            rows, columns = _read_one(input_path)
+            img_files = [p for p in inner if p.suffix.lower() in IMAGE_EXT]
+            if not img_files:
+                return _fail(fmt, "压缩包内没有可识别的表格或图片")
+            # 仅当压缩包只有一个顶层目录（常见的「多包一层」导出）才下钻，
+            # 否则以解压根目录为根：train/、test/ 并列时只取第一个会把一半数据丢掉。
+            tops = {p.relative_to(extract_dir).parts[0] for p in img_files}
+            single_top = next(iter(tops)) if len(tops) == 1 else None
+            img_root = extract_dir
+            if single_top and (extract_dir / single_top).is_dir():
+                img_root = extract_dir / single_top
+            rows, columns = _read_image_dir(img_root)
+            fmt = "image_dir"
+    else:
+        rows, columns = _read_one(input_path)
 
-        if not rows:
-            return _fail(fmt, "未读取到任何数据行")
+    if not rows:
+        return _fail(fmt, "未读取到任何数据行")
 
-        unified, field_mapping, label_merge = unify(rows, columns)
-        unified_columns = list(UNIFIED_COLUMNS) + [c for c in unified[0] if c.startswith(META_PREFIX)]
-        # 顺序：单位换算 → 序列规范 → 清洗（清洗在统一量纲后进行，异常值判定才准确）
-        unified, unified_columns, units = normalize_units(unified, unified_columns)
-        unified, sequence, seq_truncated = normalize_sequences(unified)
-        cleaned, stats = clean(unified, unified_columns)
-        if seq_truncated:
-            stats["sequences_truncated"] = seq_truncated
+    unified, field_mapping, label_merge = unify(rows, columns)
+    unified_columns = list(UNIFIED_COLUMNS) + [c for c in unified[0] if c.startswith(META_PREFIX)]
+    # 顺序：单位换算 → 序列规范 → 清洗（清洗在统一量纲后进行，异常值判定才准确）
+    unified, unified_columns, units = normalize_units(unified, unified_columns)
+    unified, sequence, seq_truncated = normalize_sequences(unified)
+    cleaned, stats = clean(unified, unified_columns)
+    if seq_truncated:
+        stats["sequences_truncated"] = seq_truncated
 
-        csv_path = _write_outputs(out_dir, cleaned, unified_columns)
-        labels = sorted({r["label"] for r in cleaned if r.get("label")})
-        summary = {
-            "status": "ok",
-            "format": fmt,
-            "dataset_name": dataset_name,
-            "task_type": task_type,
-            "n_rows": len(cleaned),
-            "n_columns": len(unified_columns),
-            "fields": unified_columns,
-            "labels": labels,
-            "cleaning": stats,
-            "output_csv": str(csv_path),
-        }
-        summary["alignment"] = {
-            "field_mapping": field_mapping,
-            "label_merge": label_merge,
-            "sequence": sequence,
-            "units": units,
-            "version": "1.0",
-        }
-        (out_dir / "dataset.schema.json").write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        return summary
-    finally:
-        if tmp is not None:
-            shutil.rmtree(tmp, ignore_errors=True)
+    csv_path = _write_outputs(out_dir, cleaned, unified_columns)
+    labels = sorted({r["label"] for r in cleaned if r.get("label")})
+    summary = {
+        "status": "ok",
+        "format": fmt,
+        "dataset_name": dataset_name,
+        "task_type": task_type,
+        "n_rows": len(cleaned),
+        "n_columns": len(unified_columns),
+        "fields": unified_columns,
+        "labels": labels,
+        "cleaning": stats,
+        "output_csv": str(csv_path),
+    }
+    summary["alignment"] = {
+        "field_mapping": field_mapping,
+        "label_merge": label_merge,
+        "sequence": sequence,
+        "units": units,
+        "version": "1.0",
+    }
+    (out_dir / "dataset.schema.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return summary
 
 
 def main() -> int:

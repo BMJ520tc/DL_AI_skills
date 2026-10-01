@@ -47,6 +47,8 @@ def create_preprocess(
     dataset_name: Optional[str] = None,
     task_type: str = "classification",
     project_id: Optional[str] = None,
+    source: Optional[str] = None,
+    url: Optional[str] = None,
 ) -> str:
     if project_id:
         project_manager.require_type(project_id, {"original"})
@@ -58,6 +60,10 @@ def create_preprocess(
             "dataset_name": dataset_name,
             "task_type": task_type,
             "project_id": project_id,
+            # 来源溯源（5.3）：外部下载的公开数据集经预处理后仍应保留 source/url，
+            # 否则 dataset_registry 会把公开数据登记成「自带」，验收时无法追溯数据来源。
+            "source": source,
+            "url": url,
         },
     )
 
@@ -146,8 +152,8 @@ async def _run(params: dict, task_id: str) -> None:
 
     dataset_id = knowledge_service.upsert_dataset({
         "name": name,
-        "url": None,
-        "source": "自带",
+        "url": params.get("url"),
+        "source": params.get("source") or "自带",
         "task_type": task_type,
         "format": summary.get("format"),
         "fields": summary.get("fields"),

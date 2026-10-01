@@ -28,6 +28,8 @@ type Props = {
     failureCount: number;
     onToggleDiagnostics: () => void;
     onToggleComputePanel: () => void;
+    /** 可选：传入后工具栏右侧出现「知识库」按钮，用于打开知识库检索面板。 */
+    onOpenKnowledge?: () => void;
     statusSlot?: ReactNode;
     selectionSummary?: ReactNode;
 };
@@ -60,6 +62,7 @@ export default function EditorHeader({
     failureCount,
     onToggleDiagnostics,
     onToggleComputePanel,
+    onOpenKnowledge,
     statusSlot,
     selectionSummary,
 }: Props) {
@@ -351,6 +354,25 @@ export default function EditorHeader({
                         >
                             {statusSlot}
                         </div>
+                    ) : null}
+                    {onOpenKnowledge ? (
+                        <button
+                            className="nodrag"
+                            onClick={onOpenKnowledge}
+                            style={{
+                                padding: "4px 8px",
+                                borderRadius: 6,
+                                border: "1px solid #3f3f46",
+                                background: "#111318",
+                                color: "#e6edf3",
+                                cursor: "pointer",
+                                fontSize: 12,
+                                flexShrink: 0,
+                            }}
+                            title="打开知识库检索面板"
+                        >
+                            知识库
+                        </button>
                     ) : null}
                     <button
                         onClick={onToggleComputePanel}

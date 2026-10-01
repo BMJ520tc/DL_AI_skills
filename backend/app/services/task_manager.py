@@ -143,10 +143,33 @@ def _set_status(task_id: str, status: str, error: Optional[str] = None) -> None:
 async def start() -> None:
     """启动后台 worker（由 main lifespan 调用）。"""
     global _queue, _worker_task
+    stale = reconcile_stale_tasks()
+    if stale:
+        print(f"[task] 启动收敛：{stale} 个残留 running 任务已置为 failed（服务重启中断，可重试）")
     if _queue is None:
         _queue = asyncio.Queue()
     if _worker_task is None:
         _worker_task = asyncio.create_task(_worker())
+
+
+def reconcile_stale_tasks() -> int:
+    """启动时收敛残留 running 任务，返回被收敛的条数。
+
+    状态机（2.1）只有 queued → running → success/failed/cancelled，没有「进程崩溃」迁移边：
+    服务重启后，上次进程中被中断的任务会永久停在 running——worker 不会拾取它（队列是内存态），
+    它也无法经 retry（要求 failed）重新入队。此处统一置 failed 并写明原因，
+    使状态可自洽、可用现有 retry 通道重新入队（failed → queued）。
+    """
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "UPDATE task SET status = 'failed', error = ?, updated_at = ? WHERE status = 'running'",
+            ("服务重启中断：任务未执行完（残留 running 状态由启动收敛置为 failed，可重试）", _now()),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
 
 
 async def stop() -> None:

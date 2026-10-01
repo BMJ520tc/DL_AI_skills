@@ -15,13 +15,17 @@ class PreprocessBody(BaseModel):
     dataset_name: str | None = None
     task_type: str = "classification"
     project_id: str | None = None
+    # 来源溯源（5.3）：外部公开数据集经预处理后仍保留来源，便于 dataset_registry 追溯
+    source: str | None = None
+    url: str | None = None
 
 
 @router.post("")
 def create_preprocess(body: PreprocessBody) -> dict:
     try:
         task_id = preprocess_service.create_preprocess(
-            body.input_path, body.dataset_name, body.task_type, body.project_id
+            body.input_path, body.dataset_name, body.task_type, body.project_id,
+            source=body.source, url=body.url,
         )
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))

@@ -11,7 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.contracts import ordered_metrics
-from app.services import agent_service, baseline_service, knowledge_service, project_manager, task_manager
+from app.services import (
+    agent_service, baseline_service, dataset_service, knowledge_service, project_manager, task_manager,
+)
 
 TASK_TYPE = "compare"
 
@@ -131,6 +133,22 @@ async def _draft_guidance(table: dict, evals: list[dict], task_type: str | None)
     return result.get("structured_output") or {}
 
 
+def _require_guidance(draft: dict, table: dict, task_id: str) -> dict:
+    """agent 起草失败时不得写下空「使用建议」（对齐 5.3 对齐草稿的失败退出先例）。
+
+    agent 无产出（端点不可用、未登录、结构化输出校验失败等）时 run_sync 返回空
+    structured_output；若继续落库，会写入 content=None 的记录并被当作待确认的使用建议，
+    问题直到用户确认时才暴露。故此处失败退出，并把已算好的对比表写入任务进度便于排查。
+    """
+    if not draft.get("guidance_content"):
+        task_manager.update_progress(task_id, {"comparison": table, "draft_failed": True})
+        raise RuntimeError(
+            "使用建议起草失败：agent 未返回结构化结果（检查模型端点/凭证配置，见 O2）；"
+            "对比表已算出但未落库，避免写入空知识记录"
+        )
+    return draft
+
+
 async def _run(params: dict, task_id: str) -> None:
     project_id = params["project_id"]
     project = project_manager.get_project(project_id)
@@ -140,8 +158,8 @@ async def _run(params: dict, task_id: str) -> None:
     if baseline is None:
         raise RuntimeError("未找到基准运行记录，请先调用 POST /api/projects/{id}/baseline")
 
-    self_ds = knowledge_service.find_datasets(local_path_prefix=str(ws / "data"), limit=1)
-    self_dataset_id = self_ds[0]["dataset_id"] if self_ds else None
+    self_ds = dataset_service.find_self_dataset(ws)
+    self_dataset_id = self_ds["dataset_id"] if self_ds else None
     aligned, unconfirmed = _aligned_datasets(project_id, self_dataset_id)
     if not aligned:
         if unconfirmed:
@@ -185,7 +203,9 @@ async def _run(params: dict, task_id: str) -> None:
             "基准与跨数据集评估没有共同指标，结果不可比；请先统一指标口径（eval 入口输出规范指标名）"
         )
 
-    draft = await _draft_guidance(table, evals, baseline_params.get("task_type"))
+    draft = _require_guidance(
+        await _draft_guidance(table, evals, baseline_params.get("task_type")), table, task_id
+    )
 
     knowledge_id = knowledge_service.record_knowledge({
         "type": "usage_guidance",

@@ -20,10 +20,32 @@ AGENT_TASK_TYPE = "agent_task"
 
 # 工具白名单（deny 优先，白名单外不提供；架构八.1）：
 # 读文件(限工作区)、写文件(限工作区)、执行命令(经独立环境)。
-# 查询知识库经 mcp_servers 挂载的 knowledge MCP，不占内置工具名。
+# 查询知识库经 mcp_servers 挂载的 knowledge MCP；注意 permission_mode="dontAsk" 下
+# 「未预授权的工具直接拒绝、can_use_tool 不会被咨询」（claude_agent_sdk types.py:
+# "dontAsk — Deny anything not pre-approved by allow rules"），因此 MCP 工具必须
+# 显式进白名单，否则 agent 查知识库会被拒（M0 冒烟测试暴露的问题）。
 DEFAULT_ALLOWED_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep", "Bash"]
 DEFAULT_DISALLOWED_TOOLS: list[str] = []
+
+KNOWLEDGE_MCP_SERVER = "knowledge"
+KNOWLEDGE_MCP_TOOL = "knowledge_search"
+# CLI 权限规则中 MCP 工具用全名 mcp__<server>__<tool>
+KNOWLEDGE_MCP_TOOL_RULE = f"mcp__{KNOWLEDGE_MCP_SERVER}__{KNOWLEDGE_MCP_TOOL}"
+
 DEFAULT_TIMEOUT_S = 900
+
+
+def allowed_tools(attach_knowledge: bool = True, base: Optional[list[str]] = None) -> list[str]:
+    """本会话工具白名单：显式白名单 + 挂载知识库时的知识库 MCP 工具。
+
+    设计依据《模块详细设计》2.5「工具白名单：…查询知识库（经每会话临时挂载的 MCP）；
+    deny 优先，白名单外不提供」。dontAsk 模式下未预授权的工具会被直接拒绝，
+    所以「挂载了 MCP」不等于「允许调用」，必须把工具全名加入白名单。
+    """
+    tools = list(base) if base is not None else list(DEFAULT_ALLOWED_TOOLS)
+    if attach_knowledge and KNOWLEDGE_MCP_TOOL_RULE not in tools:
+        tools.append(KNOWLEDGE_MCP_TOOL_RULE)
+    return tools
 
 _DANGEROUS_PATTERNS = [
     r"rm\s+-rf\s+[/~]",      # rm -rf / 或 ~
@@ -65,6 +87,29 @@ def _knowledge_mcp() -> dict:
             "env": {"PYTHONPATH": str(BACKEND_DIR)},
         }
     }
+
+
+def _build_options(params: dict) -> ClaudeAgentOptions:
+    """构造一次会话的 SDK 选项（白名单含知识库 MCP 工具、按需挂载 MCP、模型端点）。"""
+    attach: bool = bool(params.get("attach_knowledge", True))
+    options = ClaudeAgentOptions(
+        cli_path=CLAUDE_CLI_PATH,
+        cwd=params.get("cwd"),
+        add_dirs=params.get("add_dirs") or [],
+        allowed_tools=allowed_tools(attach, params.get("allowed_tools") or DEFAULT_ALLOWED_TOOLS),
+        disallowed_tools=params.get("disallowed_tools") or DEFAULT_DISALLOWED_TOOLS,
+        permission_mode=params.get("permission_mode", "dontAsk"),
+        max_turns=params.get("max_turns", 30),
+        output_format=params.get("output_schema"),
+        setting_sources=[],
+        can_use_tool=_can_use_tool,
+        env={"DISABLE_AUTOUPDATER": "1"},
+    )
+    if attach:
+        options.mcp_servers = _knowledge_mcp()
+    if DEFAULT_MODEL:
+        options.model = DEFAULT_MODEL
+    return options
 
 
 def submit(
@@ -117,23 +162,7 @@ async def _run(params: dict, task_id: str) -> None:
             + f"\n\n[系统指令] 完成分析后，除正常回复外，请同时把符合 schema 的 JSON 结果写入文件：{result_path}"
         )
 
-    options = ClaudeAgentOptions(
-        cli_path=CLAUDE_CLI_PATH,
-        cwd=params.get("cwd"),
-        add_dirs=params.get("add_dirs") or [],
-        allowed_tools=params.get("allowed_tools") or DEFAULT_ALLOWED_TOOLS,
-        disallowed_tools=params.get("disallowed_tools") or DEFAULT_DISALLOWED_TOOLS,
-        permission_mode=params.get("permission_mode", "dontAsk"),
-        max_turns=params.get("max_turns", 30),
-        output_format=params.get("output_schema"),
-        setting_sources=[],
-        can_use_tool=_can_use_tool,
-        env={"DISABLE_AUTOUPDATER": "1"},
-    )
-    if params.get("attach_knowledge", True):
-        options.mcp_servers = _knowledge_mcp()
-    if DEFAULT_MODEL:
-        options.model = DEFAULT_MODEL
+    options = _build_options(params)
 
     structured = None
     outcome: dict = {}
@@ -221,10 +250,12 @@ async def run_sync(
     output_schema: Optional[dict] = None,
     max_turns: int = 20,
     timeout_s: int = 300,
+    attach_knowledge: bool = False,
 ) -> dict:
     """直接执行一次 agent 会话（不走任务队列），供其他服务的 handler 内部调用。
 
     返回 {"structured_output": ..., "result": ...}；结构化输出在 DeepSeek 下走文件兜底。
+    attach_knowledge=True 时挂载知识库 MCP 并把其工具加入白名单（默认不挂载，保持既有调用方行为）。
     """
     d = _task_dir(uuid.uuid4().hex)
     result_path = d / "result.json"
@@ -239,7 +270,7 @@ async def run_sync(
         cli_path=CLAUDE_CLI_PATH,
         cwd=cwd,
         add_dirs=add_dirs or [],
-        allowed_tools=DEFAULT_ALLOWED_TOOLS,
+        allowed_tools=allowed_tools(attach_knowledge, DEFAULT_ALLOWED_TOOLS),
         disallowed_tools=DEFAULT_DISALLOWED_TOOLS,
         permission_mode="dontAsk",
         max_turns=max_turns,
@@ -248,6 +279,8 @@ async def run_sync(
         can_use_tool=_can_use_tool,
         env={"DISABLE_AUTOUPDATER": "1"},
     )
+    if attach_knowledge:
+        options.mcp_servers = _knowledge_mcp()
     if DEFAULT_MODEL:
         options.model = DEFAULT_MODEL
 

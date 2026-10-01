@@ -116,13 +116,25 @@ def search_external(query: str, limit: int = 5) -> list[dict]:
     return hits
 
 
+# 外部数据源的人类可读地址（5.3 来源溯源：dataset_registry.url 需可回访）
+_SOURCE_URL_TEMPLATES = {
+    "zenodo": "https://zenodo.org/records/{id}",
+    "figshare": "https://figshare.com/articles/{id}",
+}
+
+
+def source_url(source: str, source_id: str) -> str | None:
+    tpl = _SOURCE_URL_TEMPLATES.get(source)
+    return tpl.format(id=source_id) if tpl else None
+
+
 def download_dataset(source: str, source_id: str, name: str, task_type: str | None = None) -> str:
     """下载外部数据集并登记（复用 2.4 的 download_dataset），返回 dataset_id。"""
     dest = DATASETS_DIR / f"{source}_{source_id}"
-    files = download_service.download_dataset(source, source_id, dest)
+    download_service.download_dataset(source, source_id, dest)
     return knowledge_service.register_dataset({
         "name": name,
-        "url": None,
+        "url": source_url(source, source_id),
         "source": source,
         "task_type": task_type,
         "format": None,
@@ -171,21 +183,47 @@ def get_alignment(dataset_id: str) -> dict | None:
     return raw
 
 
-def _self_dataset(ws: Path) -> dict | None:
-    """项目自带数据集（预处理产物在 ws/data 下）。"""
-    found = knowledge_service.find_datasets(local_path_prefix=str(ws / "data"), limit=1)
-    return found[0] if found else None
+def _as_json(value):
+    """dataset_registry 的 fields/labels/alignment 以 JSON 文本存库，取值时统一解析。
+
+    `knowledge_service.get_item` 返回的是原始行（TEXT），若直接把该字符串当列表遍历，
+    只会逐字符走一遍——规则兜底会因此判定「缺少字段信息」并失败（真实数据集 E1 暴露）。
+    """
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    return value
+
+
+def find_self_dataset(ws: Path) -> dict | None:
+    """项目「自带数据」数据集（5.3 对齐与 5.4 对比的来源侧）。
+
+    预处理产物统一落在 ws/data 下，外部公开数据集经 5.1 预处理后同样如此，
+    因此必须排除非「自带」来源，否则会把外部数据集当成基准来源
+    （E1 用真实公开数据集暴露：来源与目标退化成同一条记录）。
+    """
+    found = knowledge_service.find_datasets(local_path_prefix=str(ws / "data"), limit=20)
+    for ds in found:
+        if (ds.get("source") or "自带") == "自带":
+            return ds
+    return None
+
+
+# 兼容既有内部调用名
+_self_dataset = find_self_dataset
 
 
 async def _draft_alignment(source_ds: dict, target_ds: dict, ws: Path) -> dict:
     prompt = (
         "两个数据集需要做跨数据集对齐，以保证评估口径可比（统一输出格式、标签体系、评价指标）。\n\n"
-        f"【来源数据集（项目自带）】\n字段: {json.dumps(source_ds.get('fields'), ensure_ascii=False)}\n"
-        f"标签: {json.dumps(source_ds.get('labels'), ensure_ascii=False)}\n"
-        f"已有对齐: {json.dumps(source_ds.get('alignment'), ensure_ascii=False)}\n\n"
+        f"【来源数据集（项目自带）】\n字段: {json.dumps(_as_json(source_ds.get('fields')), ensure_ascii=False)}\n"
+        f"标签: {json.dumps(_as_json(source_ds.get('labels')), ensure_ascii=False)}\n"
+        f"已有对齐: {json.dumps(_as_json(source_ds.get('alignment')), ensure_ascii=False)}\n\n"
         f"【目标数据集（待对齐）】\n名称: {target_ds.get('name')}\n"
-        f"字段: {json.dumps(target_ds.get('fields'), ensure_ascii=False)}\n"
-        f"标签: {json.dumps(target_ds.get('labels'), ensure_ascii=False)}\n\n"
+        f"字段: {json.dumps(_as_json(target_ds.get('fields')), ensure_ascii=False)}\n"
+        f"标签: {json.dumps(_as_json(target_ds.get('labels')), ensure_ascii=False)}\n\n"
         "请阅读项目代码（如有必要）后给出对齐规则：把目标数据集的字段映射到统一字段"
         "（id/split/label/input），把目标标签归并到与来源一致的标签体系，"
         "并给出序列长度与大小写规范。"
@@ -202,10 +240,14 @@ def _rule_alignment(source_ds: dict, target_ds: dict) -> dict:
 
     统一字段同名映射 + 标签按大小写不敏感归并到来源数据集的写法。
     """
-    field_mapping = {f: f for f in (target_ds.get("fields") or []) if f in UNIFIED_FIELDS}
-    canon = {str(lab).strip().casefold(): str(lab).strip() for lab in (source_ds.get("labels") or [])}
+    target_fields = _as_json(target_ds.get("fields")) or []
+    target_labels = _as_json(target_ds.get("labels")) or []
+    source_labels = _as_json(source_ds.get("labels")) or []
+
+    field_mapping = {f: f for f in target_fields if f in UNIFIED_FIELDS}
+    canon = {str(lab).strip().casefold(): str(lab).strip() for lab in source_labels}
     label_merge = {}
-    for lab in target_ds.get("labels") or []:
+    for lab in target_labels:
         text = str(lab).strip()
         if text.casefold() in canon and canon[text.casefold()] != text:
             label_merge[text] = canon[text.casefold()]

@@ -74,6 +74,12 @@ CONDA_PATH = _detect_conda()
 
 SCHEMA_VERSION = "1.0"
 
+# 跨域（前端开发态）：Vite dev server 直连后端需要 CORS 头。
+# 默认只放开本机来源（任意端口），可用 CORS_ORIGINS（逗号分隔的白名单）扩展；
+# 生产部署走同源或反向代理时该配置不生效（同源请求无 Origin 校验）。
+CORS_ORIGINS = [o.strip() for o in (os.getenv("CORS_ORIGINS") or "").split(",") if o.strip()]
+CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", r"http://(localhost|127\.0\.0\.1)(:\d+)?")
+
 # 环境自建时的 pip 索引：PIP_INDEX_URL 显式指定主索引（未设则用 pip 自身配置）；
 # 主索引取不到版本（如镜像 403）时回退到 PIP_FALLBACK_INDEX 重试，不与依赖冲突混为一谈。
 PIP_INDEX_URL = os.getenv("PIP_INDEX_URL")
