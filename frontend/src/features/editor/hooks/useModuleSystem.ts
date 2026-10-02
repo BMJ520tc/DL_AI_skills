@@ -30,6 +30,62 @@ function toModuleSaveInput(
     return copy as Omit<SavedModule, "id" | "createdAt" | "updatedAt"> & { id?: string };
 }
 
+/** 后端 params_schema（{参数名: {type, default}}）→ 基底 FieldSpec 参数面板描述。
+ *  可映射类型：bool→boolean、int→number(step 1)、float→number、str→text；
+ *  list/dict/null 等没有对应的基底输入控件，不进参数面板——构造参数走模块
+ *  再生成代码里的默认值（已知边界，见《模块详细设计》7.3 版本引用边界）。 */
+function paramsSchemaToVariableSchema(
+    raw: string | null | undefined,
+): Record<string, FieldSpec> | undefined {
+    if (!raw) return undefined;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        return undefined;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const entries = parsed as Record<string, unknown>;
+    const schema: Record<string, FieldSpec> = {};
+    for (const [name, entry] of Object.entries(entries)) {
+        if (!entry || typeof entry !== "object") continue;
+        const { type, default: defaultValue } = entry as { type?: unknown; default?: unknown };
+        switch (type) {
+            case "bool":
+                schema[name] = {
+                    type: "boolean",
+                    required: false,
+                    defaultValue: typeof defaultValue === "boolean" ? defaultValue : false,
+                };
+                break;
+            case "int":
+                schema[name] = {
+                    type: "number",
+                    required: false,
+                    defaultValue: typeof defaultValue === "number" ? defaultValue : 0,
+                    step: 1,
+                };
+                break;
+            case "float":
+                schema[name] = {
+                    type: "number",
+                    required: false,
+                    defaultValue: typeof defaultValue === "number" ? defaultValue : 0,
+                };
+                break;
+            case "str":
+                schema[name] = {
+                    type: "text",
+                    required: false,
+                    defaultValue: typeof defaultValue === "string" ? defaultValue : "",
+                };
+                break;
+            // list/dict/null/未知类型：跳过（见函数说明）。
+        }
+    }
+    return Object.keys(schema).length ? schema : undefined;
+}
+
 /** 后端 ModuleItem.saved_module_compat → 基底 SavedModule（只读注入，不落 localStorage）。 */
 function compatToSavedModule(item: ModuleItem): SavedModule | null {
     if (!item.saved_module_compat) return null;
@@ -60,6 +116,7 @@ function compatToSavedModule(item: ModuleItem): SavedModule | null {
         description: typeof m.description === "string" ? m.description : item.description ?? undefined,
         createdAt: typeof m.createdAt === "string" ? m.createdAt : item.created_at,
         updatedAt: typeof m.updatedAt === "string" ? m.updatedAt : item.updated_at,
+        variableSchema: paramsSchemaToVariableSchema(item.params_schema),
         origin: "backend",
     };
 }

@@ -217,7 +217,8 @@ export const ModuleRefNode: LayerDefinition<ModuleRefData> = {
 
             if (value !== undefined) {
                 // Use the literal value from node data
-                if (type === 'string') {
+                // FieldSpec 的 text/select 取值是字符串，必须加引号（'string' 为历史写法，保留兼容）
+                if (type === 'string' || type === 'text' || type === 'select') {
                     params.push(`${varName}="${value}"`);
                 } else if (type === 'boolean') {
                     params.push(`${varName}=${value ? "True" : "False"}`);
