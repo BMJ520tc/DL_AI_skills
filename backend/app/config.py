@@ -85,6 +85,10 @@ CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", r"http://(localhost|127\.0\.0
 PIP_INDEX_URL = os.getenv("PIP_INDEX_URL")
 PIP_FALLBACK_INDEX = os.getenv("PIP_FALLBACK_INDEX", "https://pypi.org/simple")
 
+# venv 环境创建所用的解释器：默认后端自身解释器；ENV_VENV_PYTHON 指定其他版本
+# （真实项目常把依赖钉在旧 Python 上，用后端解释器会因无对应 wheel 而失败）。
+ENV_VENV_PYTHON = os.getenv("ENV_VENV_PYTHON")
+
 
 def ensure_data_dirs() -> None:
     """确保 data/ 下各运行时目录存在。"""

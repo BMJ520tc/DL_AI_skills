@@ -128,13 +128,17 @@ curl.exe -s http://127.0.0.1:8300/api/health   # {"status":"ok"}
 
 ### 跨域（CORS）与开发代理
 
-`backend/app/main.py`（`uvicorn app.main:app` 的入口）**没有挂载 `CORSMiddleware`**，
-后端响应里不带 `Access-Control-Allow-Origin`。而 Vite 开发服务器（如 5173）与后端（8000）
-属于不同源，浏览器会直接拦截该跨域读取请求，表现为面板提示
-「请求后端失败：网络不可达、连接被拒绝或跨域(CORS)被浏览器拦截」。
+`backend/app/main.py`（`uvicorn app.main:app` 的入口）**已挂载 `CORSMiddleware`**：
+`config.CORS_ORIGIN_REGEX` 默认放行本机来源（`http(s)://localhost | 127.0.0.1` 的任意端口），
+也可用 `CORS_ORIGINS`（逗号分隔白名单）扩展。因此浏览器从 Vite dev server（如 5173）
+**直连后端**不再被跨域拦截——把 `VITE_API_BASE_URL` 指向后端地址即可。
 
-本前端不改后端，改用**同源代理**规避：`vite.config.ts` 中已把 `/api` 代理到
-`VITE_DEV_API_TARGET`（默认 `http://127.0.0.1:8000`），`dev` 与 `preview` 都生效。
+若不便开 CORS、或想避免在浏览器直接暴露后端地址，也可改用**同源代理**：`vite.config.ts`
+已把 `/api` 代理到 `VITE_DEV_API_TARGET`（默认 `http://127.0.0.1:8000`），`dev` 与 `preview` 都生效。
+两种方式二选一：
+
+- **直连**：`VITE_API_BASE_URL=http://127.0.0.1:8300`（后端已开 CORS）
+- **代理**：`VITE_API_BASE_URL=/` + `VITE_DEV_API_TARGET=http://127.0.0.1:8300`
 
 ```powershell
 # PowerShell：同源代理模式启动前端
@@ -150,7 +154,7 @@ curl.exe -s "http://127.0.0.1:5199/api/health"                                 #
 curl.exe -s "http://127.0.0.1:5199/api/knowledge/search?types=knowledge&limit=2"
 ```
 
-> 若后续给后端加上了 CORS 中间件，可去掉代理、直接用 `VITE_API_BASE_URL` 直连。
+> 后端 CORS 与开发代理两者都可用，按需二选一；同源代理在后端未开 CORS 或需隐藏后端地址时仍适用。
 
 ---
 

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.config import CONDA_PATH, PIP_FALLBACK_INDEX, PIP_INDEX_URL
+from app.config import CONDA_PATH, ENV_VENV_PYTHON, PIP_FALLBACK_INDEX, PIP_INDEX_URL
 from app.services import agent_service, knowledge_service, project_manager, task_manager
 
 ENV_TASK_TYPE = "env_create"
@@ -22,12 +22,14 @@ ENV_TASK_TYPE = "env_create"
 FIX_SCHEMA = {
     "type": "object",
     "properties": {
-        "action": {"type": "string", "enum": ["downgrade", "remove", "replace", "none"]},
-        "package": {"type": "string"},
-        "target_version": {"type": "string"},
-        "reason": {"type": "string"},
+        "requirements": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "修正后的完整依赖清单，每行一条（pip requirements 语法），供直接替换安装",
+        },
+        "reason": {"type": "string", "description": "修正理由：改了哪些包、为什么"},
     },
-    "required": ["action", "reason"],
+    "required": ["requirements", "reason"],
 }
 
 
@@ -71,7 +73,8 @@ async def _run_env_create(params: dict, task_id: str) -> None:
     if env_type == "conda":
         cmd = _conda_create_cmd(source, env_dir)
     else:
-        cmd = [sys.executable, "-m", "venv", str(env_dir)]
+        # 默认用后端解释器；ENV_VENV_PYTHON 指定其他版本（项目依赖钉旧 Python 时）
+        cmd = [ENV_VENV_PYTHON or sys.executable, "-m", "venv", str(env_dir)]
     err = await _create_env_dir(env_type, source, env_dir, cmd)
     if err is not None:
         knowledge_service.record_run(
@@ -176,7 +179,14 @@ async def _install_with_fix(
         if attempt >= 3:
             break
         advice = await _agent_fix_advice(source, result["error"])
-        req_file = _apply_advice(req_file, advice)
+        new_req = _apply_advice(req_file, advice)
+        # 记录建议与是否真的改动了依赖（旧实现静默无输出，问题难定位）
+        task_manager.update_progress(task_id, {"env_fix": {
+            "attempt": attempt,
+            "reason": advice.get("reason") if isinstance(advice, dict) else None,
+            "requirements_updated": new_req is not req_file,
+        }})
+        req_file = new_req
     return False
 
 
@@ -325,26 +335,47 @@ def _record_install(
 
 async def _agent_fix_advice(source: Path, error: str) -> dict:
     prompt = (
-        f"一个深度学习项目在安装依赖时失败，错误信息如下：\n\n{error}\n\n"
-        f"请阅读项目代码（目录 {source}），判断代码实际 import 了哪些库，"
-        "哪些依赖版本不匹配、可降级，哪些依赖实际未使用可移除，并给出修复建议。"
+        f"一个项目在安装依赖时失败，错误信息如下：\n\n{error}\n\n"
+        f"请阅读项目代码（目录 {source}）与依赖清单，判断代码实际 import 了哪些库，"
+        "给出**修正后的完整依赖清单**（每行一条、pip requirements 语法）——按需降级/替换版本、"
+        "移除未实际使用的项；仅在某版本在当前 Python 下确无可安装 wheel 时才放宽或去掉它的版本钉，"
+        "不要无谓放宽。\n"
+        "严格按如下 JSON 输出，顶层键必须同时为 requirements 与 reason：\n"
+        '{"requirements": ["numpy", "pandas==2.2.2"], "reason": "改了哪些包、为什么"}'
     )
     result = await agent_service.run_sync(prompt, cwd=str(source), output_schema=FIX_SCHEMA)
     return result.get("structured_output") or {}
 
 
-def _apply_advice(req_file: Optional[Path], advice: dict) -> Optional[Path]:
+def _advice_requirements(advice) -> Optional[list[str]]:
+    """从 agent 建议里取「修正后的完整依赖清单」，兼容多种形状。
+
+    DeepSeek 下结构化输出走文件兜底、不经 schema 校验，键名/形状可能漂移
+    （实测曾返回 task/root_cause/fix_recommendations 这类自有结构，导致旧逻辑静默不动作）。
+    """
+    if isinstance(advice, list):
+        lines = [str(x).strip() for x in advice]
+        return [x for x in lines if x] or None
+    if isinstance(advice, dict):
+        for key in ("requirements", "lines", "fixed_requirements", "dependencies", "packages"):
+            val = advice.get(key)
+            if isinstance(val, list):
+                lines = [str(x).strip() for x in val]
+                if any(lines):
+                    return [x for x in lines if x]
+    return None
+
+
+def _legacy_advice_lines(req_file: Path, advice) -> Optional[list[str]]:
+    """兼容旧的 {action, package, target_version} 形式，返回改写后的行；不可执行则 None。"""
+    if not isinstance(advice, dict):
+        return None
     action = advice.get("action")
     pkg = (advice.get("package") or "").strip().lower()
     if not pkg or action in (None, "none"):
-        return req_file
-    # 仅 requirements 风格文件可按行改写；pyproject.toml/setup.py 不在此处理，避免产出坏文件
-    if req_file is None or not req_file.exists() or req_file.name.lower() in _PROJECT_MANIFESTS:
-        return req_file
-
-    lines = (req_file.read_text(encoding="utf-8").splitlines() if req_file and req_file.exists() else [])
+        return None
     out_lines = []
-    for line in lines:
+    for line in req_file.read_text(encoding="utf-8").splitlines():
         if _pkg_name(line) == pkg:
             if action == "remove":
                 continue
@@ -354,9 +385,25 @@ def _apply_advice(req_file: Optional[Path], advice: dict) -> Optional[Path]:
             if action == "replace":
                 continue
         out_lines.append(line)
+    return out_lines
 
-    out = (req_file.parent if req_file else Path(".")) / f"requirements_fixed_{uuid.uuid4().hex[:8]}.txt"
-    out.write_text("\n".join(out_lines), encoding="utf-8")
+
+def _apply_advice(req_file: Optional[Path], advice) -> Optional[Path]:
+    """按建议改写依赖清单，返回新文件；无可执行建议时原样返回（不产出坏文件）。
+
+    主路径：agent 给出「修正后的完整清单」→ 直接写新文件（对任意修正都适用）。
+    兼容路径：旧 {action, package, target_version} → 按行增删改。
+    pyproject.toml/setup.py 类清单不按行改写（避免损坏）。
+    """
+    if req_file is None or not req_file.exists() or req_file.name.lower() in _PROJECT_MANIFESTS:
+        return req_file
+    lines = _advice_requirements(advice)
+    if lines is None:
+        lines = _legacy_advice_lines(req_file, advice)
+    if lines is None:
+        return req_file
+    out = req_file.parent / f"requirements_fixed_{uuid.uuid4().hex[:8]}.txt"
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return out
 
 

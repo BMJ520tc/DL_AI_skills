@@ -194,7 +194,9 @@ def run_stdio() -> dict:
 
 def run_agent(base_url: str, timeout_s: int = 300) -> dict:
     """agent 侧 tool-use 闭环：提交必须调用 MCP 工具的任务，核对 agent 报告的命中数。"""
-    db_count, db_titles = _db_count(QUERY["types"], QUERY["q"])
+    db_total, db_titles = _db_count(QUERY["types"], QUERY["q"])
+    # agent 按 prompt 指定的 limit 检索，返回条数应与 stdio 模式一致：min(limit, 命中总数)
+    db_count = min(QUERY["limit"], db_total)
     prompt = (
         "你有权访问一个名为 knowledge 的 MCP 服务，其工具为 knowledge_search（参数：types、q、limit）。\n"
         f"请调用该工具执行一次检索：types=[\"knowledge\"]，q=\"public\"，limit=5。\n"
@@ -203,7 +205,7 @@ def run_agent(base_url: str, timeout_s: int = 300) -> dict:
         "第一条标题: <工具返回的第一条标题>"
     )
     evidence: dict = {"mode": "agent", "base_url": base_url, "prompt": prompt,
-                      "db_hits": db_count, "db_titles": db_titles}
+                      "db_total": db_total, "db_hits": db_count, "db_titles": db_titles}
     checks: list[dict] = []
 
     created = _http(base_url, "POST", "/api/agents/tasks",

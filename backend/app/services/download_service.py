@@ -106,7 +106,15 @@ def verify_repo(repo_url: str) -> bool:
 
 def clone_repo(repo_url: str, target_dir: Path) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "clone", "--depth", "1", repo_url, str(target_dir)], check=True, capture_output=True)
+    # core.longpaths=true：Windows 默认 260 字符路径上限，真实仓库常有超长文件名
+    # （如 results/per_seed/...--seed42.txt）；不开启会 clone 失败（exit 128）。
+    proc = subprocess.run(
+        ["git", "-c", "core.longpaths=true", "clone", "--depth", "1", repo_url, str(target_dir)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[-800:]
+        raise RuntimeError(f"git clone 失败（exit {proc.returncode}）: {detail}")
 
 
 EXTRACT_TASK_TYPE = "extract_addresses"

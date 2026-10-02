@@ -7,9 +7,10 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const devApiTarget = env.VITE_DEV_API_TARGET || 'http://127.0.0.1:8000'
 
-  // 同源代理：backend/app/main.py 未挂 CORSMiddleware，浏览器直连后端会被跨域拦截。
-  // 把 VITE_API_BASE_URL 设为 "/"（或以 / 开头的相对路径）即走这里的代理，
-  // 详见 src/api/knowledgeClient.ts 与 README.md「跨域（CORS）与开发代理」。
+  // 同源代理：backend/app/main.py 已挂 CORSMiddleware（默认放行本机来源），浏览器可直连后端；
+  // 本代理是「不便开 CORS / 想隐藏后端地址」时的替代。把 VITE_API_BASE_URL 设为 "/"
+  //（或以 / 开头的相对路径）即走这里的代理，详见 src/api/knowledgeClient.ts 与
+  // README.md「跨域（CORS）与开发代理」。
   const apiProxy = {
     '/api': {
       target: devApiTarget,
