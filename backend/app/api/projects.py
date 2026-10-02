@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from app.services import analysis_service, project_manager
+from app.services import analysis_service, project_manager, version_service
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -32,13 +32,21 @@ def create_project(body: ProjectCreate) -> dict:
         raise HTTPException(status_code=400, detail=str(e))
 
     # 画布新建模型（阶段4 4a）：初始化空画布快照并直接置 ready（结构化项目无异步加载流程）
+    version: dict | None = None
+    version_error: str | None = None
     if body.project_type == "structured":
         project = project_manager.get_project(project_id)
         if project is not None:
+            empty_graph = {"nodes": [], "edges": []}
             _graph_path(project).write_text(
-                json.dumps({"nodes": [], "edges": []}, ensure_ascii=False), encoding="utf-8"
+                json.dumps(empty_graph, ensure_ascii=False), encoding="utf-8"
             )
             project_manager.update_status(project_id, "ready")
+            # 4d-1：git init + 初始提交（空画布）；失败透出在响应里，不连坐项目创建
+            try:
+                version = version_service.commit_graph(project_id, empty_graph)
+            except Exception as e:  # noqa: BLE001
+                version_error = f"版本仓库初始化失败（保存画布时会自动重试）: {e}"
 
     if body.source_url:
         try:
@@ -46,7 +54,10 @@ def create_project(body: ProjectCreate) -> dict:
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=f"加载失败: {e}")
 
-    return {"project_id": project_id, "status": "loading"}
+    response: dict = {"project_id": project_id, "status": "loading"}
+    if body.project_type == "structured":
+        response.update({"version": version, "version_error": version_error})
+    return response
 
 
 @router.get("")
@@ -87,13 +98,22 @@ def get_graph(project_id: str) -> dict:
 
 @router.put("/{project_id}/graph")
 def put_graph(project_id: str, body: dict) -> dict:
-    """画布保存（GraphIR v2 全量覆盖，模块四 7.1 最小闭环；版本树归阶段4）。"""
+    """画布保存（GraphIR v2 全量覆盖，模块四 7.1 最小闭环）。
+
+    阶段4 4d-1：保存即提交——graph.json + network_version.json 入工作区 git 仓库
+    （未初始化则在此懒初始化）。版本提交失败不连坐保存本身（图已落盘），
+    错误透出在响应的 version_error 字段。
+    """
     project = _require_structured(project_id)
     if not isinstance(body.get("nodes"), list) or not isinstance(body.get("edges"), list):
         raise HTTPException(status_code=400, detail="非法 GraphIR：需含 nodes/edges 数组")
     _graph_path(project).write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
     project_manager.update_status(project_id, "ready")
-    return {"status": "saved"}
+    try:
+        version = version_service.commit_graph(project_id, body)
+        return {"status": "saved", "version": version}
+    except Exception as e:  # noqa: BLE001
+        return {"status": "saved", "version": None, "version_error": f"版本提交失败（图已保存）: {e}"}
 
 
 @router.get("/{project_id}/figures/{chart_type}")

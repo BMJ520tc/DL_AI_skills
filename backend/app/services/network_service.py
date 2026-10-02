@@ -7,18 +7,25 @@
 目标环境：默认复用父原始项目的独立环境（拆解生成的结构化项目），也可显式指定
 其它 original 项目的环境（画布新建的网络没有父项目，必须指定）。环境未就绪一律
 报错引导先走模块一建环境——不静默退回宿主解释器（2.3 独立环境原则）。
+
+阶段4 4d-1：训练成功后「运行即提交」——指标摘要写进 network_version.json 并提交
+（version_service.commit_run；失败记日志，不连坐训练结果）。
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
 from app.services import (
     analysis_service, knowledge_service, network_export, proc_util,
-    project_manager, task_manager,
+    project_manager, task_manager, version_service,
 )
+
+logger = logging.getLogger(__name__)
 
 TASK_TYPE = "network_train"
 TRAIN_TIMEOUT_S = 1800  # 训练脚本超时（任务级上限见 task_manager.TASK_TIMEOUTS）
@@ -226,6 +233,11 @@ async def _run_train(params: dict, task_id: str) -> None:
         "started_at": started,
         "finished_at": _now(),
     })
+    # 4d-1 运行即提交：指标摘要入 network_version.json；失败不连坐训练结果
+    try:
+        await asyncio.to_thread(version_service.commit_run, project_id, task_id, metrics)
+    except Exception:  # noqa: BLE001
+        logger.exception("运行版本提交失败 project_id=%s task_id=%s", project_id, task_id)
     task_manager.update_progress(task_id, {"stage": "完成", "metrics": metrics})
 
 

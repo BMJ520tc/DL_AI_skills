@@ -14,6 +14,7 @@ error=failure_reason) 可检索供 agent/用户改进；入库前置强校验 ir
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -28,12 +29,14 @@ from typing import Optional
 from app.config import MODULES_DIR, PROJECT_ROOT
 from app.services import (
     agent_service, analysis_service, ir_codegen, ir_graphir, ir_schema,
-    knowledge_service, proc_util, project_manager, task_manager,
+    knowledge_service, proc_util, project_manager, task_manager, version_service,
 )
 from app.services.ir_codegen import IrIncompleteError
 from app.services.ir_schema import (
     SCHEMA_VERSION, TASK_TYPES, _as_ir, ir_hash, nodes_by_id, normalize_class_name, validate_ir,
 )
+
+logger = logging.getLogger(__name__)
 
 TASK_DECOMPOSE = "decompose"
 TASK_TRACE = "decompose_trace"
@@ -867,6 +870,11 @@ async def _run_ingest(params: dict, task_id: str) -> None:
         graph_path = _ws(project_manager.get_project(structured_id)) / "graph.json"
         graph_path.write_text(json.dumps(graph, ensure_ascii=False), encoding="utf-8")
         project_manager.update_status(structured_id, "ready")
+        # 4d-1：git init + 初始提交（拆解图快照）；失败不连坐入库（保存画布时懒初始化自愈）
+        try:
+            version_service.commit_graph(structured_id, graph)
+        except Exception:  # noqa: BLE001
+            logger.exception("结构化项目 git 版本初始化失败（保存画布时会自动重试）：%s", structured_id)
 
         tmp_dir = MODULES_DIR / f".tmp_{uuid.uuid4().hex}"
         tmp_dir.mkdir(parents=True, exist_ok=True)
