@@ -774,6 +774,12 @@ def _module_signature(ir: dict) -> str:
         model_params = n.get("params_model")
         if isinstance(model_params, dict):
             params.update(model_params)  # 模型实际值优先
+        # op 节点是表达式、模型不暴露参数：按再生成引擎的同一份占位符默认值补齐，
+        # 使「写全默认值」与「省略默认值」两种 agent 写法得到同一签名（如 flatten 的 end_dim）
+        if n.get("kind") == "op":
+            for k in ir_codegen.op_param_names(n):
+                if params.get(k) is None:
+                    params[k] = ir_codegen.OP_PARAM_DEFAULTS[k]
         return dict(sorted(params.items(), key=lambda kv: str(kv[0])))
 
     def _node_sig(n):

@@ -54,6 +54,19 @@ _OP_TEMPLATES = {
 }
 assert set(_OP_TEMPLATES) == set(OP_WHITELIST), "op 模板与 ir_schema.OP_WHITELIST 不同步"
 
+# op 模板占位符的默认值（`_render_op` 与结构签名共用同一份，避免两处口径漂移）。
+# 结构签名用它补齐 op 节点未写的参数：op 是表达式、模型不暴露参数，「写全默认值」与
+# 「省略默认值」必须得到同一 module_id（如 flatten 的 end_dim=-1）。
+OP_PARAM_DEFAULTS: dict = {"dim": 1, "start_dim": 1, "end_dim": -1, "shape": [], "dims": []}
+
+
+def op_param_names(node: dict) -> list:
+    """节点表达式模板用到的参数占位符名（不含 `{inputs}`）；无模板（走 code_hint）时为空。"""
+    tpl = _OP_TEMPLATES.get(normalize_class_name(node.get("class_name") or ""))
+    if not tpl:
+        return []
+    return [k for k in OP_PARAM_DEFAULTS if "{" + k + "}" in tpl]
+
 
 def _py_value(v) -> str:
     """JSON 值 → Python 字面量（数组转元组，PyTorch 构造参数大多要求 tuple）。"""
@@ -101,17 +114,17 @@ def _render_op(node: dict, in_vars: list[str]) -> str:
         )
     params = node.get("params") or {}
 
-    def _p(key, default):
+    def _p(key):
         v = params.get(key)
-        return default if v is None else v
+        return OP_PARAM_DEFAULTS[key] if v is None else v
 
     return (
         tpl.replace("{inputs}", in_vars[0] if len(in_vars) == 1 else ", ".join(in_vars))
-        .replace("{dim}", _py_value(_p("dim", 1)))
-        .replace("{start_dim}", _py_value(_p("start_dim", 1)))
-        .replace("{end_dim}", _py_value(_p("end_dim", -1)))
-        .replace("{shape}", _py_value(_p("shape", [])))
-        .replace("{dims}", _py_value(_p("dims", [])))
+        .replace("{dim}", _py_value(_p("dim")))
+        .replace("{start_dim}", _py_value(_p("start_dim")))
+        .replace("{end_dim}", _py_value(_p("end_dim")))
+        .replace("{shape}", _py_value(_p("shape")))
+        .replace("{dims}", _py_value(_p("dims")))
     )
 
 

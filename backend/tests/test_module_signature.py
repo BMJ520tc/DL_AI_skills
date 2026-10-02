@@ -205,6 +205,55 @@ def test_merge_shapes_replaces_non_literal_expression():
     assert fc["params"]["in_features"] == 8
 
 
+def test_op_node_optional_param_does_not_change_module_id():
+    """op 节点模型不暴露参数：写全 `end_dim=-1` 与省略它必须得到同一 module_id。"""
+    def _ir_with_flatten(end_dim_written: bool) -> dict:
+        params = {"start_dim": 1}
+        if end_dim_written:
+            params["end_dim"] = -1
+        return {
+            "schema_version": "1.0",
+            "source_file": "model.py",
+            "entry_class": "Net",
+            "task_type": "classification",
+            "input_spec": {"shape": [1, 8], "dtype": "float32"},
+            "root_id": "net",
+            "nodes": [
+                {"id": "net", "kind": "module", "class_name": "Net", "params": {}, "parent_id": None},
+                {"id": "fc", "kind": "leaf", "class_name": "nn.Linear", "module_path": "fc",
+                 "params": {"in_features": 8, "out_features": 8}, "parent_id": "net"},
+                {"id": "flatten", "kind": "op", "class_name": "flatten", "params": params,
+                 "parent_id": "net"},
+            ],
+            "edges": [{"from": "fc", "to": "flatten"}],
+        }
+
+    assert _module_signature(_ir_with_flatten(True)) == _module_signature(_ir_with_flatten(False))
+
+
+def test_op_node_real_param_difference_still_detected():
+    """补齐默认值不能把真实结构差异抹平：flatten 的 start_dim 不同仍应得到不同签名。"""
+    def _ir(start_dim: int) -> dict:
+        return {
+            "schema_version": "1.0",
+            "source_file": "model.py",
+            "entry_class": "Net",
+            "task_type": "classification",
+            "input_spec": {"shape": [1, 8], "dtype": "float32"},
+            "root_id": "net",
+            "nodes": [
+                {"id": "net", "kind": "module", "class_name": "Net", "params": {}, "parent_id": None},
+                {"id": "fc", "kind": "leaf", "class_name": "nn.Linear", "module_path": "fc",
+                 "params": {"in_features": 8, "out_features": 8}, "parent_id": "net"},
+                {"id": "flatten", "kind": "op", "class_name": "flatten",
+                 "params": {"start_dim": start_dim}, "parent_id": "net"},
+            ],
+            "edges": [{"from": "fc", "to": "flatten"}],
+        }
+
+    assert _module_signature(_ir(1)) != _module_signature(_ir(2))
+
+
 def test_merge_shapes_fixes_bogus_expression_on_default_valued_key():
     """默认值键（不在 delta）也被 agent 写成表达式时，同样以模型值纠正（不放过错代码）。"""
     ir = _net_ir({"inplace": "cfg"})
