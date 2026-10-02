@@ -141,6 +141,25 @@ def _script_dir_candidates(source: Path) -> list[list[str]]:
     return found
 
 
+def _package_candidates(source: Path) -> list[list[str]]:
+    """库型项目（无入口脚本，如 GEARS）的兜底候选：导入顶层包即证明环境可加载。
+
+    3.5 要求「从 README、脚本目录或 --help 输出定位最小可运行命令，跑通一遍」——
+    对没有可执行入口的库，`python -c "import <包>"` 是等价的最小跑通验证。
+    """
+    out: list[list[str]] = []
+    try:
+        entries = sorted(source.iterdir())
+    except OSError:
+        return out
+    for p in entries:
+        name = p.name
+        if (p.is_dir() and name.isidentifier() and not name.startswith(".")
+                and (p / "__init__.py").exists()):
+            out.append(["-c", f"import {name}"])
+    return out
+
+
 def _candidate_commands(source: Path) -> list[list[str]]:
     """3.5 候选命令列表，按优先级：README → 根目录入口脚本 → scripts/bin 脚本目录。
 
@@ -150,6 +169,10 @@ def _candidate_commands(source: Path) -> list[list[str]]:
     cands: list[list[str]] = []
     readme = _extract_from_readme(source)
     if readme:
+        # 从 README 抽到的若是「裸脚本」（无参数），先试 `--help`（快速且无副作用），
+        # 再按原文运行——避免一上来就真的跑一遍训练（宽限期内会被判「启动成功」但仍浪费时间）
+        if len(readme) == 1 and readme[0].endswith(".py"):
+            cands.append([readme[0], "--help"])
         cands.append(readme)
     for name in ENTRY_SCRIPTS:
         if (source / name).exists():
@@ -158,6 +181,9 @@ def _candidate_commands(source: Path) -> list[list[str]]:
         if (source / name).exists() and [name] not in cands:
             cands.append([name])
     for cand in _script_dir_candidates(source):
+        if cand not in cands:
+            cands.append(cand)
+    for cand in _package_candidates(source):   # 库型项目兜底（无入口脚本时）
         if cand not in cands:
             cands.append(cand)
     return cands
@@ -186,7 +212,13 @@ async def _agent_construct_command(source: Path) -> Optional[list[str]]:
     )
     result = await agent_service.run_sync(prompt, cwd=str(source), output_schema=CMD_SCHEMA)
     cmd = (result.get("structured_output") or {}).get("command")
-    return cmd.split() if cmd else None
+    if not cmd:
+        return None
+    tokens = cmd.split()
+    # 裸解释器（如仅 "python"）不是可运行命令——等于开一个 REPL，会以「打不开 python」失败
+    if len(tokens) == 1 and tokens[0] in ("python", "python3", "py", "bash", "sh"):
+        return None
+    return tokens
 
 
 GRACE_S = 60  # 启动判定宽限期（秒）：训练型项目启动满该时长且无导入/环境错误即判通过
@@ -260,6 +292,13 @@ async def _try_command(python: str, cmd: list[str], source: Path, grace_s: int =
         full_cmd = ["bash", *cmd[1:]]
     elif cmd and str(cmd[0]).lower().endswith((".sh", ".bash")):
         full_cmd = ["bash", *cmd]
+    elif cmd and cmd[0] in ("python", "python3", "py"):
+        # agent/README 常把命令写成 "python x.py"：用**项目环境解释器替换**（不是前缀，
+        # 否则会执行 `<env python> python x.py` → can't open file 'python'）
+        if len(cmd) == 1:
+            return {"ok": False, "mode": "invalid", "error": "候选命令只有解释器、缺少脚本，已跳过",
+                    "command": " ".join(cmd), "started_at": _now(), "finished_at": _now()}
+        full_cmd = [python, *cmd[1:]]
     else:
         full_cmd = [python, *cmd]
     started = _now()

@@ -718,7 +718,20 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                 "生成模块包 + 结构化项目",
                 !!verification && verification.overall === "passed" && vStatus === "valid",
                 !!structuredChild,
-                () => runTask("ingest", () => postIngestModule(projectId), afterIngest),
+                () =>
+                    runTask(
+                        "ingest",
+                        async () => {
+                            const resp = await postIngestModule(projectId);
+                            const prev = resp.existing_versions ?? [];
+                            if (prev.length) {
+                                // 设计 6.5 异常与边界：重复模块「提示已有，支持覆盖为新版本」
+                                setFlash(`同结构模块此前已入库（${prev.join("、")}），本次将生成 ${resp.module_version ?? "新版本"}`);
+                            }
+                            return resp;
+                        },
+                        afterIngest
+                    ),
                 !verification
                     ? "需先通过两步验证"
                     : verification.overall !== "passed"

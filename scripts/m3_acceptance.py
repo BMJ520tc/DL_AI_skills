@@ -105,8 +105,10 @@ def poll_task(base: str, task_id: str, label: str, quiet: bool = False) -> dict:
 
 def wait_env(base: str, project_id: str, no_env: bool) -> None:
     status, payload = api(base, "GET", f"/api/projects/{project_id}/env")
-    if isinstance(payload, dict) and payload.get("status") == "ready":
-        print("  env 已就绪")
+    # 项目状态机里的就绪态是 env_ready（原实现只比对 "ready" → 永远不匹配 → 每次都重建环境，
+    # 既浪费时间又可能用不兼容的解释器覆盖原可用环境）
+    if isinstance(payload, dict) and payload.get("status") in ("ready", "env_ready"):
+        print(f"  env 已就绪（{payload.get('status')}）")
         return
     if no_env:
         print("  --no-env：跳过 env 创建（假定就绪）")

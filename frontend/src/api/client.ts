@@ -259,7 +259,7 @@ export const putNodeParams = (projectId: string, nodeId: string, params: Record<
 // ---------------------------------------------------------------------------
 
 export const postIngestModule = (projectId: string) =>
-    request<{ task_id: string; status: string }>("/api/modules", {
+    request<{ task_id: string; status: string; module_id?: string; module_version?: string; existing_versions?: string[] }>("/api/modules", {
         method: "POST",
         body: JSON.stringify({ project_id: projectId }),
     });

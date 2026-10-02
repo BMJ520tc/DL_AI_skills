@@ -7,8 +7,10 @@
 import asyncio
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,6 +73,24 @@ async def _run_env_create(params: dict, task_id: str) -> None:
 
     env_dir = ws / "env"
     created_at = _now()
+    # 重建环境前必须清空目标目录：venv/conda 创建都不会清理已存在的目录，
+    # 旧解释器的 site-packages（例如 cp312 的 numpy）会残留并与新环境混装 → 导入即失败。
+    if env_dir.exists():
+        shutil.rmtree(env_dir, ignore_errors=True)
+        if env_dir.exists():          # Windows 上可能因占用/杀软扫描短暂锁定 → 稍等重试一次
+            time.sleep(2)
+            shutil.rmtree(env_dir, ignore_errors=True)
+        if env_dir.exists():
+            # 删除不完整时 venv 覆写 python.exe 会报 Permission denied，必须报清楚而不是让它神秘失败
+            raise RuntimeError(
+                f"旧环境目录无法删除（可能被进程占用或杀软扫描中）: {env_dir}；请关闭占用后重试"
+            )
+        knowledge_service.record_run(
+            {"project_id": project_id, "task_id": task_id, "run_type": "env_install",
+             "environment": {"type": env_type}, "params": {"step": "env_clean"},
+             "command": f"清理旧环境目录 {env_dir}", "status": "success",
+             "started_at": created_at, "finished_at": _now()}
+        )
     if env_type == "conda":
         cmd = _conda_create_cmd(source, env_dir)
     else:
@@ -221,6 +241,8 @@ async def _install_with_fix(
         task_manager.update_progress(task_id, {"env_fix": {
             "attempt": attempt,
             "reason": advice.get("reason") if isinstance(advice, dict) else None,
+            # 修正建议 agent 自身失败时如实记录（不掩盖 pip 的真实报错）
+            "advice_error": advice.get("_advice_error") if isinstance(advice, dict) else None,
             "requirements_updated": new_req is not req_file,
         }})
         req_file = new_req
@@ -253,6 +275,11 @@ def _find_requirements(source: Path) -> Optional[Path]:
 _PROJECT_MANIFESTS = ("pyproject.toml", "setup.py")
 
 
+# 大包（torch/scanpy 等）在本机网络下易 ReadTimeoutError：给 pip 加重试与读超时（可用 env 覆盖）
+PIP_RETRIES = int(os.getenv("PIP_RETRIES", "5"))
+PIP_TIMEOUT_S = int(os.getenv("PIP_TIMEOUT_S", "120"))
+
+
 def _install_cmd(pip: str, req_file: Path, index_url: Optional[str] = None) -> list[str]:
     if req_file.name.lower() in _PROJECT_MANIFESTS:
         cmd = [pip, "install", str(req_file.parent)]  # 安装项目及其声明依赖
@@ -260,6 +287,7 @@ def _install_cmd(pip: str, req_file: Path, index_url: Optional[str] = None) -> l
         cmd = [pip, "install", "-r", str(req_file)]
     if index_url:
         cmd += ["--index-url", index_url]
+    cmd += ["--retries", str(PIP_RETRIES), "--timeout", str(PIP_TIMEOUT_S)]
     return cmd
 
 
@@ -382,7 +410,10 @@ async def _agent_fix_advice(source: Path, error: str) -> dict:
         "严格按如下 JSON 输出，顶层键必须同时为 requirements 与 reason：\n"
         '{"requirements": ["numpy", "pandas==2.2.2"], "reason": "改了哪些包、为什么"}'
     )
-    result = await agent_service.run_sync(prompt, cwd=str(source), output_schema=FIX_SCHEMA)
+    try:
+        result = await agent_service.run_sync(prompt, cwd=str(source), output_schema=FIX_SCHEMA)
+    except Exception as e:  # noqa: BLE001 —— 修正建议 agent 失败不应掩盖 pip 的真实错误
+        return {"_advice_error": str(e)[:500]}
     return result.get("structured_output") or {}
 
 

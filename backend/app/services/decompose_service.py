@@ -158,7 +158,13 @@ def ingest_precheck(project_id: str) -> dict:
     module_version = knowledge_service.next_module_version(module_id)
     if knowledge_service.get_module(module_id, module_version):
         raise ValueError(f"模块 {module_id} 的 {module_version} 已入库，请确认后再入库")
-    return {"module_id": module_id, "module_version": module_version}
+    # 需求/设计 6.5 异常与边界「重复模块（同项目同结构）→ 提示已有，支持覆盖为新版本」：
+    # 不阻断，但把已有版本回给调用方，由界面提示「同结构此前已入库 vN，本次生成新版本」
+    return {
+        "module_id": module_id,
+        "module_version": module_version,
+        "existing_versions": knowledge_service.list_module_versions(module_id),
+    }
 
 
 def regenerate(project_id: str) -> str:
@@ -167,6 +173,27 @@ def regenerate(project_id: str) -> str:
     if ir is None:
         raise LookupError("ir not found：请先 POST /api/projects/{id}/decompose")
     return ir_codegen.generate(ir)
+
+
+def update_input_spec(project_id: str, shape: list, dtype: Optional[str] = None) -> dict:
+    """修正入口输入规格（6.1/6.2）：agent 对「尺寸由运行期构造参数决定」的模型给不出具体维度时，
+    由用户/工具补上；写回后 ir_hash 变化 → 旧验证变 stale（与调参同口径）。
+
+    shape 必须是非空正整数数组（不允许 null 维度：无法据此构造输入）。
+    """
+    project = _require_original(project_id)
+    ir = _read_ir(project)
+    if ir is None:
+        raise LookupError("ir not found：请先 POST /api/projects/{id}/decompose")
+    if not isinstance(shape, list) or not shape or not all(isinstance(d, int) and d > 0 for d in shape):
+        raise ValueError("shape 必须是非空正整数数组（如 [1, 64]），不接受 null/非正数维度")
+    spec = dict(ir.get("input_spec") or {})
+    spec["shape"] = shape
+    if dtype:
+        spec["dtype"] = dtype
+    ir["input_spec"] = spec
+    _write_ir(project, ir)
+    return spec
 
 
 def update_node_params(project_id: str, node_id: str, params: dict) -> dict:
@@ -453,6 +480,18 @@ async def _run_trace(params: dict, task_id: str) -> None:
     ir = _read_ir(project)
     if ir is None:
         raise RuntimeError("尚未拆解：请先 POST /api/projects/{id}/decompose")
+    missing = [n["id"] for n in ir["nodes"]
+               if n.get("input_shape") is None or n.get("output_shape") is None]
+    if not missing:
+        # 3.2「读 IR 统计形状缺失（无缺失直接跳过）」：省掉一次项目环境跑模型
+        knowledge_service.record_run({
+            "project_id": project_id, "task_id": task_id, "run_type": "decompose_trace",
+            "command": "trace skipped (shapes complete)", "status": "success",
+            "metrics": {"skipped": True, "reason": "IR 形状已完整"},
+            "started_at": _now(), "finished_at": _now(),
+        })
+        task_manager.update_progress(task_id, {"skipped": True, "reason": "IR 形状已完整，无需追踪"})
+        return
     python = analysis_service._project_python(ws)
     if python is None:
         raise RuntimeError("项目环境未就绪：未找到独立环境解释器，请先完成环境创建（模块一 env）")

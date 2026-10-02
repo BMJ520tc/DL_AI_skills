@@ -167,6 +167,10 @@ def main() -> None:
     cls = load_entry_class(source_dir, ir["source_file"], ir["entry_class"])
     spec = ir.get("input_spec") or {}
     shape = list(spec.get("shape") or [1, 3, 32, 32])
+    if not shape or not all(isinstance(d, int) and d > 0 for d in shape):
+        print("input_spec.shape 含非正整数维度（如 null），无法构造输入："
+              "请先 PUT /api/projects/{id}/ir/input_spec 指定具体形状（如 [1, 64]）", file=sys.stderr)
+        sys.exit(3)
     dtype = getattr(torch, str(spec.get("dtype") or "float32"), torch.float32)
 
     orig = instantiate(cls).eval()

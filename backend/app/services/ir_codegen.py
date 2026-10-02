@@ -246,6 +246,8 @@ def _module_class(ir: dict, node: dict) -> str:
         nid = n["id"]
         if nid in container_children:
             continue
+        if _isolated(nid) and nid not in sinks:
+            continue      # 未参与数据流的属性（如未使用的 self.relu）：只实例化，不出 forward 行
         in_vars = []
         for e in in_edges(ir, nid):
             src = e.get("from")
@@ -267,11 +269,22 @@ def _module_class(ir: dict, node: dict) -> str:
             in_var = in_vars[0] if in_vars else "x"
             fwd_lines.append(f"        var_{nid} = self.{nid}({in_var})")
 
-    # 汇点：出边全部止于自身子树内部（或模块之外）的直接子节点 = 本模块的输出
+    # 汇点：出边全部止于自身子树内部（或模块之外）的直接子节点 = 本模块的输出。
+    # 注意「孤立子节点」：既无入边也无出边（典型如定义了但 forward 未使用的 self.relu），
+    # 不应算作汇点——否则真实仓库里这类模型会被判「多汇点」而无法再生成。
+    def _isolated(cid: str) -> bool:
+        members = {cid} | _subtree_ids(ir, cid)
+        has_in = any(e["from"] in owner and owner[e["from"]] != cid for m in members for e in in_edges(ir, m))
+        has_out = any((ow := owner.get(e["to"])) is not None and ow != cid
+                      for m in members for e in out_edges(ir, m))
+        return not has_in and not has_out
+
+    candidates = [cid for cid in child_ids
+                  if cid not in container_children and not _isolated(cid)]
+    if not candidates:      # 全是孤立子节点：唯一子节点视为输出
+        candidates = [cid for cid in child_ids if cid not in container_children]
     sinks = []
-    for cid in child_ids:
-        if cid in container_children:
-            continue
+    for cid in candidates:
         members = {cid} | _subtree_ids(ir, cid)
         consumed = any(
             (ow := owner.get(e["to"])) is not None and ow != cid

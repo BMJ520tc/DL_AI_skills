@@ -11,6 +11,7 @@ import asyncio
 import os
 import signal
 import subprocess
+from pathlib import Path
 from typing import Optional
 
 
@@ -53,8 +54,19 @@ async def run_command(
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
+    # numba（dcor/scanpy 等依赖会用）默认把 JIT 缓存写进 site-packages，编译产物文件名极长；
+    # 项目工作区路径本就深，容易突破 Windows MAX_PATH(260) → FileNotFoundError。
+    # 统一把缓存指到项目内的短目录（可用 NUMBA_CACHE_DIR 覆盖）。
+    run_env = {**os.environ, **(env or {})}
+    if os.name == "nt" and not run_env.get("NUMBA_CACHE_DIR"):
+        short_cache = Path(__file__).resolve().parents[3] / "data" / "numba_cache"
+        try:
+            short_cache.mkdir(parents=True, exist_ok=True)
+            run_env["NUMBA_CACHE_DIR"] = str(short_cache)
+        except OSError:
+            pass
     proc = await asyncio.create_subprocess_exec(
-        *cmd, cwd=cwd, env=env,
+        *cmd, cwd=cwd, env=run_env,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         **kwargs,
     )

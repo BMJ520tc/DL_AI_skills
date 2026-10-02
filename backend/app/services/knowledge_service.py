@@ -738,6 +738,21 @@ def get_latest_run(project_id: str, run_type: str, status: str = "success") -> O
     return dict(row) if row else None
 
 
+def list_module_versions(module_id: str) -> list[str]:
+    """某 module_id 已入库的版本列表（升序）——供入库前提示「同结构已存在」。"""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT module_version FROM module WHERE module_id = ?", (module_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+    def _key(v: str) -> int:
+        m = re.match(r"v(\d+)", v or "")
+        return int(m.group(1)) if m else 0
+    return sorted((r["module_version"] for r in rows), key=_key)
+
+
 def next_module_version(module_id: str) -> str:
     """标准化模块版本号：同 module_id 递增 v1,v2,…（模块表复合主键 (module_id, module_version)）。"""
     conn = get_connection()

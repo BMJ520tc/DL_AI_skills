@@ -101,6 +101,23 @@ class NodeParamsBody(BaseModel):
     params: dict
 
 
+class InputSpecBody(BaseModel):
+    shape: list[int]
+    dtype: str | None = None
+
+
+@ir_router.put("/ir/input_spec")
+def update_input_spec(project_id: str, body: InputSpecBody) -> dict:
+    """修正入口输入规格（agent 给不出具体维度时的补参通道）；写回后旧验证变 stale。"""
+    _require_original(project_id)
+    try:
+        return decompose_service.update_input_spec(project_id, body.shape, body.dtype)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @ir_router.put("/ir/nodes/{node_id}")
 def update_node(project_id: str, node_id: str, body: NodeParamsBody) -> dict:
     """调参回写（6.2）；写回后旧验证经 ir_hash 变 stale，入库前需重新验证。"""
