@@ -55,7 +55,7 @@ Python 的 FastAPI）。`agents/prompts/` 里是交给大模型的任务提示�
 ## 四、常用命令
 
 ```powershell
-# 后端自动化用例（当前 100 个，全部通过）
+# 后端自动化用例（当前 104 个，全部通过）
 backend\.venv\Scripts\python.exe scripts/run_tests.py
 
 # 前端：代码规范检查（当前 0 问题）与构建
@@ -66,7 +66,9 @@ cd frontend; npm run lint; npm run build
 backend\.venv\Scripts\python.exe scripts/ui_check_4a.py
 backend\.venv\Scripts\python.exe scripts/ui_check_4b.py
 backend\.venv\Scripts\python.exe scripts/ui_check_4c.py
-#   4c 会真实跑一次 CPU 训练（smoke 环境 torch 2.14.1+cpu，目录联接挂进临时项目），约 4 分钟
+backend\.venv\Scripts\python.exe scripts/ui_check_4d2.py
+#   4c 会真实跑一次 CPU 训练（smoke 环境 torch 2.14.1+cpu，目录联接挂进临时项目），约 4 分钟；
+#   4d2 覆盖 M5 三条（版本树/对比/回退），无训练链路、不需要 venv_smoke
 
 # 不需要模型接口凭证的端到端自检：
 #   在项目自己的运行环境里「补形状 → 回填参数 → 再生成代码 → 结构比对 + 数值比对」，
@@ -85,9 +87,10 @@ cd backend; $env:PIP_INDEX_URL="https://mirrors.cloud.tencent.com/pypi/simple"; 
 前五个阶段的目标（基线准备、模型加载与代码分析、跨数据集对比、论文自动复现、模型拆解入库）都已验收通过；
 **阶段4「画布自建」进行中**：4a（三并列入口 / 画布新建模型 / 守卫回归）、4b（params_schema 参数面板联动、
 模块库注入守卫回归）、4c（网络保存收口 / 训练运行 API 与运行面板，导出即所存即所训）、4d-1（git 初始化
-与保存即提交 / 运行即提交，版本提交失败透出不静默）已完成并通过构建产物界面自检（22/22、23/23、
-17/17，其中 4c 真实 CPU 训练端到端走通），
-下一步 4d-2（版本树 / 对比 / 回退 UI）→ M4 验收。
+与保存即提交 / 运行即提交，版本提交失败透出不静默）、4d-2（版本树 / 两版本代码+参数对比 / 回退记为新版本
+及其版本面板 UI）已完成并通过构建产物界面自检（22/22、23/23、17/17、14/14，其中 4c 真实 CPU 训练端到端
+走通、4d2 覆盖 M5 三条验收判据），
+下一步 M4 验收。
 本地主干领先远端几个提交，尚未推送。
 
 ## 六、提交约定
