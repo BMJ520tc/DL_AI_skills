@@ -25,3 +25,6 @@ dist/
 .vscode/
 .idea/
 .DS_Store
+
+# 误建在仓库根的 numba JIT 缓存（shell 传入 NUMBA_CACHE_DIR 时反斜杠被吞，正确位置是 data/numba_cache）
+vs_wordDL-AI-skillsdatanumba_cache/
