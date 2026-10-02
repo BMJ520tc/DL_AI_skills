@@ -55,7 +55,7 @@ export class ConcatNode {
         return `${out} = torch.cat([${args}], dim=${dim})`;
     }
 
-    static computeShape(_data: ConcatData) {
+    static computeShape() {
         return [];
     }
 

@@ -9,11 +9,11 @@ type SaveModuleModalProps = {
     // setPendingVariables: (val: Record<string, FieldSpec>) => void;
     paramToVariableMap: Record<string, Record<string, string>>;
     // setParamToVariableMap: (val: React.SetStateAction<Record<string, string>>) => void; // Allow functional update to match hook
-    promotableParams: Array<{ nodeId: string; nodeLabel: string; paramName: string; spec: any }>;
+    promotableParams: Array<{ nodeId: string; nodeLabel: string; paramName: string; spec: FieldSpec }>;
     onAddVariable: () => void;
     onRenameVariable: (oldName: string, newName: string) => void;
     onDeleteVariable: (varName: string) => void;
-    onUpdateMapping: (nodeId: string, paramName: string, variableName: string, spec?: any) => void;
+    onUpdateMapping: (nodeId: string, paramName: string, variableName: string, spec?: FieldSpec) => void;
 };
 
 export function SaveModuleModal({

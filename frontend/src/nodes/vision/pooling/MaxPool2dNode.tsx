@@ -55,7 +55,7 @@ export class MaxPool2dNode {
         return `${outputVar} = self.${name}(${inputVar})`;
     }
 
-    static computeShape(_data: PoolData) {
+    static computeShape() {
         return [];
     }
 

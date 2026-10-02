@@ -58,7 +58,7 @@ export class TransposeNode {
         return `${out} = ${inputVar}.permute(${perm})`;
     }
 
-    static computeShape(_data: TransposeData) {
+    static computeShape() {
         return [];
     }
 

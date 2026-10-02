@@ -58,7 +58,10 @@ const getDataSig = (nodeList: Node[]) => {
         .map(n => {
             const d = n.data || {};
             // Exclude large objects or UI flags to prevent recursions
-            const { internalNodes, internalEdges, __highlight, ...stableData } = d;
+            const stableData: Record<string, unknown> = { ...d };
+            delete stableData.internalNodes;
+            delete stableData.internalEdges;
+            delete stableData.__highlight;
             const stableString = JSON.stringify(stableData, Object.keys(stableData).sort());
             return `${n.id}.${stableString}`;
         })
@@ -243,7 +246,7 @@ export function useContainerSystem(
             setNodes(nds => nds.map(n => (n.id === node.id ? processedNode : n)));
             dragStartRef.current = null;
         },
-        [getNodes, setNodes],
+        [getNodes, setNodes, config],
     );
 
     // 3. SYNC DATA

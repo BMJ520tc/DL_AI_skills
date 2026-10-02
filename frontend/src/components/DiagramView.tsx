@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Edge, Node } from "@xyflow/react";
 import { layoutDiagramWithElk, type LayoutDirection } from "../utils/layout";
 import { buildGraphIR } from "../utils/graphIR";
-import type { GraphIR } from "../types/graph";
+import type { DiagramGraphInput } from "../types/graph";
 import { projectGraphToDiagram } from "../utils/diagramProjector";
 import type { ReactNode } from "react";
 
@@ -97,7 +97,7 @@ export default function DiagramView({
     edges: Edge[];
     direction?: LayoutDirection;
     onClose: () => void;
-    graph?: GraphIR;
+    graph?: DiagramGraphInput;
     extraActions?: ReactNode;
     fullscreen?: boolean;
     /** 受控形状开关（传入时由外部驱动，隐藏内置勾选框）。 */
@@ -111,7 +111,7 @@ export default function DiagramView({
     const showShapes = showShapesProp ?? showShapesState;
     const [sizingMode, setSizingMode] = useState<"spacious" | "compact">("spacious");
     const [dir, setDir] = useState<LayoutDirection>(direction);
-    const graphInput = useMemo<GraphIR>(() => graph ?? buildGraphIR(nodes, edges), [graph, nodes, edges]);
+    const graphInput = useMemo<DiagramGraphInput>(() => graph ?? buildGraphIR(nodes, edges), [graph, nodes, edges]);
     const projected = useMemo(
         () =>
             projectGraphToDiagram(graphInput, {

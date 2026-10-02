@@ -22,7 +22,8 @@ export function useExportSystem({ nodes, edges, modules }: UseExportSystemProps)
     };
 
     // Helper to calculate the bounds of the graph for image export
-    const getGraphBounds = () => {
+    // 记忆化：exportPng/exportSvg 以它为依赖，保证这两个回调身份稳定。
+    const getGraphBounds = useCallback(() => {
         const currentNodes = getNodes();
         if (currentNodes.length === 0) return null;
         
@@ -35,7 +36,7 @@ export function useExportSystem({ nodes, edges, modules }: UseExportSystemProps)
             2, 0
         );
         return { width: nodesBounds.width, height: nodesBounds.height, viewport };
-    };
+    }, [getNodes]);
 
     const exportJson = useCallback(() => {
         console.log("exporting json")
@@ -56,7 +57,7 @@ export function useExportSystem({ nodes, edges, modules }: UseExportSystemProps)
         } finally {
             setIsExporting(false);
         }
-    }, [nodes, edges]);
+    }, [nodes, edges, modules]);
 
     const exportPng = useCallback(async () => {
         console.log("exporting json")
@@ -85,7 +86,7 @@ export function useExportSystem({ nodes, edges, modules }: UseExportSystemProps)
         } finally {
             setIsExporting(false);
         }
-    }, [getNodes]);
+    }, [getGraphBounds]);
 
     const exportSvg = useCallback(async () => {
         console.log("exporting svg")
@@ -114,7 +115,7 @@ export function useExportSystem({ nodes, edges, modules }: UseExportSystemProps)
         } finally {
             setIsExporting(false);
         }
-    }, [getNodes]);
+    }, [getGraphBounds]);
 
     return {
         exportJson,

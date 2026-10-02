@@ -39,7 +39,7 @@ export class AddNode {
         return `${out} = ${sumExpr}`;
     }
 
-    static computeShape(_data: AddData) {
+    static computeShape() {
         return [];
     }
 

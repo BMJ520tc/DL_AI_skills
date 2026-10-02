@@ -48,10 +48,11 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
 
     const getTraceInputShapes = useCallback((): number[][] => {
         const isValidShape = (vals: number[]) => vals.length > 0 && vals.every(v => Number.isFinite(v) && v > 0);
-        const readDimsFromData = (data: any): number[] | null => {
-            const liveShape = Array.isArray(data?.__shape) ? data.__shape : null;
-            if (liveShape && isValidShape(liveShape)) return liveShape as number[];
-            const dims = Array.isArray(data?.dims) ? data.dims : [];
+        const readDimsFromData = (data: unknown): number[] | null => {
+            const bag = (data && typeof data === "object") ? (data as Record<string, unknown>) : null;
+            const liveShape = bag && Array.isArray(bag.__shape) ? (bag.__shape as number[]) : null;
+            if (liveShape && isValidShape(liveShape)) return liveShape;
+            const dims = bag && Array.isArray(bag.dims) ? bag.dims : [];
             if (dims.length) {
                 const parsed: number[] = dims.map((d: { size?: unknown }) => Number(d?.size));
                 if (isValidShape(parsed)) return parsed;
@@ -62,7 +63,7 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
         const shapes: number[][] = [];
         const inputNodes = nodes.filter(n => n.type === "input_layer");
         for (const node of inputNodes) {
-            const data = (node.data && typeof node.data === "object") ? (node.data as any) : {};
+            const data: Record<string, unknown> = (node.data && typeof node.data === "object") ? node.data : {};
             const shape = readDimsFromData(data);
             if (shape) {
                 shapes.push(shape);
@@ -87,7 +88,9 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
                 continue;
             }
             if (node.type === "module_ref") {
-                const moduleId = (node.data as any)?.moduleId;
+                // moduleId 由 getInitialNodeData 写成字符串；非字符串视为未设置。
+                const rawModuleId = node.data?.moduleId;
+                const moduleId = typeof rawModuleId === "string" ? rawModuleId : undefined;
                 const mod = moduleId ? getModule(moduleId) : undefined;
                 const internal = mod?.internalNodes || [];
                 const internalInputNodes = internal.filter(n => n.type === "input_layer");
@@ -115,7 +118,7 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
         if (shapeResultRef.current === currentShapesStr) return;
 
         setNodes(currentNodes => {
-            const deepEqual = (a: any, b: any): boolean => {
+            const deepEqual = (a: unknown, b: unknown): boolean => {
                 if (a === b) return true;
                 if (!Array.isArray(a) || !Array.isArray(b)) return false;
                 if (a.length !== b.length) return false;
@@ -181,7 +184,7 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
         } finally {
             setTraceLoading(false);
         }
-    }, [nodes, edges, generatedCode, shapeResult]);
+    }, [nodes, edges, generatedCode, shapeResult, getTraceInputShapes]);
 
     const shapeComparisons = useMemo(
         () => (traceData ? buildShapeComparisons(traceData, shapeResult, edges, nodes, LAYER_REGISTRY) : []),

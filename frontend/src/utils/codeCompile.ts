@@ -1,7 +1,7 @@
 import type { Edge, Node } from "@xyflow/react";
 import type { ModuleRefData } from "../nodes/ModuleRefNode";
 import { LAYER_REGISTRY } from "./layerRegistry";
-import { getModule } from "./moduleRegistry";
+import { getModule, type SavedModule } from "./moduleRegistry";
 
 export type CodeSpan = {
     line: number;
@@ -65,8 +65,8 @@ export function createCustomComponentDAG(
 // This function works on the module level code generator and uses the generate main code function to generate code for individual modules.
 // It first sorts the module ids based on the way they should be arranged in the code and then writes the code.
 export function recursiveCodeGenerator(nodes: Node[], edges: Edge[]): CodeGenResult {
-    let order: string[] = [];
-    let color: Record<string, number> = {};
+    const order: string[] = [];
+    const color: Record<string, number> = {};
     createCustomComponentDAG("0", nodes, order, color);
 
     // *
@@ -81,7 +81,7 @@ export function recursiveCodeGenerator(nodes: Node[], edges: Edge[]): CodeGenRes
     lines.push("import torch", "import torch.nn as nn");
     spans.push({ line: 1, kind: "header" }, { line: 2, kind: "header" });
 
-    let generatedCode: CodeGenResult = { code: lines.join("\n"), spans };
+    const generatedCode: CodeGenResult = { code: lines.join("\n"), spans };
 
     let moduleNodes: Node[];
     let moduleEdges: Edge[];
@@ -89,14 +89,14 @@ export function recursiveCodeGenerator(nodes: Node[], edges: Edge[]): CodeGenRes
     let lineOffset: number = lines.length;
 
     order.forEach(moduleId => {
-        let savedModule: any = null;
+        let savedModule: SavedModule | null = null;
         if (moduleId === "0") {
             // Accidental clash?
             moduleNodes = nodes;
             moduleEdges = edges;
             moduleName = "GeneratedModel";
         } else {
-            savedModule = getModule(moduleId);
+            savedModule = getModule(moduleId) ?? null;
             if (savedModule) {
                 moduleNodes = savedModule?.internalNodes || [];
                 moduleEdges = savedModule?.internalEdges || [];
@@ -111,7 +111,7 @@ export function recursiveCodeGenerator(nodes: Node[], edges: Edge[]): CodeGenRes
         generatedCode.code += "\n\n\n";
         lineOffset += 2;
 
-        let moduleCode = generateMainCode(moduleNodes, moduleEdges, moduleName, lineOffset, savedModule);
+        const moduleCode = generateMainCode(moduleNodes, moduleEdges, moduleName, lineOffset, savedModule);
 
         generatedCode.code += moduleCode.code;
         generatedCode.spans.push(...moduleCode.spans);
@@ -184,8 +184,9 @@ export function compileGraphToScript(
     // 若像原先那样按「消费侧/生产侧各自的下标」兜底，同一根边两侧会得到不同名字，
     // 导出的 forward 会引用未定义变量、代码不可编译（GB-1 验证暴露）。
     const edgeVarName = (edge: Edge): string => {
-        const label = (edge.data as any)?.label;
-        if (label) return getVarName(label);
+        const label = edge.data?.label;
+        // label 为动态 data 字段；非字符串时按模板插值的字符串化结果处理，保持原名。
+        if (label) return getVarName(String(label));
         const stable = edge.id ? sanitizeIdent(`edge_${edge.id}`) : getVarName("edge");
         return sanitizeIdent(`${variablePrefix}${stable}`);
     };
@@ -242,7 +243,7 @@ export function compileGraphToScript(
 
             const outEdges = outgoingEdges[node.id];
             const handlesSpec =
-                typeof ClassRef.handles === "function" ? ClassRef.handles(node.data as any) : ClassRef.handles;
+                typeof ClassRef.handles === "function" ? ClassRef.handles(node.data) : ClassRef.handles;
             const sourceHandles = handlesSpec?.sources && handlesSpec.sources.length ? handlesSpec.sources : [];
             const outputNames = (sourceHandles || []).length
                 ? sourceHandles.map((handleId, idx) => {
@@ -286,7 +287,7 @@ export function generateMainCode(
     edges: Edge[], 
     name: string, 
     lineOffset: number,
-    savedModule?: any // Optional: saved module with variableSchema and variableMap
+    savedModule?: SavedModule | null // Optional: saved module with variableSchema and variableMap
 ): CodeGenResult {
     const lines: string[] = [];
     const spans: CodeSpan[] = [];
@@ -296,14 +297,16 @@ export function generateMainCode(
 
     // Build __init__ signature with variable schema parameters
     const variableSchema = savedModule?.variableSchema || {};
-    const pyLiteral = (spec: any, value: any) => {
+    // spec 来自可持久化/后端注入的模块 schema，运行时 type 可能取约定外的字符串，
+    // 因此按 unknown 比较，保持原有判定结果。
+    const pyLiteral = (spec: { type?: unknown } | undefined, value: unknown): string => {
         if (value === undefined || value === null) return "None";
         if (spec?.type === "string") return `"${value}"`;
         if (spec?.type === "boolean") return value ? "True" : "False";
         return `${value}`;
     };
 
-    const variableParams = Object.entries(variableSchema).map(([varName, spec]: [string, any]) => {
+    const variableParams = Object.entries(variableSchema).map(([varName, spec]) => {
         const required = spec?.required ?? false;
         const defaultValue = spec?.defaultValue;
         if (required) return varName;

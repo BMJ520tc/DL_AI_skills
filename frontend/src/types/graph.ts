@@ -44,3 +44,32 @@ export interface GraphIR {
     nodes: GraphNode[];
     edges: GraphEdge[];
 }
+
+// ---------------------------------------------------------------------------
+// 图示投影的最小输入契约。
+//
+// `projectGraphToDiagram` / `DiagramView` 只读取下列字段（不读 handles/label），
+// 因此完整 GraphIR 与画布上的 React Flow 快照都可以直接传入。
+// ---------------------------------------------------------------------------
+
+export interface DiagramNodeInput {
+    id: string;
+    type?: string;
+    display?: GraphDisplay;
+    data?: Record<string, unknown>;
+    position?: { x: number; y: number };
+}
+
+export interface DiagramEdgeInput {
+    id: string;
+    source: string;
+    target: string;
+    sourceHandle?: string | null;
+    targetHandle?: string | null;
+    data?: Record<string, unknown>;
+}
+
+export interface DiagramGraphInput {
+    nodes: DiagramNodeInput[];
+    edges: DiagramEdgeInput[];
+}

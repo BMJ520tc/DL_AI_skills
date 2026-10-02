@@ -17,7 +17,7 @@ export class BCELossNode {
         return { ok: true as const };
     }
 
-    static shapeCompute(_data: LossData, _inputShapes: number[][]) {
+    static shapeCompute() {
         return [];
     }
 

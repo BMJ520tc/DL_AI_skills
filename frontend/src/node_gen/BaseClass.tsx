@@ -8,10 +8,23 @@ export interface FieldSpec {
     required: boolean;
     label?: string;
     options?: string[];
-    defaultValue?: any;
+    defaultValue?: unknown;
     step?: number;
 }
-export type LayerData = Record<string, any>;
+/** 节点参数包：各图层的参数值类型不一（number/text/boolean/...），统一以 unknown
+ *  存放，读取处按需收窄。 */
+export type LayerData = Record<string, unknown>;
+
+/** 模块变量映射：变量名 -> 需要被替换为该变量的 (节点, 参数) 列表。 */
+export type VariableMap = Record<string, Array<{ nodeId: string; paramName: string }>>;
+
+/** 图层注册表：图层 key -> 图层定义。各图层数据形状不同，调用处传入 React Flow 的
+ *  `node.data`（同样是 Record<string, unknown>），因此这里统一按 LayerData 处理。 */
+export type LayerRegistry = Record<string, LayerDefinition<LayerData>>;
+
+/** shapeCompute 的返回形态：单个形状（number[]）、多输出形状列表（number[][]，
+ *  容器类图层历史上如此返回），或按 handle 名索引的形状映射。 */
+export type ShapeComputeResult = number[] | number[][] | Record<string, number[]>;
 
 // These are static class level static function implementation
 // all attributes and methods MUST be static in nature to the class
@@ -28,14 +41,15 @@ export interface LayerDefinition<D extends LayerData> {
     encapsulatesChildInit?: boolean | undefined;
     // Pure functions
     // shapeVerifier: checks compatibility of incoming shapes/params, must NOT modify data
-    shapeVerifier(data: D, inputShapes: number[][]): { ok: true } | { ok: false; error: string };
+    shapeVerifier(data: D, inputShapes: number[][], registry?: LayerRegistry): { ok: true } | { ok: false; error: string };
     // shapeCompute: computes output shape, assumes verifier passed
-    shapeCompute(data: D, inputShapes: number[][], context?: { registry: Record<string, any> }): number[] | Record<string, number[]>;
+    shapeCompute(data: D, inputShapes: number[][], registry?: LayerRegistry): ShapeComputeResult;
     // estimateCost: optional params/FLOPs estimate for analysis panels. Currently WIP. 
-    estimateCost?: (data: D, inputShapes: number[][], outputShape: number[]) => { params: number; flops: number };
-    getInitCode(data: D, name: string, variableMap?:any): string;
+    // 与方法型成员保持一致：参数按双变（bivariant）检查，允许各图层使用自己的数据形状。
+    estimateCost?(data: D, inputShapes: number[][], outputShape: number[], context?: { registry: LayerRegistry }): { params: number; flops: number };
+    getInitCode(data: D, name: string, variableMap?: VariableMap): string;
     getForwardCode(data: D, name: string, inputs: Array<string>, outputs: Array<string>): string;
-    Component: ComponentType<NodeProps<any>>;
+    Component: ComponentType<NodeProps>;
 }
 
 export type HandleSpec = {
@@ -47,144 +61,24 @@ export type HandleFactory<D> = (data: D) => HandleSpec;
 // Utility: get a parameter value with default fallback from schema
 type HasParamSchema = { paramSchema: Record<string, FieldSpec> };
 
-export function getParamValue<D extends LayerData, K extends keyof D & string>(
+export function getParamValue(
     schemaOrLayer: Record<string, FieldSpec> | HasParamSchema,
-    data: Partial<D> | undefined,
-    key: K
-): D[K] | FieldSpec["defaultValue"] {
+    data: object | undefined,
+    key: string
+): unknown {
     const schema = (schemaOrLayer as HasParamSchema).paramSchema ?? (schemaOrLayer as Record<string, FieldSpec>);
     const spec = schema[key];
-    const val = data?.[key];
+    const val = (data as Record<string, unknown> | undefined)?.[key];
     if (spec?.type === "number") {
         return typeof val === "number" && !Number.isNaN(val) ? val : spec?.defaultValue;
     }
     return val !== undefined ? val : spec?.defaultValue;
 }
 
-export function InputControl({
-    paramKey,
-    spec,
-    value,
-    onChange
-}: {
-    paramKey: string;
-    spec: FieldSpec;
-    value: any;
-    onChange: (key: string, type: FieldType) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => void;
-}) {
-    const isOptional = !spec.required;
-    const style = (isOptional && value !== undefined)
-        ? {
-            width: "60px",
-            backgroundColor: "#111",
-            border: "1px solid #64ffda",
-            color: "white",
-            borderRadius: "4px",
-            padding: "2px 4px",
-            fondSize: "11px"
-        }
-        : {
-            width: "60px",
-            backgroundColor: "#111",
-            border: "1px solid #444",
-            color: "white",
-            borderRadius: "4px",
-            padding: "2px 4px",
-            fondSize: "11px"
-        };
-    switch (spec.type) {
-        case "boolean":
-            return (
-                <input
-                    className="nodrag"
-                    type="checkbox"
-                    checked={!!value}
-                    onChange={onChange(paramKey, "boolean")}
-                    style={{ cursor: "pointer" }}
-                />
-            );
-        case "select":
-            return (
-                <select
-                    className="nodrag"
-                    value={value ?? ""}
-                    onChange={onChange(paramKey, "select")}
-                    style={{ ...style, width: "80px" }}
-                >
-                    <option value="" disabled>...</option>
-                    {spec.options?.map(opt => (
-                        <option key={opt} value={opt}>
-                            {opt}
-                        </option>
-                    ))}
-                </select>
-            );
-        case "text":
-            return (
-                <input
-                    className="nodrag"
-                    type="text"
-                    value={value ?? ""}
-                    onChange={onChange(paramKey, "text")}
-                    style={{ ...style, width: "80px" }}
-                />
-            );
-        case "number":
-            return (
-                <input
-                    className="nodrag"
-                    type="number"
-                    step={spec.step || 1}
-                    value={value ?? ""}
-                    onChange={onChange(paramKey, "number")}
-                    placeholder={isOptional ? "" : "0"}
-                    style={style}
-                />
-            );
-    }
-}
-
-export function ParamsList<D>({
-    renderKeys,
-    optionalParams,
-    paramSchema,
-    data,
-    onChange,
-    onExpand,
-    hiddenCount
-}: {
-    renderKeys: string[];
-    optionalParams: string[];
-    paramSchema: Record<string, FieldSpec>;
-    data: D;
-    onChange: (key: string, type: FieldType) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => void;
-    onExpand: () => void;
-    hiddenCount: number;
-}) {
-    return (
-        <div style={{ padding: "10px" }}>
-            {renderKeys.map(key => {
-                const spec = paramSchema[key];
-                if (!spec) return null;
-                return (
-                    <div
-                        key={key}
-                        style={{ display: "flex", justifyContent: "space-between", marginBottom: "6px", alignItems: "center" }}
-                    >
-                        <label style={{ fontSize: "11px", color: optionalParams.includes(key) ? "#aaa" : "#fff" }}>
-                            {spec.label || key}
-                        </label>
-                        <InputControl paramKey={key} spec={spec} value={(data as any)[key]} onChange={onChange} />
-                    </div>
-                );
-            })}
-            {hiddenCount > 0 && (
-                <div onClick={onExpand} style={{ fontSize: "9px", color: "#666", textAlign: "center", cursor: "pointer" }}>
-                    + {hiddenCount} options
-                </div>
-            )}
-        </div>
-    );
+/** 把 unknown 参数值按 JS 关系运算的隐式转换取成数值：非数值得到 NaN
+ *  （所有比较均为 false），与迁移前 `as number` 后直接比较的结果一致。 */
+export function toNumberParam(value: unknown): number {
+    return typeof value === "number" ? value : Number(value);
 }
 
 export function renderHandles(side: "left" | "right", ids: string[], isConnectable: boolean) {
@@ -225,16 +119,19 @@ export function buildInitString(
     className: string,
     name: string,
     schema: Record<string, FieldSpec>,
-    data: Record<string, any>
+    data: object
 ) {
+    // 图层数据既可能是具体的数据类型别名，也可能是图层类本身（静态类实例类型没有
+    // 隐式索引签名），因此这里只要求 object，按 key 读取时再局部收窄。
+    const bag = data as Record<string, unknown>;
     const args: string[] = [];
     Object.keys(schema).forEach(key => {
         const spec = schema[key];
-        const value = data[key];
-        const toPython = (val: any) => {
+        const value = bag[key];
+        const toPython = (val: unknown): string => {
             if (spec.type === 'boolean') return val ? 'True' : 'False';
             if (spec.type === 'select' || spec.type === 'text') return `${val}`
-            return val
+            return `${val}`
         };
 
         if (spec.required) {

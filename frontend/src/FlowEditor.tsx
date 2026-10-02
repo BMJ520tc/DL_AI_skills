@@ -1,6 +1,6 @@
 import { ReactFlowProvider } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import React, { useMemo, useRef, useState } from "react";
+import React, { useCallback, useMemo, useRef, useState } from "react";
 import type { GraphIR } from "./types/graph";
 import { buildGraphIR } from "./utils/graphIR";
 
@@ -70,7 +70,12 @@ function FlowContent({ initialGraph, onSave }: FlowEditorProps) {
     });
 
     // 5. Module System
-    const modSys = useModuleSystem({ nodes, edges, setNodes, getNodeSchema: (type) => LAYER_REGISTRY[type]?.paramSchema });
+    // 稳定的 schema 查询入口：保证 useModuleSystem 内部 useMemo 的依赖稳定。
+    const getNodeSchema = useCallback(
+        (type: string) => LAYER_REGISTRY[type]?.paramSchema,
+        [],
+    );
+    const modSys = useModuleSystem({ nodes, edges, setNodes, getNodeSchema });
 
     // 6. Interaction (Drag/Drop, Selection)
     const interaction = useGraphInteraction({
@@ -91,9 +96,11 @@ function FlowContent({ initialGraph, onSave }: FlowEditorProps) {
     } = interaction;
 
     // Derived States for Visualization
+    // 先取出回调，保证 useMemo 的依赖就是该回调本身（而不是整个 trace 对象）。
+    const { getDecoratedEdges } = trace;
     const decoratedEdges = useMemo(() => {
-        return trace.getDecoratedEdges(edgesWithHandlers);
-    }, [edgesWithHandlers, trace.getDecoratedEdges]);
+        return getDecoratedEdges(edgesWithHandlers);
+    }, [edgesWithHandlers, getDecoratedEdges]);
 
     const highlightedEdgesList = useMemo(() => {
         if (!highlightEdges.size) return decoratedEdges;
@@ -425,9 +432,9 @@ function FlowContent({ initialGraph, onSave }: FlowEditorProps) {
 
             {layout.showDiagram && (
                 <DiagramView
-                    nodes={nodes as any}
-                    edges={edges as any}
-                    graph={{ nodes: nodes as any, edges: edges as any, version: 1, createdAt: new Date().toISOString() }}
+                    nodes={nodes}
+                    edges={edges}
+                    graph={{ nodes, edges }}
                     onClose={() => layout.setShowDiagram(false)}
                 />
             )}

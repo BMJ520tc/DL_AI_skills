@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { type FieldSpec, type FieldType, type LayerData } from "../../node_gen/BaseClass";
+import { type FieldSpec, type FieldType, type LayerData, type LayerRegistry } from "../../node_gen/BaseClass";
 // import { createLayerComponent } from "../../node_gen/CreateNodeComponent.tsx";
 import { Handle, NodeResizeControl, Position, useReactFlow, type Edge, type Node, type NodeProps } from "@xyflow/react";
 import { compileGraphToScript } from "../../utils/codeCompile";
@@ -29,7 +29,7 @@ export class RepeatLayerNode {
         }
     }
     // TODO: run actual simulation through this 
-    static shapeVerifier(data: RepeatLayerData, inputShapes: number[][], registry?: Record<string, any>) {
+    static shapeVerifier(data: RepeatLayerData, inputShapes: number[][], registry?: LayerRegistry) {
         // 1. SAFETY: Handle uninitialized data (Fixes the "New Node" crash)
         const safeData = data || { internalNodes: [], internalEdges: [] };
 
@@ -127,7 +127,7 @@ export class RepeatLayerNode {
         return inputShapes[0];
     }
 
-    static estimateCost(data: RepeatLayerData, inputShapes: number[][], _outputShape: number[], context?: { registry?: Record<string, any> }) {
+    static estimateCost(data: RepeatLayerData, inputShapes: number[][], _outputShape: number[], context?: { registry?: LayerRegistry }) {
         const registry = context?.registry;
         if (!registry) return { params: 0, flops: 0 };
         if (!data?.internalNodes?.length) return { params: 0, flops: 0 };
@@ -173,7 +173,7 @@ export class RepeatLayerNode {
         };
     }
 
-    static getInitCode(data: RepeatLayerData, _name: string) {
+    static getInitCode(data: RepeatLayerData) {
         if (!data.internalNodes || data.internalNodes.length === 0) {
             return `#Empty Loop`;
         }
@@ -242,7 +242,7 @@ export function createRepeatLayerComponent<D extends LayerData>(
         const [isExpanded] = useState(true);
         const safeData = data || ({} as D);
 
-        const childCount = (safeData as any).internalNodes?.length || 0;
+        const childCount = (safeData as { internalNodes?: Node[] }).internalNodes?.length || 0;
 
         const DEFAULT_W = 400;
         const DEFAULT_H = 300;
@@ -268,15 +268,15 @@ export function createRepeatLayerComponent<D extends LayerData>(
         }, [id, width, height, setNodes]);
         // const isHighlighted = !!(safeData as any).__highlight;
         const onChange = (key: string, type: FieldType) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
-            let newValue: any = e.target.value;
+            const raw = e.target.value;
+            let newValue: string | number | boolean | undefined = raw;
             if (type === "number") {
                 newValue = newValue === "" ? undefined : parseFloat(newValue);
             }
             setNodes(nds => nds.map(n => n.id === id ? { ...n, data: { ...n.data, [key]: newValue } } : n));
 
         };
-        const handleDelete = (_e: React.MouseEvent) => {
-            // e.stopPropagation();
+        const handleDelete = () => {
             setNodes(nodes => nodes.filter(n => n.id !== id))
             setEdges(eds => eds.filter(edge => edge.source !== id && edge.target !== id));
         }
@@ -399,7 +399,7 @@ export function createRepeatLayerComponent<D extends LayerData>(
                             <input
                                 type="number"
                                 className="nodrag"
-                                value={safeData['repetitions'] || 1}
+                                value={String(safeData['repetitions'] || 1)}
                                 onChange={onChange('repetitions', 'number')}
                                 style={{ width: '44px', fontSize: '12px', textAlign: 'center', fontWeight: 'bold', background: '#0b0d10', border: '1px solid #444', color: '#64ffda', borderRadius: 6, padding: '4px 0' }}
                             />

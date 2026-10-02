@@ -1,4 +1,5 @@
 import CodeViewer from "../../../components/CodeViewer";
+import type { CodeGenResult } from "../../../utils/codeCompile";
 
 type CodePanelProps = {
     showLiveCode: boolean;
@@ -8,7 +9,7 @@ type CodePanelProps = {
     setShowLiveCode: (val: boolean) => void;
     generatedCode: string;
     onDownloadCode: () => void;
-    generated: any; // spans and code
+    generated: CodeGenResult; // spans and code
     handleSelectionTargets: (targets: { nodeIds: string[], edgeIds: string[] }) => void;
 }
 

@@ -18,23 +18,19 @@ export default function CodeViewer({
     language = "python"
 }: Props) {
 
-    const [localCode, setLocalCode] = useState(code);
-    const [isDirty, setIsDirty] = useState(false);
-
-    useEffect(() => {
-        if (!isDirty) {
-            setLocalCode(code);
-        }
-    }, [code, isDirty]);
+    // The editor shows the generated code unless the user has typed a manual
+    // override. `draft === null` means "mirror the prop", which expresses the
+    // previous isDirty=false behaviour without a prop-syncing effect.
+    const [draft, setDraft] = useState<string | null>(null);
+    const localCode = draft ?? code;
+    const isDirty = draft !== null;
 
     const handleEditorChange = (value: string | undefined) => {
-        setLocalCode(value || "");
-        setIsDirty(true);
+        setDraft(value || "");
     };
 
     const handleReset = () => {
-        setLocalCode(code);
-        setIsDirty(false);
+        setDraft(null);
     };
 
     const spanByLine = useMemo(() => {

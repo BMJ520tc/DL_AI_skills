@@ -18,6 +18,18 @@ import {
 } from "../../../utils/moduleRegistry";
 import { getActiveModule, popModule, pushModule, type OpenModule } from "../../../utils/stackNavigation";
 
+/** 浅拷贝并去掉 saveModule 自行管理的元数据字段。
+ *  id 由 saveModule 处理，createdAt/updatedAt 由它重写，因此保存入参不含时间戳。 */
+function toModuleSaveInput(
+    mod: SavedModule,
+): Omit<SavedModule, "id" | "createdAt" | "updatedAt"> & { id?: string } {
+    const copy: Record<string, unknown> = { ...mod };
+    delete copy.createdAt;
+    delete copy.updatedAt;
+    // 运行时形状与目标类型一致：仅移除了上面两个时间戳键。
+    return copy as Omit<SavedModule, "id" | "createdAt" | "updatedAt"> & { id?: string };
+}
+
 /** 后端 ModuleItem.saved_module_compat → 基底 SavedModule（只读注入，不落 localStorage）。 */
 function compatToSavedModule(item: ModuleItem): SavedModule | null {
     if (!item.saved_module_compat) return null;
@@ -154,7 +166,8 @@ export function useModuleSystem({ nodes, edges, setNodes, getNodeSchema }: UseMo
     }, []);
     const deleteVariable = useCallback((varName: string) => {
         setPendingVariables(prev => {
-            const { [varName]: _unused, ...rest } = prev;
+            const rest = { ...prev };
+            delete rest[varName];
 
             return rest;
         });
@@ -210,8 +223,8 @@ export function useModuleSystem({ nodes, edges, setNodes, getNodeSchema }: UseMo
             // Logic for standard should go here
         });
         return params;
-    }, [showSaveModal, nodes, modules]);
-    const updateParamMapping = useCallback((nodeId: string, paramName: string, variableName: string, spec?: any) => {
+    }, [showSaveModal, nodes, modules, getNodeSchema]);
+    const updateParamMapping = useCallback((nodeId: string, paramName: string, variableName: string, spec?: FieldSpec) => {
         setParamToVariableMap(prev => {
             const existingNodeParams = prev[nodeId] || {};
             return {
@@ -450,11 +463,8 @@ export function useModuleSystem({ nodes, edges, setNodes, getNodeSchema }: UseMo
 
         importedModules.forEach(importedMod => {
             if (importedMod && importedMod.name && importedMod.graph) {
-                // Destructure to remove createdAt and updatedAt to satisfy the saveModule TypeScript signature
-                const { createdAt, updatedAt, ...modToSave } = importedMod;
-                
                 // saveModule handles ID matching, overriding, and saving to localStorage automatically
-                saveModule(modToSave);
+                saveModule(toModuleSaveInput(importedMod));
                 hasChanges = true;
             }
         });

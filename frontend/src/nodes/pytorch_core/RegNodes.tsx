@@ -1,4 +1,4 @@
-import { buildInitString, getParamValue, type FieldSpec } from "../../node_gen/BaseClass";
+import { buildInitString, getParamValue, toNumberParam, type FieldSpec } from "../../node_gen/BaseClass";
 import { estimateElementwiseCost } from "../../utils/computeUtils";
 import { createLayerComponent } from "../../node_gen/CreateNodeComponent.tsx";
 
@@ -12,7 +12,7 @@ export class DropoutNode {
 
     static shapeVerifier(data: DropoutNode, inputShapes: number[][]) {
         if (inputShapes.length !== 1) return { ok: false as const, error: "Dropout 期望一个输入" };
-        const p = getParamValue(this, data as any, "p") as number;
+        const p = toNumberParam(getParamValue(this, data, "p"));
         if (p < 0 || p > 1) return { ok: false as const, error: "p 必须在 [0,1] 之间" };
         return { ok: true as const };
     }
@@ -25,7 +25,7 @@ export class DropoutNode {
         return estimateElementwiseCost(outputShape);
     }
     static getInitCode(data: DropoutNode, name: string) {
-        return buildInitString("nn.Dropout", name, DropoutNode.paramSchema, data as any);
+        return buildInitString("nn.Dropout", name, DropoutNode.paramSchema, data);
     }
 
     static getForwardCode(_data: DropoutNode, name: string, inputs: Array<string>, outputs: Array<string>) {
@@ -34,7 +34,7 @@ export class DropoutNode {
         return `${outputVar} = self.${name}(${inputVar})`;
     }
 
-    static Component = createLayerComponent<any>(DropoutNode.label, DropoutNode.paramSchema);
+    static Component = createLayerComponent(DropoutNode.label, DropoutNode.paramSchema);
 }
 
 export class SpatialDropout2dNode {
@@ -52,10 +52,10 @@ export class SpatialDropout2dNode {
     static estimateCost = DropoutNode.estimateCost;
 
     static getInitCode(data: DropoutNode, name: string) {
-        return buildInitString("nn.Dropout2d", name, SpatialDropout2dNode.paramSchema, data as any);
+        return buildInitString("nn.Dropout2d", name, SpatialDropout2dNode.paramSchema, data);
     }
     static getForwardCode = DropoutNode.getForwardCode;
-    static Component = createLayerComponent<any>(SpatialDropout2dNode.label, SpatialDropout2dNode.paramSchema);
+    static Component = createLayerComponent(SpatialDropout2dNode.label, SpatialDropout2dNode.paramSchema);
 }
 
 export class AlphaDropoutNode {
@@ -66,10 +66,10 @@ export class AlphaDropoutNode {
     static shapeCompute = DropoutNode.shapeCompute;
     static estimateCost = DropoutNode.estimateCost;
     static getInitCode(data: DropoutNode, name: string) {
-        return buildInitString("nn.AlphaDropout", name, AlphaDropoutNode.paramSchema, data as any);
+        return buildInitString("nn.AlphaDropout", name, AlphaDropoutNode.paramSchema, data);
     }
     static getForwardCode = DropoutNode.getForwardCode;
-    static Component = createLayerComponent<any>(AlphaDropoutNode.label, AlphaDropoutNode.paramSchema);
+    static Component = createLayerComponent(AlphaDropoutNode.label, AlphaDropoutNode.paramSchema);
 }
 
 export class StochasticDepthNode {
@@ -81,7 +81,7 @@ export class StochasticDepthNode {
 
     static shapeVerifier(data: DropData, inputShapes: number[][]) {
         if (inputShapes.length !== 1) return { ok: false as const, error: "StochasticDepth 期望一个输入" };
-        const p = getParamValue(this, data as any, "p") as number;
+        const p = toNumberParam(getParamValue(this, data, "p"));
         if (p < 0 || p > 1) return { ok: false as const, error: "p 必须在 [0,1] 之间" };
         return { ok: true as const };
     }
@@ -94,7 +94,7 @@ export class StochasticDepthNode {
         return estimateElementwiseCost(outputShape);
     }
     static getInitCode(data: DropData, name: string) {
-        return buildInitString("nn.StochasticDepth", name, StochasticDepthNode.paramSchema, data as any);
+        return buildInitString("nn.StochasticDepth", name, StochasticDepthNode.paramSchema, data);
     }
 
     static getForwardCode(_data: DropData, name: string, inputs: Array<string>, outputs: Array<string>) {
@@ -103,5 +103,5 @@ export class StochasticDepthNode {
         return `${outputVar} = self.${name}(${inputVar})`;
     }
 
-    static Component = createLayerComponent<any>(StochasticDepthNode.label, StochasticDepthNode.paramSchema);
+    static Component = createLayerComponent(StochasticDepthNode.label, StochasticDepthNode.paramSchema);
 }

@@ -17,7 +17,7 @@ export class AccuracyNode {
         return { ok: true as const };
     }
 
-    static shapeCompute(_data: MetricData, _inputShapes: number[][]) {
+    static shapeCompute() {
         return []; // scalar metric
     }
 

@@ -26,7 +26,7 @@ type InputNodeData = InputData & { __shape?: number[]; __highlight?: boolean };
 
 export class InputNode {
     static label = "输入";
-    static diagramFamily = "input";
+    static diagramFamily = "input" as const;
     static paramSchema: Record<string, FieldSpec> = {};
     static handles = { targets: [], sources: ["out-0"] };
 
@@ -57,9 +57,9 @@ export class InputNode {
         return `${outputVar} = ${inputVar}  # input passthrough`;
     }
 
-    static Component = function InputComponent({ id, data, isConnectable }: NodeProps<any>) {
+    static Component = function InputComponent({ id, data, isConnectable }: NodeProps) {
         const { setNodes, setEdges } = useReactFlow();
-        const safeData = useMemo<InputNodeData>(() => data || {}, [data]);
+        const safeData = useMemo<InputNodeData>(() => (data ?? {}) as InputNodeData, [data]);
         const [isExpanded, setIsExpanded] = useState(true);
         const isHighlighted = !!safeData.__highlight;
 

@@ -1,4 +1,5 @@
 import type { Edge, Node } from "@xyflow/react";
+import type { LayerRegistry } from "../node_gen/BaseClass";
 // import { LAYER_REGISTRY } from "../types/nodeTypes";
 
 export type ShapeFailure = {
@@ -20,7 +21,7 @@ export type ShapeResult = {
     failures: ShapeFailure[];
 };
 
-export function verifyShapes(nodes: Node[], edges: Edge[], registry: Record<string, any>): ShapeResult {
+export function verifyShapes(nodes: Node[], edges: Edge[], registry: LayerRegistry): ShapeResult {
     const byId = Object.fromEntries(nodes.map(n => [n.id, n]));
     const sources: Record<string, string[]> = {};
     edges.forEach(e => {
@@ -85,7 +86,7 @@ export function verifyShapes(nodes: Node[], edges: Edge[], registry: Record<stri
             if (!ready) continue;
 
             const inputShapes = inputIds.map(src => shapes[src]?.defaultShape || []);
-            const verdict = layer.shapeVerifier(node.data as any, inputShapes, registry);
+            const verdict = layer.shapeVerifier(node.data, inputShapes, registry);
             if (!verdict.ok) {
                 failures.push({
                     nodeId: id,
@@ -99,13 +100,16 @@ export function verifyShapes(nodes: Node[], edges: Edge[], registry: Record<stri
                 progressed = true;
                 continue;
             }
-            const computed = layer.shapeCompute(node.data as any, inputShapes, registry) as any;
+            const computed = layer.shapeCompute(node.data, inputShapes, registry);
             if (Array.isArray(computed)) {
-                shapes[id] = { defaultShape: computed };
+                // 数组形态既可能是单个形状，也可能是多输出形状列表；二者历史上都直接
+                // 作为 defaultShape 使用，这里保持原有行为。
+                shapes[id] = { defaultShape: computed as number[] };
             } else if (computed && typeof computed === "object") {
-                const entries = Object.entries(computed as Record<string, number[]>);
+                const byHandle = computed as Record<string, number[]>;
+                const entries = Object.entries(byHandle);
                 const first = entries[0]?.[1] || [];
-                shapes[id] = { defaultShape: first, byHandle: computed };
+                shapes[id] = { defaultShape: first, byHandle };
             } else {
                 shapes[id] = { defaultShape: [] };
             }

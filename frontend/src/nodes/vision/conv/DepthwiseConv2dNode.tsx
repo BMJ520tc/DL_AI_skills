@@ -68,7 +68,7 @@ export class DepthwiseConv2dNode {
             ...DepthwiseConv2dNode.paramSchema,
             out_channels: { required: true, type: "number", label: "输出通道", defaultValue: 1 },
             groups: { required: true, type: "number", label: "分组数", defaultValue: 1 }
-        }, merged as any);
+        }, merged);
     }
 
     static getForwardCode(_data: DepthwiseData, name: string, inputs: Array<string>, outputs: Array<string>) {

@@ -1,4 +1,5 @@
 import type { Edge, Node } from "@xyflow/react";
+import type { LayerRegistry } from "../node_gen/BaseClass";
 import type { ShapeResult } from "./shape_verifier";
 
 export type NodeCompute = {
@@ -27,7 +28,7 @@ export function estimateGraphCost(
     nodes: Node[],
     edges: Edge[],
     shapeResult: ShapeResult | null,
-    registry: Record<string, any>
+    registry: LayerRegistry
 ): ComputeSummary {
     if (!shapeResult) return { totalParams: 0, totalFlops: 0, nodes: [] };
     const { shapes } = shapeResult;

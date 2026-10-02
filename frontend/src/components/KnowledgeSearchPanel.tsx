@@ -17,6 +17,7 @@ import {
   type KnowledgeDataType,
   type KnowledgeSearchHit,
   type RequestFailure,
+  type RequestOutcome,
   type SearchParams,
 } from "../api/knowledgeClient";
 
@@ -89,8 +90,6 @@ const FILTER_INPUT_STYLE: CSSProperties = {
 
 /** 三维度筛选值。 */
 type SearchFilters = { taskType: string; model: string; dataset: string };
-
-const EMPTY_FILTERS: SearchFilters = { taskType: "", model: "", dataset: "" };
 
 /** task_type 静态建议（下拉可选项，实际以检索结果回填为主）。 */
 const TASK_TYPE_SUGGESTIONS = [
@@ -166,11 +165,25 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
   const [modelName, setModelName] = useState("");
   const [datasetName, setDatasetName] = useState("");
 
+  // 首次浏览的检索参数（q 为空 => 后端返回最近条目）。组件挂载即发起，
+  // 因此直接把初始状态置为「请求进行中」，effect 内无需同步 setState。
+  const initialParams = useMemo<SearchParams>(
+    () => ({
+      q: "",
+      types: [...KNOWLEDGE_DATA_TYPES],
+      limit: 20,
+      task_type: undefined,
+      model: undefined,
+      dataset: undefined,
+    }),
+    [],
+  );
+
   const [hits, setHits] = useState<KnowledgeSearchHit[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [failure, setFailure] = useState<RequestFailure | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
-  const [lastUrl, setLastUrl] = useState("");
+  const [lastUrl, setLastUrl] = useState(() => buildSearchUrl(baseUrl, initialParams));
 
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [detail, setDetail] = useState<DetailState>({ status: "idle" });
@@ -178,6 +191,32 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
 
   const searchAbort = useRef<AbortController | null>(null);
   const detailAbort = useRef<AbortController | null>(null);
+
+  /** 落地一次检索结果。仅作结果归一化，不发起请求。 */
+  const applyOutcome = useCallback(
+    (outcome: RequestOutcome<KnowledgeSearchHit[]>, controller: AbortController) => {
+      if (controller.signal.aborted) return;
+
+      setLoading(false);
+      setHasSearched(true);
+      if (outcome.ok) {
+        setHits(outcome.data);
+      } else {
+        setHits([]);
+        setFailure(outcome.failure);
+      }
+    },
+    [],
+  );
+
+  /** 发起请求并落地结果。调用方负责已经进入「请求进行中」状态。 */
+  const performSearch = useCallback(
+    async (params: SearchParams, controller: AbortController) => {
+      const outcome = await searchKnowledge(baseUrl, params, controller.signal);
+      applyOutcome(outcome, controller);
+    },
+    [baseUrl, applyOutcome],
+  );
 
   const runSearch = useCallback(
     async (keyword: string, types: KnowledgeDataType[], size: number, filters: SearchFilters) => {
@@ -198,29 +237,25 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
       setFailure(null);
       setLastUrl(buildSearchUrl(baseUrl, params));
 
-      const outcome = await searchKnowledge(baseUrl, params, controller.signal);
-      if (controller.signal.aborted) return;
-
-      setLoading(false);
-      setHasSearched(true);
-      if (outcome.ok) {
-        setHits(outcome.data);
-      } else {
-        setHits([]);
-        setFailure(outcome.failure);
-      }
+      await performSearch(params, controller);
     },
-    [baseUrl],
+    [baseUrl, performSearch],
   );
 
   // 打开面板即浏览一次（q 为空 => 后端返回最近条目）
+  // 结果在 then 回调里落地（外部系统 -> setState 的订阅式写法），
+  // effect 体内不同步 setState。
   useEffect(() => {
-    void runSearch("", [...KNOWLEDGE_DATA_TYPES], 20, EMPTY_FILTERS);
+    const controller = new AbortController();
+    searchAbort.current = controller;
+    searchKnowledge(baseUrl, initialParams, controller.signal).then(outcome =>
+      applyOutcome(outcome, controller),
+    );
     return () => {
       searchAbort.current?.abort();
       detailAbort.current?.abort();
     };
-  }, [runSearch]);
+  }, [baseUrl, initialParams, applyOutcome]);
 
   // 以当前筛选条件发起检索
   const doSearch = useCallback(() => {
@@ -703,7 +738,7 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
           }}
         >
           最近一次检索：{lastUrl || "—"}
-          {detail.status === "ready" ? `　|　详情：${buildItemUrl(baseUrl, detail.dataType, detail.refId)}` : ""}
+          {detail.status === "ready" ? `\u3000|\u3000详情：${buildItemUrl(baseUrl, detail.dataType, detail.refId)}` : ""}
         </div>
       </aside>
     </>

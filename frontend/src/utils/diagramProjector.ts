@@ -1,5 +1,5 @@
 import type { Edge, Node } from "@xyflow/react";
-import type { GraphIR, GraphNode } from "../types/graph";
+import type { DiagramGraphInput, DiagramNodeInput } from "../types/graph";
 import { LAYER_REGISTRY } from "../nodes/registry";
 
 type DiagramFamily = "input" | "output" | "merge" | "activation" | "block" | "other";
@@ -15,11 +15,11 @@ const COMPACT_MAX_WIDTH = 360;
 const COMPACT_BASE_HEIGHT = 50;
 const COMPACT_LINE_HEIGHT = 18;
 
-function resolveDefinition(node: GraphNode) {
-    return LAYER_REGISTRY[node.type];
+function resolveDefinition(node: DiagramNodeInput) {
+    return node.type ? LAYER_REGISTRY[node.type] : undefined;
 }
 
-function displayName(node: GraphNode): string {
+function displayName(node: DiagramNodeInput): string {
     const def = resolveDefinition(node);
     const raw = node.display?.title || def?.diagramLabel || def?.label || node.type || node.id;
     if (!raw) return "Layer";
@@ -27,7 +27,7 @@ function displayName(node: GraphNode): string {
     return clean.charAt(0).toUpperCase() + clean.slice(1);
 }
 
-function formatParams(node: GraphNode): string | undefined {
+function formatParams(node: DiagramNodeInput): string | undefined {
     if (node.display?.params) return node.display.params;
     const data = (node.data || {}) as Record<string, unknown>;
     const params = data.params;
@@ -51,7 +51,7 @@ function formatParams(node: GraphNode): string | undefined {
     return JSON.stringify(params);
 }
 
-function formatShape(node: GraphNode): string | undefined {
+function formatShape(node: DiagramNodeInput): string | undefined {
     if (node.display?.shape) return node.display.shape;
     const data = (node.data || {}) as Record<string, unknown>;
     const fmt = (s: unknown) => (Array.isArray(s) && s.length ? `[${(s as Array<unknown>).join(", ")}]` : "未知");
@@ -65,7 +65,7 @@ function formatShape(node: GraphNode): string | undefined {
     return undefined;
 }
 
-function buildLabel(node: GraphNode): string {
+function buildLabel(node: DiagramNodeInput): string {
     const title = displayName(node);
     const paramLine = formatParams(node);
     const shapeLine = formatShape(node);
@@ -88,10 +88,11 @@ function measureSize(label: string, mode: "spacious" | "compact") {
 }
 
 /**
- * Project GraphIR → lightweight nodes/edges for diagram/layout rendering.
+ * Project a graph snapshot → lightweight nodes/edges for diagram/layout rendering.
+ * Accepts either a full GraphIR or a raw React Flow canvas snapshot (see DiagramGraphInput).
  */
 export function projectGraphToDiagram(
-    graph: GraphIR,
+    graph: DiagramGraphInput,
     opts?: { sizingMode?: "spacious" | "compact"; showShapes?: boolean }
 ): { nodes: Node[]; edges: Edge[] } {
     const sizingMode = opts?.sizingMode ?? "spacious";

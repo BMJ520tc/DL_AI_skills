@@ -4,7 +4,30 @@
  * 仅用于 GB-1「画布导出代码」的机器化验证（headless 跑前端 codegen），
  * 不参与浏览器运行时；放在单独模块是为了保证在其它 import 之前执行。
  */
-const g = globalThis as any;
+/** headless 环境下需要注入的浏览器全局（仅本桩使用，不参与浏览器运行时）。 */
+type HeadlessGlobal = {
+    localStorage?: {
+        getItem(key: string): string | null;
+        setItem(key: string, value: string): void;
+        removeItem(key: string): void;
+        clear(): void;
+        key(index: number): string | null;
+        readonly length: number;
+    };
+    window?: unknown;
+    document?: {
+        createElement(): {
+            style: Record<string, unknown>;
+            setAttribute(): void;
+            appendChild(): void;
+        };
+        documentElement: { style: Record<string, unknown> };
+        addEventListener(): void;
+        removeEventListener(): void;
+    };
+};
+
+const g = globalThis as HeadlessGlobal;
 
 if (!g.localStorage) {
     const store = new Map<string, string>();

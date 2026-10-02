@@ -33,7 +33,7 @@ export class EmbeddingNode {
         return [b, t, dim];
     }
 
-    static estimateCost(data: EmbeddingData, _inputShapes: number[][], _outputShape: number[]) {
+    static estimateCost(data: EmbeddingData) {
         const vocab = toNumber(getParamValue(this, data, "num_embeddings"), 0);
         const dim = toNumber(getParamValue(this, data, "embedding_dim"), 0);
         return { params: vocab * dim, flops: 0 };
@@ -43,7 +43,8 @@ export class EmbeddingNode {
         const vocab = getParamValue(EmbeddingNode.paramSchema, data, "num_embeddings");
         const dim = getParamValue(EmbeddingNode.paramSchema, data, "embedding_dim");
         const pad = getParamValue(EmbeddingNode.paramSchema, data, "padding_idx");
-        const padArg = pad !== undefined && pad >= 0 ? `, padding_idx=${pad}` : "";
+        // Number(pad) 复现 JS 关系运算对 null/字符串等的隐式转换，保持原有判断结果。
+        const padArg = pad !== undefined && Number(pad) >= 0 ? `, padding_idx=${pad}` : "";
         return `self.${name} = nn.Embedding(num_embeddings=${vocab}, embedding_dim=${dim}${padArg})`;
     }
 

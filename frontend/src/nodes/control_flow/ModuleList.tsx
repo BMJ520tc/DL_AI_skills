@@ -1,6 +1,6 @@
 import { Handle, NodeResizeControl, Position, useReactFlow, type Edge, type Node, type NodeProps } from "@xyflow/react";
 import React, { useEffect } from "react";
-import { type FieldSpec, type FieldType, type LayerData } from "../../node_gen/BaseClass";
+import { type FieldSpec, type FieldType, type LayerData, type LayerRegistry } from "../../node_gen/BaseClass";
 import { compileGraphToScript } from "../../utils/codeCompile";
 import { verifyShapes } from "../../utils/shape_verifier";
 
@@ -38,7 +38,7 @@ export class ModuleListNode {
      * Helper: Generates virtual edges connecting the Container's input/output 
      * directly to the internal nodes.
      */
-    private static getImplicitEdges(data: ModuleListData, registry?: Record<string,any>): Edge[] {
+    private static getImplicitEdges(data: ModuleListData, registry?: LayerRegistry): Edge[] {
         if (!data.internalNodes || data.internalNodes.length === 0) return [];
 
         const internalIds = new Set(data.internalNodes.map(n => n.id));
@@ -99,7 +99,7 @@ export class ModuleListNode {
         return [...data.internalEdges, ...virtualEdges];
     }
 
-    static shapeVerifier(data: ModuleListData, inputShapes: number[][], registry?: Record<string, any>) {
+    static shapeVerifier(data: ModuleListData, inputShapes: number[][], registry?: LayerRegistry) {
         const safeData = data || { internalNodes: [], internalEdges: [] };
 
         if (!safeData.internalNodes || safeData.internalNodes.length === 0) return { ok: true as const };
@@ -163,7 +163,7 @@ export class ModuleListNode {
         return { ok: true as const };
     }
 
-    static shapeCompute(data: ModuleListData, inputShapes: number[][], registry?: Record<string, any>) {
+    static shapeCompute(data: ModuleListData, inputShapes: number[][], registry?: LayerRegistry) {
         if (!inputShapes || !inputShapes[0] || !registry) return inputShapes?.[0] ? [inputShapes[0]] : [[]];
 
         let currentShape = inputShapes[0];
@@ -269,17 +269,16 @@ export class ModuleListNode {
         `.trim();
     }
 
-    static Component = createModuleListComponent(ModuleListNode.label, ModuleListNode.paramSchema);
+    static Component = createModuleListComponent(ModuleListNode.label);
 }
 
 export function createModuleListComponent(
     label: string,
-    _paramSchema: Record<string, FieldSpec>,
 ) {
     return ({ id, data, isConnectable, selected, width, height }: ResizableNodeProps) => {
         const { setNodes, setEdges } = useReactFlow();
         const safeData = data || ({} as ModuleListData);
-        const childCount = (safeData as any).internalNodes?.length || 0;
+        const childCount = (safeData as Partial<ModuleListData>).internalNodes?.length || 0;
         const isEmpty = childCount === 0;
 
         const DEFAULT_W = 400;
@@ -294,8 +293,9 @@ export function createModuleListComponent(
         }, [id, width, height, setNodes]);
 
         const onChange = (key: string, type: FieldType) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
-            let newValue: any = e.target.value;
-            if (type === "number") newValue = newValue === "" ? undefined : parseFloat(newValue);
+            const raw = e.target.value;
+            let newValue: string | number | boolean | undefined = raw;
+            if (type === "number") newValue = raw === "" ? undefined : parseFloat(raw);
             setNodes(nds => nds.map(n => n.id === id ? { ...n, data: { ...n.data, [key]: newValue } } : n));
         };
 
@@ -371,7 +371,7 @@ export function createModuleListComponent(
                         </div>
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                             <span style={{ fontSize: '10px', color: '#888', fontWeight: 600 }}>SIZE</span>
-                            <input type="number" className="nodrag" value={safeData['repetitions'] || 2} onChange={onChange('repetitions', 'number')}
+                            <input type="number" className="nodrag" value={String(safeData['repetitions'] || 2)} onChange={onChange('repetitions', 'number')}
                                 style={{ width: '44px', fontSize: '12px', textAlign: 'center', fontWeight: 'bold', background: '#0b0d10', border: '1px solid #444', color: '#fbbf24', borderRadius: 6, padding: '4px 0' }} />
                             <button onClick={handleDelete} className="nodrag" style={{ background: 'transparent', border: 'none', cursor: 'pointer', color: '#ff5555', fontSize: '18px' }}>×</button>
                         </div>

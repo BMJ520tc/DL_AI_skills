@@ -15,13 +15,16 @@ import { syncIdFromNodes } from "../utils/idUtils";
 /** initialGraph 传入时进入外部画布模式（模块四 B3）：从 GraphIR 快照初始化、
  *  不再读写 localStorage（避免结构化项目画布污染沙盒编辑器的本地存档）。 */
 export function useGraphState(initialGraph?: GraphIR | null) {
-    const external = useRef(!!initialGraph);
+    // Frozen at mount (FlowEditor remounts via key={projectId}), so a plain state
+    // value expresses the same lifetime as the previous ref without reading a ref
+    // during render. Never updated: the canvas mode is decided once per mount.
+    const [external] = useState(() => !!initialGraph);
 
     // -------------------------------------------------------------------------
     // 1. Storage & Initialization
     // -------------------------------------------------------------------------
     const [nodes, setNodes] = useState<Node[]>(() => {
-        if (external.current && initialGraph) {
+        if (external && initialGraph) {
             const restored = graphIRToFlow(initialGraph);
             syncIdFromNodes(restored.nodes);
             return restored.nodes;
@@ -47,7 +50,7 @@ export function useGraphState(initialGraph?: GraphIR | null) {
     });
 
     const [edges, setEdges] = useState<Edge[]>(() => {
-        if (external.current && initialGraph) {
+        if (external && initialGraph) {
             return graphIRToFlow(initialGraph).edges;
         }
         const savedGraph = localStorage.getItem("graphIR");
@@ -152,14 +155,13 @@ export function useGraphState(initialGraph?: GraphIR | null) {
             historyRef.current = [cloneSnapshot(nodes, edges)];
             historyIndexRef.current = 0;
             syncIdFromNodes(nodes);
-            setCanUndo(false);
-            setCanRedo(false);
+            // canUndo/canRedo already start as false; seeding history keeps them false.
         }
     }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
     // Sync to localStorage and History on every change
     useEffect(() => {
-        if (!external.current) {
+        if (!external) {
             const graph = buildGraphIR(nodes, edges);
             localStorage.setItem("graphIR", JSON.stringify(graph));
             localStorage.setItem("nodes", JSON.stringify(nodes));
@@ -183,17 +185,15 @@ export function useGraphState(initialGraph?: GraphIR | null) {
         setCanUndo(canUndoNow);
         setCanRedo(canRedoNow);
         syncIdFromNodes(nodes);
-    }, [nodes, edges, cloneSnapshot]);
+    }, [nodes, edges, cloneSnapshot, external]);
 
-    // Drop orphaned edges
-    useEffect(() => {
-        const nodeIds = new Set(nodes.map(n => n.id));
-        setEdges(eds => {
-            const nextEds = eds.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target));
-            if (nextEds.length === eds.length) return eds;
-            return nextEds;
-        });
-    }, [nodes, setEdges]);
+    // Drop orphaned edges. Derived during render (React's "adjust state when a prop
+    // changes" pattern) so the invalid wiring never reaches a commit or a paint.
+    // Converges: after the corrective re-render no orphan remains.
+    const liveNodeIds = new Set(nodes.map(n => n.id));
+    if (edges.some(e => !liveNodeIds.has(e.source) || !liveNodeIds.has(e.target))) {
+        setEdges(eds => eds.filter(e => liveNodeIds.has(e.source) && liveNodeIds.has(e.target)));
+    }
 
     return {
         nodes,

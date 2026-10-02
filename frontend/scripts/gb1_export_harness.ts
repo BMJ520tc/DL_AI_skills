@@ -13,6 +13,7 @@
  */
 import fs from "node:fs";
 
+import type { Edge, Node } from "@xyflow/react";
 import "./gb1_stubs";
 import { recursiveCodeGenerator } from "../src/utils/codeCompile";
 import "../src/nodes/registry"; // 触发 registerLayer，填充 LAYER_REGISTRY
@@ -23,7 +24,7 @@ const outIndex = argv.indexOf("--out");
 const outPath = outIndex >= 0 ? argv[outIndex + 1] : null;
 
 // 固定图：Input → Linear(8→16) → ReLU → Linear(16→3)
-const rawNodes = [
+const rawNodes: Node[] = [
     { id: "in1", type: "input_layer", position: { x: 0, y: 0 }, data: {} },
     { id: "fc1", type: "linear_layer", position: { x: 200, y: 0 }, data: { in_features: 8, out_features: 16, bias: true } },
     { id: "act", type: "relu_layer", position: { x: 400, y: 0 }, data: {} },
@@ -37,7 +38,7 @@ const wires = [
 ];
 
 // 与真实画布一致：连边带 sourceHandle，且 onConnect 会写 label = `out_<source>[_<sourceHandle>]`
-const edges = wires.map(w => ({
+const edges: Edge[] = wires.map(w => ({
     ...w,
     type: "custom",
     sourceHandle: "out-0",
@@ -45,7 +46,7 @@ const edges = wires.map(w => ({
     ...(withLabels ? { data: { label: `out_${w.source}` } } : {}),
 }));
 
-const result = recursiveCodeGenerator(rawNodes as any, edges as any);
+const result = recursiveCodeGenerator(rawNodes, edges);
 const code = result.code + "\n";
 if (!code.includes("class GeneratedModel(nn.Module)")) {
     console.error("导出失败：未生成 GeneratedModel 类");

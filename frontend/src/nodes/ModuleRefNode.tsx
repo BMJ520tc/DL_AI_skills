@@ -1,6 +1,6 @@
-/* eslint-disable react-refresh/only-export-components */
+ 
 import { type Edge, type Node } from "@xyflow/react";
-import { type LayerDefinition } from "../node_gen/BaseClass";
+import { type LayerDefinition, type LayerRegistry } from "../node_gen/BaseClass";
 import { createLayerComponent } from "../node_gen/CreateNodeComponent";
 import { sanitizeIdent } from "../utils/codeCompile";
 import { getModule } from "../utils/moduleRegistry";
@@ -15,7 +15,7 @@ export type ModuleRefData = {
     handles?: ModuleHandles;
     description?: string;
     __highlight?: boolean;
-    [key: string]: any; // Allow other properties for variables
+    [key: string]: unknown; // Allow other properties for variables
 };
 
 type Handles = { targets: string[]; sources: string[] };
@@ -26,7 +26,7 @@ function toHandles(handles?: ModuleHandles): Handles {
     const outputs = handles.outputs?.length ? handles.outputs : ["out"];
     return { targets: inputs, sources: outputs };
 }
-function runInternalVerification(data: ModuleRefData, inputShapes: number[][], registry: Record<string, any>) {
+function runInternalVerification(data: ModuleRefData, inputShapes: number[][], registry: LayerRegistry) {
     // 1. Get Module
     if (!data.moduleId) return { ok: false as const, error: "缺少模块 ID" };
     const module = getModule(data.moduleId);
@@ -39,7 +39,7 @@ function runInternalVerification(data: ModuleRefData, inputShapes: number[][], r
     if (module.variableMap) {
         const injectVariables = (nodes: Node[]): Node[] => {
             return nodes.map(node => {
-                let updatedData = { ...node.data };
+                const updatedData = { ...node.data };
                 
                 if (Array.isArray(updatedData.internalNodes)) {
                     updatedData.internalNodes = injectVariables(updatedData.internalNodes);
@@ -145,7 +145,7 @@ export const ModuleRefNode: LayerDefinition<ModuleRefData> = {
     paramSchema: {},
     handles: (data: ModuleRefData) => toHandles(data.handles),
 
-    shapeVerifier: (data: ModuleRefData, inputShapes: number[][], registry?: Record<string, any>) => {
+    shapeVerifier: (data: ModuleRefData, inputShapes: number[][], registry?: LayerRegistry) => {
         if (!registry) return { ok: true as const }; // Cannot verify without registry
 
         // Run full internal verification
@@ -162,7 +162,7 @@ export const ModuleRefNode: LayerDefinition<ModuleRefData> = {
         return { ok: true };
     },
 
-    shapeCompute: (data: ModuleRefData, inputShapes: number[][], registry?: Record<string, any>) => {
+    shapeCompute: (data: ModuleRefData, inputShapes: number[][], registry?: LayerRegistry) => {
         // const registry = context?.registry || (window as any).__LAYER_REGISTRY_GLOBAL__;
 
         if (!registry) {
@@ -211,7 +211,9 @@ export const ModuleRefNode: LayerDefinition<ModuleRefData> = {
         for (const varName in variableSchema) {
             const spec = variableSchema[varName];
             const value = data[varName];
-            const type = (spec as any)?.type;
+            // spec.type 来自可持久化/后端注入的 schema，运行时可能取约定外的字符串，
+            // 因此按 unknown 做字符串比较，保持原有判定结果。
+            const type: unknown = spec?.type;
 
             if (value !== undefined) {
                 // Use the literal value from node data

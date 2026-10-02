@@ -77,7 +77,8 @@ type Props = {
 };
 
 export default function TraceView({ trace, loading, error, shapeComparisons, onClose, onSelect }: Props) {
-    const entries = trace?.entries ?? [];
+    // 记忆化以使 `entries` 身份稳定（`trace?.entries ?? []` 每次渲染都会新建数组）。
+    const entries = useMemo(() => trace?.entries ?? [], [trace]);
     const svg = trace?.svgBase64;
     const summary = trace?.summaryText;
     const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
@@ -147,7 +148,8 @@ export default function TraceView({ trace, loading, error, shapeComparisons, onC
         [parsedSummary]
     );
 
-    const rows = useMemo(() => entries, [entries]);
+    // `rows` 与 `entries` 同引用（原为恒等 useMemo）。
+    const rows = entries;
     const warningText = warnings.join(" · ");
     const mismatchCount = useMemo(
         () => shapeComparisons.filter(row => row.matchInput === false || row.matchOutput === false).length,

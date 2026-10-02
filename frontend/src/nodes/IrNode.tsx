@@ -1,4 +1,4 @@
-/* eslint-disable react-refresh/only-export-components */
+ 
 // nodes/IrNode.tsx — 结构化项目画布节点（模块四 B3，GraphIR type="ir"）。
 // 与 LAYER_REGISTRY 图层不同：参数 schema 不固定，来自节点 data.params（IR 调参）。
 // 句柄从 data.handles 动态渲染（后端 ir_to_graphir / 前端 irAdapter.graphIRToFlow 注入）。

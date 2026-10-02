@@ -1,4 +1,5 @@
 import type { Edge, Node } from "@xyflow/react";
+import type { LayerRegistry } from "../node_gen/BaseClass";
 import type { ShapeResult } from "./shape_verifier";
 import type { TraceResponse } from "../types/trace";
 
@@ -6,7 +7,7 @@ const parseShape = (value?: string) => {
     if (!value) return null;
     const matches = value.match(/-?\d+/g);
     if (!matches) {
-        return /[\[\(]\s*[\]\)]/.test(value) ? [] : null;
+        return /[[(]\s*[\])]/.test(value) ? [] : null;
     }
     return matches.map(num => Number(num));
 };
@@ -45,7 +46,7 @@ export const buildShapeComparisons = (
     shapeResult: ShapeResult | null,
     edges: Edge[],
     nodes: Node[],
-    registry: Record<string, any>
+    registry: LayerRegistry
 ) => {
     const inferredShapes: ShapeResult["shapes"] = shapeResult?.shapes || nodes.reduce<ShapeResult["shapes"]>((acc, node) => {
         const shape = (node.data as { __shape?: number[] } | undefined)?.__shape;
@@ -126,7 +127,7 @@ export const compareTraceShapes = (
     shapeResult: ShapeResult | null,
     edges: Edge[],
     nodes: Node[],
-    registry: Record<string, any>
+    registry: LayerRegistry
 ) => {
     const warnings: string[] = [];
     buildShapeComparisons(trace, shapeResult, edges, nodes, registry).forEach(row => {

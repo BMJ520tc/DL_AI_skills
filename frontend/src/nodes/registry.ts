@@ -1,4 +1,4 @@
-import { type LayerDefinition } from "../node_gen/BaseClass";
+import { type LayerData, type LayerDefinition } from "../node_gen/BaseClass";
 import { LAYER_REGISTRY, registerLayer } from "../utils/layerRegistry";
 import { ModuleListNode } from "./control_flow/ModuleList";
 import { RepeatLayerNode } from "./control_flow/RepeatLayer";
@@ -73,7 +73,7 @@ import { MaxPool3dNode } from "./vision/pooling/MaxPool3dNode";
 
 export type NodeGroup = {
     label: string;
-    nodes: Record<string, any>;
+    nodes: Record<string, LayerDefinition<LayerData>>;
 };
 
 // Node catalog grouped by modality/usage. This keeps the registry modular and
@@ -236,7 +236,7 @@ export const NODE_GROUPS: Record<string, NodeGroup> = {
 
 Object.values(NODE_GROUPS).forEach(group => {
     Object.entries(group.nodes).forEach(([key, Class]) => {
-        registerLayer(key, Class as LayerDefinition<any>);
+        registerLayer(key, Class);
     });
 });
 

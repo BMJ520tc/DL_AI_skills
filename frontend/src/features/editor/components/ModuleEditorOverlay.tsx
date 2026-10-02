@@ -4,6 +4,7 @@ import {
     applyNodeChanges,
     Background,
     ReactFlow,
+    type OnNodeDrag,
     type ReactFlowInstance,
     ReactFlowProvider,
 } from "@xyflow/react";
@@ -38,8 +39,8 @@ type ModuleEditorOverlayProps = {
     onDragOver: (event: React.DragEvent) => void;
     saveExistingModuleChanges: () => void;
     saveModuleAsNew: () => void;
-    onNodeDragStart: any;
-    onNodeDragStop: any;
+    onNodeDragStart: OnNodeDrag;
+    onNodeDragStop: OnNodeDrag;
 };
 
 export function ModuleEditorOverlay({

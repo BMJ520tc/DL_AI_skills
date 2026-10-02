@@ -34,7 +34,7 @@ export class BatchNorm2dNode {
         return [...(inputShapes[0] || [])];
     }
 
-    static estimateCost(data: NormData, _inputShapes: number[][], _outputShape: number[]) {
+    static estimateCost(data: NormData) {
         const affine = data.affine !== false;
         const channels = toNumber(getParamValue(this, data, "num_features"), 0);
         const params = affine ? channels * 2 : 0;
@@ -94,7 +94,7 @@ export class GroupNormNode {
         return [...(inputShapes[0] || [])];
     }
 
-    static estimateCost(data: NormData, _inputShapes: number[][], _outputShape: number[]) {
+    static estimateCost(data: NormData) {
         const affine = data.affine !== false;
         const channels = toNumber(getParamValue(this, data, "num_features"), 0);
         const params = affine ? channels * 2 : 0;
@@ -131,7 +131,7 @@ export class LayerNormNode {
         return [...(inputShapes[0] || [])];
     }
 
-    static estimateCost(data: NormData, _inputShapes: number[][], _outputShape: number[]) {
+    static estimateCost(data: NormData) {
         const affine = data.affine !== false;
         const norm = toNumber(getParamValue(this, data, "normalized_shape"), 0);
         const params = affine ? norm * 2 : 0;
@@ -156,7 +156,7 @@ export class RMSNormNode {
     static shapeVerifier = LayerNormNode.shapeVerifier;
     static shapeCompute = LayerNormNode.shapeCompute;
 
-    static estimateCost(data: NormData, _inputShapes: number[][], _outputShape: number[]) {
+    static estimateCost(data: NormData) {
         const norm = toNumber(getParamValue(this, data, "normalized_shape"), 0);
         return { params: norm, flops: 0 };
     }

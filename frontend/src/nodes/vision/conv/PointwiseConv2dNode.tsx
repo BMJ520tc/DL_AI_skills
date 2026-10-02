@@ -47,7 +47,7 @@ export class PointwiseConv2dNode {
             kernel_size: { required: true, type: "number", label: "卷积核大小", defaultValue: 1 },
             stride: { required: true, type: "number", label: "步长", defaultValue: 1 },
             padding: { required: true, type: "number", label: "填充", defaultValue: 0 }
-        }, { ...data, kernel_size: 1, stride: 1, padding: 0 } as any);
+        }, { ...data, kernel_size: 1, stride: 1, padding: 0 });
     }
 
     static getForwardCode(_data: PointwiseData, name: string, inputs: Array<string>, outputs: Array<string>) {

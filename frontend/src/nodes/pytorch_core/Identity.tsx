@@ -19,7 +19,7 @@ export class PassLayerNode {
         return inputShapes[0] || [];
     }
 
-    static estimateCost(_data: PassData, _inputShapes: number[][], _outputShape: number[]) {
+    static estimateCost() {
         return { params: 0, flops: 0 };
     }
 

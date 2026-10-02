@@ -1,4 +1,4 @@
-import { Background, ReactFlow, type Edge, type Node, type OnConnect, type OnEdgesChange, type OnNodesChange, type ReactFlowInstance } from "@xyflow/react";
+import { Background, ReactFlow, type Edge, type Node, type OnConnect, type OnEdgesChange, type OnNodeDrag, type OnNodesChange, type OnSelectionChangeFunc, type ReactFlowInstance } from "@xyflow/react";
 import { edgeTypes } from "../../../types/edgeTypes";
 import { nodeTypes } from "../../../types/nodeTypes";
 
@@ -11,11 +11,11 @@ type EditorCanvasProps = {
     onNodesChange: OnNodesChange;
     onEdgesChange: OnEdgesChange;
     onConnect: OnConnect;
-    onNodeDragStop: any; // Type from useContainerSystem
-    onNodeDragStart: any;
+    onNodeDragStop: OnNodeDrag; // Type from useContainerSystem
+    onNodeDragStart: OnNodeDrag;
     onMainDrop: (e: React.DragEvent) => void;
     onDragOver: (e: React.DragEvent) => void;
-    onSelectionChange: any;
+    onSelectionChange: OnSelectionChangeFunc;
     clearSelection: () => void;
     setMainFlowRef: (rf: ReactFlowInstance) => void;
 }

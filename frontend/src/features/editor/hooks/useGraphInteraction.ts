@@ -20,8 +20,8 @@ type UseGraphInteractionProps = {
     moduleStack: OpenModule[];
     setModuleStack: React.Dispatch<React.SetStateAction<OpenModule[]>>;
 };
-function getInitialNodeData(type: string, targetModuleId?: string): Record<string, any> {
-    const initialData: Record<string, any> = {};
+function getInitialNodeData(type: string, targetModuleId?: string): Record<string, unknown> {
+    const initialData: Record<string, unknown> = {};
     const registryItem = LAYER_REGISTRY[type];
     if (registryItem && registryItem.paramSchema) {
         Object.entries(registryItem.paramSchema as Record<string, FieldSpec>).forEach(([key, spec]) => {
@@ -142,7 +142,7 @@ export function useGraphInteraction({
                 }),
             );
         },
-        [setModuleStack],
+        [setModuleStack, assignParent],
     );
     useEffect(() => {
         const active = getActiveModule(moduleStack);
@@ -230,7 +230,7 @@ export function useGraphInteraction({
             const finalNode = assignParent(newNode, getNodes());
             setNodes(nds => [...nds, finalNode]);
         },
-        [setNodes, getNodes],
+        [setNodes, getNodes, assignParent],
     );
 
     const onModuleDrop = useCallback(
@@ -251,7 +251,7 @@ export function useGraphInteraction({
                 }),
             );
         },
-        [setModuleStack],
+        [setModuleStack, assignParent],
     );
 
     const [highlightNodes, setHighlightNodes] = useState<Set<string>>(new Set());
