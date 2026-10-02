@@ -388,23 +388,22 @@ async def _run_decompose(params: dict, task_id: str) -> None:
 
 # --------------------------- 6.2 形状追踪 ---------------------------
 
-# 维度类参数：原模型与再生成模型必须同维，比对才有意义；这些键以「实例化模型」为准。
-# （agent 对尺寸由运行期构造参数决定的模型只能猜，猜的值与实际实例化不一致会让比对必败。）
-_DIM_PARAM_KEYS = frozenset({
-    "in_features", "out_features", "num_features", "in_channels", "out_channels",
-    "num_embeddings", "embedding_dim",
-})
+# 维度类参数（in_features/out_channels/…）在构造签名里没有默认值，因此必然出现在 trace 的
+# `params_delta` 中；agent 给错（或给成 `'sizes[0]'` 这类表达式）时由回填改写为模型实际值，
+# 保证原模型与再生成模型同维（比对才有意义）。
 
 
-def _is_param_literal(v) -> bool:
-    """参数值是否可直接写进生成代码（数字/布尔/非空整数列表）。
-
-    agent 对运行期决定的尺寸会写成 `'sizes[0]'` 这类字符串表达式——它不是可用的构造参数值，
-    应当视为「缺失」并由 trace 从实例化模型上回填真实值，而不是原样写进生成代码（会 NameError）。
-    """
-    if isinstance(v, bool) or isinstance(v, (int, float)):
-        return True
-    return isinstance(v, list) and bool(v) and all(isinstance(x, int) for x in v)
+def _same_param(a, b) -> bool:
+    """参数等价判定：3 与 (3,3)、1 与 (1,1) 视为同一值（避免无谓改写 `params` 让验证变 stale）。"""
+    if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
+        return len(a) == len(b) and all(_same_param(x, y) for x, y in zip(a, b))
+    if isinstance(a, (tuple, list)) and a and all(x == a[0] for x in a):
+        return _same_param(a[0], b)
+    if isinstance(b, (tuple, list)) and b and all(x == b[0] for x in b):
+        return _same_param(a, b[0])
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b
+    return a == b
 
 
 def _merge_shapes(ir: dict, trace_output: dict) -> int:
@@ -414,8 +413,12 @@ def _merge_shapes(ir: dict, trace_output: dict) -> int:
     `{"shapes": {...}, "order": [{"path","class_name"}]}`（新，附类名以便兜底对齐）。
     兜底（3.2）：节点没有 module_path 时，按「class_name + 出现次序」与 traced 的
     同层同类模块配对，避免 agent 漏填 module_path 就整棵树补不上形状。
-    补参（3.1）：库型模型的层尺寸由运行期构造参数决定，agent 给出的 params 值为 null；
-    trace 从实例化模型上读出真实构造参数（`params`）按 module_path 回填**仅补 null**。
+    补参（3.1）：库型模型的层尺寸由运行期构造参数决定，agent 给出的值为 null 或 `'sizes[0]'`
+    这类表达式；trace 从实例化模型上读出真实构造参数，按 module_path 回填**仅当当前值缺失、
+    不可用、或与模型实际值不等价**——与构造默认值等价的键不回填，避免平白改动 `params`
+    使既有验证无故 stale（trace 另给出 `params_delta`＝其中与默认值不等价的部分）。
+    另把「模型实际暴露的参数」原样记入节点的 `params_model`（不参与 ir_hash）：模块结构签名
+    取它，从而与 agent 是否写出可选参数（ReLU 的 inplace 等）解耦（R27）。
     input_spec.shape 缺失/含非法维度时，用本次 trace 实际使用的输入形状（`input_shape`）补齐。
     """
     if "shapes" in trace_output and isinstance(trace_output.get("shapes"), dict):
@@ -460,8 +463,15 @@ def _merge_shapes(ir: dict, trace_output: dict) -> int:
             n["output_shape"] = rec["output_shape"]
             filled += 1
 
-    # 层构造参数回填（3.1 补参）：只补 null，不覆盖 agent 已给的确定值
+    # 层构造参数回填（3.1 补参）：以模型实际值为准的只有两类键——① agent 没写、且该键与
+    # 构造默认值不等价（trace 的 `params_delta`；默认值等价的键补了也等于没补，反而平白改动
+    # `params` 让既有验证无故 stale）；② agent 写了但与模型实际值不等价（含 `'sizes[0]'`
+    # 这类写进生成代码会 NameError 的表达式）。等价字面量（3 vs (3,3)）保持原样不动。
+    # 兼容旧 trace 产物（无 params_delta 时按全量 params 处理）。
     trace_params = trace_output.get("params") or {}
+    trace_delta = trace_output.get("params_delta")
+    if not isinstance(trace_delta, dict):
+        trace_delta = trace_params
     for n in ir["nodes"]:
         params = n.get("params")
         if not isinstance(params, dict):
@@ -469,11 +479,16 @@ def _merge_shapes(ir: dict, trace_output: dict) -> int:
         src = trace_params.get(n.get("module_path"))
         if not src:
             continue
+        # 记录「模型实际暴露的参数」，供结构签名使用（`params` 仍保持「可写进生成代码」的语义）
+        n["params_model"] = dict(src)
+        delta = trace_delta.get(n.get("module_path")) or {}
         for k, v in src.items():
             cur = params.get(k)
-            # 维度类参数以实例化模型为准；其余只在「当前值不是可用字面量」时回填，
-            # 避免把 agent 的等价表示（kernel_size 3 vs (3,3)）改掉、无谓改动模块签名。
-            if cur != v and (k in _DIM_PARAM_KEYS or not _is_param_literal(cur)):
+            if cur is None:
+                if k in delta:
+                    params[k] = v
+                    filled += 1
+            elif not _same_param(cur, v):
                 params[k] = v
                 filled += 1
 
@@ -531,6 +546,30 @@ def _knowledge_hint(knowledge: dict) -> str:
             + "\n".join(lines[:12])[:2000])
 
 
+def _warn_canonical_unavailable(task_id: str, reason: str) -> None:
+    """仅补记模型参数失败时的进度警示（run_record 由调用方按真实原因记录）。"""
+    task_manager.update_progress(task_id, {
+        "skipped": True,
+        "warning": f"{reason}；未能补记模型实际参数，结构签名暂用 agent 参数（module_id 可能随可选参数写法变化）",
+    })
+
+
+def _record_canonical_unavailable(project_id: str, task_id: str, reason: str) -> None:
+    """形状/补参/输入规格都已齐备，仅「模型实际参数」补记失败：如实留痕但不阻断任务（R27）。
+
+    此时 IR 仍可用（结构签名回落到 agent 参数），但 module_id 可能对 agent 的可选参数写法敏感，
+    因此记一条 failed 的 run_record 与进度警示，便于事后发现「同一模型两个 module_id」的根因。
+    """
+    now = _now()
+    knowledge_service.record_run({
+        "project_id": project_id, "task_id": task_id, "run_type": "decompose_trace",
+        "command": "trace canonical params skipped", "status": "failed",
+        "error": f"{reason}；未能补记模型实际参数（结构签名暂用 agent 参数，module_id 可能不稳定）",
+        "started_at": now, "finished_at": now,
+    })
+    _warn_canonical_unavailable(task_id, reason)
+
+
 async def _run_trace(params: dict, task_id: str) -> None:
     project_id = params["project_id"]
     project = _require_original(project_id)
@@ -546,8 +585,15 @@ async def _run_trace(params: dict, task_id: str) -> None:
     )
     spec_shape = (ir.get("input_spec") or {}).get("shape") or []
     need_input = not spec_shape or not all(isinstance(d, int) and d > 0 for d in spec_shape)
-    if not (need_shape or need_params or need_input):
-        # 3.2「读 IR 统计形状缺失（无缺失直接跳过）」：省掉一次项目环境跑模型
+    # 结构签名所需的「模型实际暴露的参数」是否已具备（R27）：缺失时即使形状/参数都齐也要跑一次
+    # trace，否则 module_id 会随 agent 是否写出可选参数（inplace 等）而变化。
+    need_canonical = any(
+        n.get("kind") == "leaf" and not isinstance(n.get("params_model"), dict)
+        for n in ir["nodes"]
+    )
+    if not (need_shape or need_params or need_input or need_canonical):
+        # 3.2「读 IR 统计形状缺失（无缺失直接跳过）」：形状、补参、输入规格与模型参数均已齐备，
+        # 省掉一次项目环境跑模型
         knowledge_service.record_run({
             "project_id": project_id, "task_id": task_id, "run_type": "decompose_trace",
             "command": "trace skipped (shapes complete)", "status": "success",
@@ -556,9 +602,14 @@ async def _run_trace(params: dict, task_id: str) -> None:
         })
         task_manager.update_progress(task_id, {"skipped": True, "reason": "IR 形状已完整，无需追踪"})
         return
+    # 仅为了补记模型参数才需要追踪时，不因环境/模型不可用而中断（IR 本身已完整）
+    only_canonical = not (need_shape or need_params or need_input)
     python = analysis_service._project_python(ws)
     if python is None:
-        raise RuntimeError("项目环境未就绪：未找到独立环境解释器，请先完成环境创建（模块一 env）")
+        if not only_canonical:
+            raise RuntimeError("项目环境未就绪：未找到独立环境解释器，请先完成环境创建（模块一 env）")
+        _record_canonical_unavailable(project_id, task_id, "项目环境未就绪（未找到解释器）")
+        return
 
     run_dir = ws / "runs" / "decompose" / task_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -578,6 +629,9 @@ async def _run_trace(params: dict, task_id: str) -> None:
             "error": f"形状追踪超时（>{DECOMPOSE_TRACE_TIMEOUT_S}s）",
             "started_at": started, "finished_at": _now(),
         })
+        if only_canonical:
+            _warn_canonical_unavailable(task_id, "形状追踪超时")
+            return
         raise RuntimeError("形状追踪超时")
     if rc != 0:
         knowledge_service.record_run({
@@ -585,6 +639,9 @@ async def _run_trace(params: dict, task_id: str) -> None:
             "command": command, "status": "failed", "error": log[-2000:],
             "log_path": None, "started_at": started, "finished_at": _now(),
         })
+        if only_canonical:
+            _warn_canonical_unavailable(task_id, "形状追踪执行失败（模型/环境不可用）")
+            return
         raise RuntimeError("形状追踪失败: " + log[-1500:])
 
     shapes = json.loads(out_json.read_text(encoding="utf-8"))
@@ -706,12 +763,21 @@ def _module_signature(ir: dict) -> str:
     """结构签名（实施约定）：入口类+input_spec+节点(类名,排序参数)+边(类对)，不含 id/位置/形状。
 
     节点清单按签名的 JSON 文本排序：同一结构无论 agent 的节点声明序如何，module_id 都一样。
+    参数取「agent 的 params」∪「模型实际暴露的 params_model」（后者优先，由 trace 回填）：
+    agent 是否写出可选参数（ReLU 的 inplace、BatchNorm 的 affine 等）不再影响 module_id（R27）；
+    仅在从未跑过 trace 时才回落到纯 agent 参数。
     """
     node_map = nodes_by_id(ir)
 
+    def _node_params(n) -> dict:
+        params = dict(n.get("params") or {})
+        model_params = n.get("params_model")
+        if isinstance(model_params, dict):
+            params.update(model_params)  # 模型实际值优先
+        return dict(sorted(params.items(), key=lambda kv: str(kv[0])))
+
     def _node_sig(n):
-        params = dict(sorted((n.get("params") or {}).items(), key=lambda kv: str(kv[0])))
-        return [n.get("kind"), ir_schema.normalize_class_name(n.get("class_name") or ""), params]
+        return [n.get("kind"), ir_schema.normalize_class_name(n.get("class_name") or ""), _node_params(n)]
 
     def _edge_sig(e):
         return [
