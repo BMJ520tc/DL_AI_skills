@@ -30,7 +30,10 @@ import { useExportSystem } from "./features/editor/hooks/useExportSystem";
 import { LAYER_REGISTRY } from "./types/nodeTypes";
 import { estimateGraphCost } from "./utils/computeEstimator";
 import NetworkRunPanel from "./features/network/NetworkRunPanel";
+import VersionPanel from "./features/network/VersionPanel";
 import { exportNetwork } from "./api/client";
+import { graphIRToFlow } from "./utils/irAdapter";
+import { syncIdFromNodes } from "./features/editor/utils/idUtils";
 
 const TRACE_SEED_PRESETS = [42, 1337, 1234, 2020, 2021];
 
@@ -204,6 +207,20 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
 
     // 运行面板开关（阶段4 4c：训练任务发起、轮询与指标展示）
     const [showRunPanel, setShowRunPanel] = useState(false);
+
+    // 版本面板开关（阶段4 4d-2：版本树/对比/回退）
+    const [showVersionPanel, setShowVersionPanel] = useState(false);
+
+    // 回退成功：把目标版本的图替换进画布（与 onUploadGraph 同一替换模式），
+    // 继续编辑后保存会生成新版本（树上分叉的新节点）。
+    const handleRollback = useCallback((graph: GraphIR) => {
+        const restored = graphIRToFlow(graph);
+        syncIdFromNodes(restored.nodes);
+        setEdges([]);
+        setNodes(restored.nodes);
+        setEdges(restored.edges);
+        setSaveState("idle");
+    }, [setNodes, setEdges]);
 
     // File Upload (ref needed)
     const uploadInputRef = useRef<HTMLInputElement>(null);
@@ -415,7 +432,10 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                                           : "导出代码"}
                                 </button>
                                 <button
-                                    onClick={() => setShowRunPanel(v => !v)}
+                                    onClick={() => {
+                                        setShowVersionPanel(false);
+                                        setShowRunPanel(v => !v);
+                                    }}
                                     style={{
                                         border: "1px solid #1f2a2f",
                                         borderRadius: 8,
@@ -428,6 +448,24 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                                     }}
                                 >
                                     运行训练
+                                </button>
+                                <button
+                                    onClick={() => {
+                                        setShowRunPanel(false);
+                                        setShowVersionPanel(v => !v);
+                                    }}
+                                    style={{
+                                        border: "1px solid #1f2a2f",
+                                        borderRadius: 8,
+                                        padding: "6px 14px",
+                                        fontWeight: 600,
+                                        fontSize: 12,
+                                        cursor: "pointer",
+                                        background: showVersionPanel ? "#1d4ed8" : "#2563eb",
+                                        color: "#e2e8f0",
+                                    }}
+                                >
+                                    版本
                                 </button>
                             </>
                         )}
@@ -463,6 +501,14 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                             if (onSave) await onSave(buildGraphIR(nodes, edges));
                         }}
                         onClose={() => setShowRunPanel(false)}
+                    />
+                )}
+
+                {projectId && showVersionPanel && (
+                    <VersionPanel
+                        projectId={projectId}
+                        onRollback={handleRollback}
+                        onClose={() => setShowVersionPanel(false)}
                     />
                 )}
 

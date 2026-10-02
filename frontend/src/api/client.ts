@@ -387,3 +387,65 @@ export const postNetworkRun = (
         method: "POST",
         body: JSON.stringify(body),
     });
+
+// ---------------------------------------------------------------------------
+// 版本管理（阶段4 4d-2，模块详细设计 7.6）
+// ---------------------------------------------------------------------------
+
+export interface VersionMeta {
+    saved_at: string | null;
+    node_count: number;
+    edge_count: number;
+    input_spec: Array<{ node_id: string; type: string }>;
+    output_spec: Array<{ node_id: string; type: string }>;
+    run_summary: { task_id: string; metrics: Record<string, unknown>; finished_at: string } | null;
+    rollback_to: string | null;
+}
+
+export interface VersionNode {
+    commit: string;
+    short: string;
+    message: string;
+    committed_at: string;
+    parents: string[];
+    meta: VersionMeta | null;
+}
+
+export interface VersionTree {
+    current: string | null;
+    versions: VersionNode[];
+}
+
+export interface ParamChange {
+    key: string;
+    old: unknown;
+    new: unknown;
+}
+
+export interface ParamDiff {
+    nodes_added: Array<{ id: string; type: string }>;
+    nodes_removed: Array<{ id: string; type: string }>;
+    nodes_changed: Array<{ id: string; type: string; param_changes: ParamChange[] }>;
+    edges_added: Array<{ id: string; source: string; target: string }>;
+    edges_removed: Array<{ id: string; source: string; target: string }>;
+}
+
+export interface VersionCompare {
+    v1: string;
+    v2: string;
+    code_diff: string[] | null;
+    code_diff_error: string | null;
+    param_diff: ParamDiff;
+}
+
+export const getVersionTree = (projectId: string) =>
+    request<VersionTree>(`/api/versions/${projectId}/tree`);
+
+export const compareVersions = (projectId: string, v1: string, v2: string) =>
+    request<VersionCompare>(`/api/versions/${projectId}/compare?v1=${encodeURIComponent(v1)}&v2=${encodeURIComponent(v2)}`);
+
+export const postRollback = (projectId: string, targetVersion: string) =>
+    request<{ commit: string; target: string; graph: GraphIR }>(
+        `/api/versions/${projectId}/rollback`,
+        { method: "POST", body: JSON.stringify({ target_version: targetVersion }) },
+    );
