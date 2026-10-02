@@ -242,6 +242,35 @@ def _module_class(ir: dict, node: dict) -> str:
             sink_cache[cid] = _subtree_sink(ir, cid)
         return sink_cache[cid]
 
+    # 汇点：出边全部止于自身子树内部（或模块之外）的直接子节点 = 本模块的输出。
+    # 注意「孤立子节点」：既无入边也无出边（典型如定义了但 forward 未使用的 self.relu），
+    # 不应算作汇点——否则真实仓库里这类模型会被判「多汇点」而无法再生成。
+    def _isolated(cid: str) -> bool:
+        # 「未参与数据流」= 整棵子树不与任何边相连（如定义了但 forward 未使用的 self.relu）。
+        # 注意不能只看「模块内」的边：模块的输入子节点只有一条来自父模块（owner 之外）的入边，
+        # 若把 owner 之外的边排除，输入子节点会被误判为孤立。
+        members = {cid} | _subtree_ids(ir, cid)
+        return not any(in_edges(ir, m) or out_edges(ir, m) for m in members)
+
+    candidates = [cid for cid in child_ids
+                  if cid not in container_children and not _isolated(cid)]
+    if not candidates:      # 全是孤立子节点：唯一子节点视为输出
+        candidates = [cid for cid in child_ids if cid not in container_children]
+    sinks = []
+    for cid in candidates:
+        members = {cid} | _subtree_ids(ir, cid)
+        consumed = any(
+            (ow := owner.get(e["to"])) is not None and ow != cid
+            for m in members for e in out_edges(ir, m)
+        )
+        if not consumed:
+            sinks.append(cid)
+    if len(sinks) != 1:
+        raise IrIncompleteError(
+            [f"module 节点 {node['id']} 的直接子节点应有唯一输出，实际汇点 {len(sinks)} 个: {sinks}"
+             "（多分支输出请用 op 节点汇合）"]
+        )
+
     for n in ordered:
         nid = n["id"]
         if nid in container_children:
@@ -268,35 +297,6 @@ def _module_class(ir: dict, node: dict) -> str:
         else:
             in_var = in_vars[0] if in_vars else "x"
             fwd_lines.append(f"        var_{nid} = self.{nid}({in_var})")
-
-    # 汇点：出边全部止于自身子树内部（或模块之外）的直接子节点 = 本模块的输出。
-    # 注意「孤立子节点」：既无入边也无出边（典型如定义了但 forward 未使用的 self.relu），
-    # 不应算作汇点——否则真实仓库里这类模型会被判「多汇点」而无法再生成。
-    def _isolated(cid: str) -> bool:
-        members = {cid} | _subtree_ids(ir, cid)
-        has_in = any(e["from"] in owner and owner[e["from"]] != cid for m in members for e in in_edges(ir, m))
-        has_out = any((ow := owner.get(e["to"])) is not None and ow != cid
-                      for m in members for e in out_edges(ir, m))
-        return not has_in and not has_out
-
-    candidates = [cid for cid in child_ids
-                  if cid not in container_children and not _isolated(cid)]
-    if not candidates:      # 全是孤立子节点：唯一子节点视为输出
-        candidates = [cid for cid in child_ids if cid not in container_children]
-    sinks = []
-    for cid in candidates:
-        members = {cid} | _subtree_ids(ir, cid)
-        consumed = any(
-            (ow := owner.get(e["to"])) is not None and ow != cid
-            for m in members for e in out_edges(ir, m)
-        )
-        if not consumed:
-            sinks.append(cid)
-    if len(sinks) != 1:
-        raise IrIncompleteError(
-            [f"module 节点 {node['id']} 的直接子节点应有唯一输出，实际汇点 {len(sinks)} 个: {sinks}"
-             "（多分支输出请用 op 节点汇合）"]
-        )
 
     return (
         f"class Decomp_{node['id']}(nn.Module):\n"
