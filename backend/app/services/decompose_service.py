@@ -294,55 +294,64 @@ async def _run_decompose(params: dict, task_id: str) -> None:
     deadline = time.monotonic() + DECOMPOSE_AGENT_BUDGET_S
     ir: Optional[dict] = None
     last_reason = "agent 未产出有效 IR 结构（structured_output 缺失）"
+
+    def _record_fail(reason: str, bad_ir: Optional[dict] = None) -> None:
+        """失败也要留 run_record（架构九.4：失败可检索供 agent 改进）。"""
+        entry: dict = {
+            "project_id": project_id, "task_id": task_id, "run_type": "decompose",
+            "command": "agent parse (structure → IR)", "status": "failed", "error": reason,
+            "started_at": started, "finished_at": _now(),
+        }
+        if bad_ir is not None:
+            entry["metrics"] = {"nodes": len(bad_ir.get("nodes") or []),
+                                "edges": len(bad_ir.get("edges") or [])}
+        knowledge_service.record_run(entry)
+
     for attempt in range(1, DECOMPOSE_AGENT_RETRIES + 1):
         budget = deadline - time.monotonic()
         if attempt > 1 and budget <= 30:
             last_reason = (
-                f"agent 连续 {attempt - 1} 次未产出有效 IR 结构，重试预算（{DECOMPOSE_AGENT_BUDGET_S}s）已用尽"
+                f"agent 连续 {attempt - 1} 次未产出可用 IR，重试预算（{DECOMPOSE_AGENT_BUDGET_S}s）已用尽"
             )
             break
+        # 重试时把上一次的失败原因回喂，否则同样的 prompt 只会得到同样的结果
+        ask = prompt if attempt == 1 else prompt + f"\n\n【上一次尝试未通过，请据此修正】{last_reason}"
         try:
             result = await agent_service.run_sync(
-                prompt,
+                ask,
                 cwd=str(source),
                 output_schema=ir_schema.IR_SCHEMA,
                 max_turns=60,
                 timeout_s=int(min(DECOMPOSE_AGENT_TIMEOUT_S, budget)),
             )
         except Exception as e:  # noqa: BLE001 —— agent 失败记 run_record 供检索（先例 4.3）
-            knowledge_service.record_run({
-                "project_id": project_id, "task_id": task_id, "run_type": "decompose",
-                "command": "agent parse (structure → IR)",
-                "status": "failed", "error": f"第 {attempt}/{DECOMPOSE_AGENT_RETRIES} 次尝试失败: {e}",
-                "started_at": started, "finished_at": _now(),
-            })
+            _record_fail(f"第 {attempt}/{DECOMPOSE_AGENT_RETRIES} 次尝试失败: {e}")
             raise
-        ir = _as_ir(result.get("structured_output"))
-        if ir is not None:
-            break
-        last_reason = (
-            f"agent 未产出有效 IR 结构（structured_output 缺失，第 {attempt}/{DECOMPOSE_AGENT_RETRIES} 次）"
-        )
+        candidate = _as_ir(result.get("structured_output"))
+        if candidate is None:
+            last_reason = (
+                f"agent 未产出有效 IR 结构（structured_output 缺失，第 {attempt}/{DECOMPOSE_AGENT_RETRIES} 次）"
+            )
+            continue
+        errors = validate_ir(candidate)
+        if errors:
+            last_reason = "IR 结构校验失败: " + "；".join(errors)
+            _record_fail(last_reason, candidate)
+            continue
+        # 结构自检：能否再生成（纯函数、秒级）。agent 对「结构由运行期构造参数决定」的模型
+        # （如 GEARS 的 MLP）产出不稳定（漏边、空容器、参数写成 `sizes[0]` 这类表达式），
+        # 这类问题先前只到用户点「再生成」才暴露 → 提前拦下并重试，使链路对抖动可自愈。
+        try:
+            ir_codegen.generate(candidate)
+        except (IrIncompleteError, ValueError) as e:
+            last_reason = "IR 结构自检未通过（再生成失败）: " + str(e)
+            _record_fail(last_reason, candidate)
+            continue
+        ir = candidate
+        break
     if ir is None:
-        knowledge_service.record_run({
-            "project_id": project_id, "task_id": task_id, "run_type": "decompose",
-            "command": "agent parse (structure → IR)",
-            "status": "failed", "error": last_reason,
-            "started_at": started, "finished_at": _now(),
-        })
+        _record_fail(last_reason)
         raise RuntimeError(last_reason)
-    errors = validate_ir(ir)
-    if errors:
-        # 结构校验失败也要留 run_record（架构九.4：失败可检索供 agent 改进）
-        reason = "IR 结构校验失败: " + "；".join(errors)
-        knowledge_service.record_run({
-            "project_id": project_id, "task_id": task_id, "run_type": "decompose",
-            "command": "agent parse (structure → IR)",
-            "status": "failed", "error": reason,
-            "metrics": {"nodes": len(ir.get("nodes") or []), "edges": len(ir.get("edges") or [])},
-            "started_at": started, "finished_at": _now(),
-        })
-        raise RuntimeError(reason)
     ir["schema_version"] = SCHEMA_VERSION
     ir["project_id"] = project_id
     ir_path = ws / "reports" / "ir.json"
@@ -379,13 +388,35 @@ async def _run_decompose(params: dict, task_id: str) -> None:
 
 # --------------------------- 6.2 形状追踪 ---------------------------
 
+# 维度类参数：原模型与再生成模型必须同维，比对才有意义；这些键以「实例化模型」为准。
+# （agent 对尺寸由运行期构造参数决定的模型只能猜，猜的值与实际实例化不一致会让比对必败。）
+_DIM_PARAM_KEYS = frozenset({
+    "in_features", "out_features", "num_features", "in_channels", "out_channels",
+    "num_embeddings", "embedding_dim",
+})
+
+
+def _is_param_literal(v) -> bool:
+    """参数值是否可直接写进生成代码（数字/布尔/非空整数列表）。
+
+    agent 对运行期决定的尺寸会写成 `'sizes[0]'` 这类字符串表达式——它不是可用的构造参数值，
+    应当视为「缺失」并由 trace 从实例化模型上回填真实值，而不是原样写进生成代码（会 NameError）。
+    """
+    if isinstance(v, bool) or isinstance(v, (int, float)):
+        return True
+    return isinstance(v, list) and bool(v) and all(isinstance(x, int) for x in v)
+
+
 def _merge_shapes(ir: dict, trace_output: dict) -> int:
-    """把 hook 捕获的形状回填 IR 的缺失项（ir_hash 不含形状，回填不产生 stale）。
+    """把 trace 捕获的形状与层构造参数回填 IR 的缺失项。
 
     trace 产物两种形态都接受：`{path: {input_shape, output_shape}}`（旧）与
     `{"shapes": {...}, "order": [{"path","class_name"}]}`（新，附类名以便兜底对齐）。
     兜底（3.2）：节点没有 module_path 时，按「class_name + 出现次序」与 traced 的
     同层同类模块配对，避免 agent 漏填 module_path 就整棵树补不上形状。
+    补参（3.1）：库型模型的层尺寸由运行期构造参数决定，agent 给出的 params 值为 null；
+    trace 从实例化模型上读出真实构造参数（`params`）按 module_path 回填**仅补 null**。
+    input_spec.shape 缺失/含非法维度时，用本次 trace 实际使用的输入形状（`input_shape`）补齐。
     """
     if "shapes" in trace_output and isinstance(trace_output.get("shapes"), dict):
         shapes: dict = trace_output["shapes"]
@@ -427,6 +458,34 @@ def _merge_shapes(ir: dict, trace_output: dict) -> int:
             filled += 1
         if n.get("output_shape") is None and rec.get("output_shape"):
             n["output_shape"] = rec["output_shape"]
+            filled += 1
+
+    # 层构造参数回填（3.1 补参）：只补 null，不覆盖 agent 已给的确定值
+    trace_params = trace_output.get("params") or {}
+    for n in ir["nodes"]:
+        params = n.get("params")
+        if not isinstance(params, dict):
+            continue
+        src = trace_params.get(n.get("module_path"))
+        if not src:
+            continue
+        for k, v in src.items():
+            cur = params.get(k)
+            # 维度类参数以实例化模型为准；其余只在「当前值不是可用字面量」时回填，
+            # 避免把 agent 的等价表示（kernel_size 3 vs (3,3)）改掉、无谓改动模块签名。
+            if cur != v and (k in _DIM_PARAM_KEYS or not _is_param_literal(cur)):
+                params[k] = v
+                filled += 1
+
+    # 输入规格回填：shape 缺失/含非法维度时，用本次 trace 实际使用的输入形状
+    used_shape = trace_output.get("input_shape")
+    if used_shape:
+        spec = dict(ir.get("input_spec") or {})
+        cur = spec.get("shape") or []
+        if not cur or not all(isinstance(d, int) and d > 0 for d in cur):
+            spec["shape"] = list(used_shape)
+            spec.setdefault("dtype", "float32")
+            ir["input_spec"] = spec
             filled += 1
     return filled
 
@@ -480,9 +539,14 @@ async def _run_trace(params: dict, task_id: str) -> None:
     ir = _read_ir(project)
     if ir is None:
         raise RuntimeError("尚未拆解：请先 POST /api/projects/{id}/decompose")
-    missing = [n["id"] for n in ir["nodes"]
-               if n.get("input_shape") is None or n.get("output_shape") is None]
-    if not missing:
+    need_shape = any(n.get("input_shape") is None or n.get("output_shape") is None for n in ir["nodes"])
+    need_params = any(
+        n.get("kind") == "leaf" and any(v is None for v in (n.get("params") or {}).values())
+        for n in ir["nodes"]
+    )
+    spec_shape = (ir.get("input_spec") or {}).get("shape") or []
+    need_input = not spec_shape or not all(isinstance(d, int) and d > 0 for d in spec_shape)
+    if not (need_shape or need_params or need_input):
         # 3.2「读 IR 统计形状缺失（无缺失直接跳过）」：省掉一次项目环境跑模型
         knowledge_service.record_run({
             "project_id": project_id, "task_id": task_id, "run_type": "decompose_trace",
