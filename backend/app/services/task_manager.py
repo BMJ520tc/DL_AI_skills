@@ -39,6 +39,7 @@ TASK_TIMEOUTS: dict[str, float] = {
     "decompose_trace": 900,  # 脚本 600s + 余量
     "decompose_verify": 2400,  # 脚本 1800s + 余量
     "module_ingest": 600,
+    "network_train": 3600,  # 训练脚本 1800s + 余量
 }
 
 
