@@ -141,8 +141,12 @@ export default function IrNode({ id, data, selected }: NodeProps<Node<IrNodeData
     return (
         <div
             style={{
-                minWidth: hint?.width ?? 220,
-                minHeight: hint?.height ?? undefined,
+                // 固定尺寸 = 布局预留尺寸（graph.json layout_hint）：渲染高度与预留一致，
+                // 兄弟/父子不会互相挤压；参数过多时参数区内部滚动而不撑高节点。
+                width: hint?.width ?? 220,
+                height: hint?.height ?? undefined,
+                maxHeight: hint?.height ?? undefined,
+                overflow: "hidden",
                 background: selected ? "#1e293b" : "#0f172a",
                 border: `1.5px solid ${selected ? color : "#334155"}`,
                 borderRadius: 8,
@@ -150,6 +154,8 @@ export default function IrNode({ id, data, selected }: NodeProps<Node<IrNodeData
                 fontSize: 12,
                 color: "#e2e8f0",
                 boxSizing: "border-box",
+                display: "flex",
+                flexDirection: "column",
             }}
         >
             {inputs.map(h => (
@@ -191,7 +197,8 @@ export default function IrNode({ id, data, selected }: NodeProps<Node<IrNodeData
 
             {/* 参数（动态 schema，编辑即写回 data.params，保存画布时随 GraphIR 落库） */}
             {entries.length > 0 && (
-                <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                // 参数区占满剩余高度并在超出时内部滚动：节点总高度恒等于 layout_hint 预留值
+                <div style={{ display: "flex", flexDirection: "column", gap: 3, flex: 1, minHeight: 0, overflowY: "auto" }}>
                     {entries.map(([k, v]) => (
                         <ParamField key={k} name={k} value={v} onCommit={commitParam} onRemove={removeParam} />
                     ))}

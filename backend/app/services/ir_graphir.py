@@ -19,13 +19,22 @@ GRAPH_VERSION = 2
 # 旧实现给所有父节点的子节点用固定网格（240×100）+ 固定父宽 500，兄弟容器互相重叠、
 # 子节点溢出父框，故改为「格子尺寸 = 该层子节点里最大的子树尺寸」。
 _LEAF_W = 220.0
-_LEAF_H = 64.0
+_LEAF_MIN_H = 56.0
 _PAD_X = 16.0
 _PAD_TOP = 34.0  # 留出父节点标题行
 _PAD_BOTTOM = 16.0
 _GAP_X = 24.0
 _GAP_Y = 20.0
 _COLS = 2  # 仅当子节点都是叶子/操作时并排；含子容器时单列（避免相互遮挡）
+
+# 节点自身内容高度（画布 IrNode 渲染：头部 + 形状 + 参数单列）——
+# 参数行数必须计入预留高度，否则节点实际渲染高于预留值，会与下方兄弟节点重叠（界面表现为「内容挤在一起」）。
+# 数值由无头浏览器实测校准（与前端 irAdapter 同构）：
+#   无参数节点 ≈ 28px（内边距 + 头部 + 形状行）；带参数节点固定部分 ≈ 78px，每行参数 ≈ 21.5px（留余量取 22）。
+_NODE_BASE_H = 32.0        # 无参数时所需高度
+_NODE_PARAM_BASE_H = 78.0  # 有参数时的固定部分（内边距 + 头部 + 形状行 + 参数区上边距）
+_PARAM_ROW_H = 22.0        # 每个参数行（标签 + 输入框 + 删除）
+_PARAM_MAX_ROWS = 8        # 超过该行数时参数区内部滚动（高度不再增长）
 
 
 def _shape_str(shape) -> str:
@@ -59,6 +68,14 @@ def _handles(ins: list[str], outs: list[str]) -> list[dict]:
     hs = [{"id": i, "kind": "input", "order": k} for k, i in enumerate(ins)]
     hs += [{"id": o, "kind": "output", "order": k} for k, o in enumerate(outs)]
     return hs
+
+
+def _own_content_h(node: dict) -> float:
+    """节点**自身内容**所需高度（内边距 + 头部 + 形状 + 参数单列），与前端 IrNode 实测口径一致。"""
+    rows = len(node.get("params") or {})
+    if rows == 0:
+        return _NODE_BASE_H
+    return _NODE_PARAM_BASE_H + min(rows, _PARAM_MAX_ROWS) * _PARAM_ROW_H
 
 
 def _cols_for(ir: dict, kids: list[dict]) -> int:
@@ -103,12 +120,13 @@ def _subtree_sizes(ir: dict) -> dict[str, tuple[float, float]]:
     def visit(n: dict) -> tuple[float, float]:
         nid = n["id"]
         kids = children_of(ir, nid)
+        own_h = _own_content_h(n)
         if not kids:
-            sizes[nid] = (_LEAF_W, _LEAF_H)
+            sizes[nid] = (_LEAF_W, max(_LEAF_MIN_H, own_h))
             return sizes[nid]
         kid_sizes = {k["id"]: visit(k) for k in kids}
         _coords, grid_w, grid_h = _grid_slots(ir, kids, kid_sizes)
-        sizes[nid] = (2 * _PAD_X + grid_w, _PAD_TOP + grid_h + _PAD_BOTTOM)
+        sizes[nid] = (2 * _PAD_X + grid_w, max(own_h, _PAD_TOP + grid_h + _PAD_BOTTOM))
         return sizes[nid]
 
     for node in ir["nodes"]:
@@ -143,12 +161,12 @@ def _layout(ir: dict) -> tuple[dict[str, dict], dict[str, tuple[float, float]]]:
 
     # 兜底：与根无层级关系的游离节点，排在根右侧（多根/异常 IR 也不重叠）
     offset_y = 0.0
-    root_w = sizes.get(root["id"], (_LEAF_W, _LEAF_H))[0] if root is not None else 0.0
+    root_w = sizes.get(root["id"], (_LEAF_W, _LEAF_MIN_H))[0] if root is not None else 0.0
     for n in ir["nodes"]:
         if n["id"] in positions:
             continue
         positions[n["id"]] = {"x": root_w + 80.0, "y": offset_y}
-        offset_y += sizes.get(n["id"], (_LEAF_W, _LEAF_H))[1] + _GAP_Y
+        offset_y += sizes.get(n["id"], (_LEAF_W, _LEAF_MIN_H))[1] + _GAP_Y
     return positions, sizes
 
 
@@ -199,10 +217,10 @@ def ir_to_graphir(ir: dict) -> dict:
             "__in_shape": n.get("input_shape"),
             "__out_shape": n.get("output_shape"),
         }
-        if children_of(ir, nid):
-            # 父容器尺寸 = 子树包围盒（子节点恒在框内），画布按此撑开容器
-            w, h = sizes[nid]
-            data["layout_hint"] = {"width": w, "height": h}
+        # 所有节点都给尺寸（含叶子）：画布按固定高度渲染、参数区内部滚动，
+        # 保证「渲染高度 == 布局预留高度」，父子与兄弟都不会互相挤压
+        w, h = sizes[nid]
+        data["layout_hint"] = {"width": w, "height": h}
         graph_nodes.append({
             "id": nid,
             "type": "ir",

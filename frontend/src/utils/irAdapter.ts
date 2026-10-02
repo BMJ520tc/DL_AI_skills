@@ -6,13 +6,13 @@ import type { Edge, Node } from "@xyflow/react";
 import type { IrEdge, IrGraph, IrNode } from "../api/client";
 import type { GraphEdge, GraphHandle, GraphIR, GraphNode } from "../types/graph";
 import { applyGraphIR } from "./graphIR";
+import { LEAF_W, ownContentH } from "./nodeSize";
 
 const GRAPH_VERSION = 2;
 
 // 布局参数（与后端 ir_graphir._layout 同构）：按**子树实际尺寸**自底向上排布，
 // 父容器被其子节点撑开；旧实现用固定网格(240×100)+固定父宽 500，兄弟容器会互相重叠。
-const LEAF_W = 220;
-const LEAF_H = 64;
+const LEAF_MIN_H = 32;
 const PAD_X = 16;
 const PAD_TOP = 34;
 const PAD_BOTTOM = 16;
@@ -102,13 +102,14 @@ function subtreeSizes(ir: IrGraph): Map<string, Size> {
         const cached = sizes.get(n.id);
         if (cached) return cached;
         const kids = childrenOf(ir, n.id);
+        const ownH = ownContentH(n.params);   // 参数行数必须计入高度，否则节点渲染高于预留会与兄弟重叠
         let size: Size;
         if (kids.length === 0) {
-            size = { w: LEAF_W, h: LEAF_H };
+            size = { w: LEAF_W, h: Math.max(LEAF_MIN_H, ownH) };
         } else {
             kids.forEach(visit);
             const { gridW, gridH } = gridSlots(kids, sizes);
-            size = { w: 2 * PAD_X + gridW, h: PAD_TOP + gridH + PAD_BOTTOM };
+            size = { w: 2 * PAD_X + gridW, h: Math.max(ownH, PAD_TOP + gridH + PAD_BOTTOM) };
         }
         sizes.set(n.id, size);
         return size;
@@ -140,7 +141,7 @@ function layoutOf(ir: IrGraph): { positions: Map<string, { x: number; y: number 
     for (const n of ir.nodes) {
         if (positions.has(n.id)) continue;
         positions.set(n.id, { x: rootW + 80, y: offsetY });
-        offsetY += (sizes.get(n.id)?.h ?? LEAF_H) + GAP_Y;
+        offsetY += (sizes.get(n.id)?.h ?? LEAF_MIN_H) + GAP_Y;
     }
     return { positions, sizes };
 }
@@ -200,11 +201,10 @@ export function irToGraphIR(ir: IrGraph): GraphIR {
                 __in_shape: n.input_shape ?? null,
                 __out_shape: n.output_shape ?? null,
             };
-            const kids = childrenOf(ir, n.id);
-            if (kids.length) {
-                const size = sizes.get(n.id)!;
-                data.layout_hint = { width: size.w, height: size.h };
-            }
+            // 所有节点都给尺寸（含叶子）：画布按固定高度渲染 + 参数区内部滚动，
+            // 保证「渲染高度 == 布局预留高度」，父子/兄弟不会互相挤压
+            const size = sizes.get(n.id)!;
+            data.layout_hint = { width: size.w, height: size.h };
             const parentId = n.parent_id || undefined;
             return {
                 id: n.id,

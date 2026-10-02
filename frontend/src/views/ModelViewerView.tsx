@@ -87,9 +87,12 @@ function ViewerNode({ data, selected }: NodeProps<Node<Record<string, unknown>>>
     return (
         <div
             style={{
-                // 容器节点（有 layout_hint）按建议尺寸撑开，避免子节点塌陷（参照 IrNode 做法）
+                // 容器节点（有子节点）**必须**保留布局预留的尺寸：React Flow 的 extent="parent"
+                // 会把子节点钳制在父框内，父框过小会让所有子节点被压到 y=0（层级错乱）；
+                // 叶子/算子无子节点，用 maxHeight 收住框高，避免撑出大片空白。
                 minWidth: hint?.width ?? 220,
-                minHeight: hint?.height ?? undefined,
+                minHeight: d.__hasChildren && hint?.height ? hint.height : undefined,
+                maxHeight: !d.__hasChildren && hint?.height ? Math.min(hint.height, 120) : undefined,
                 background: selected ? "#1e293b" : "#0f172a",
                 border: `1.5px solid ${selected ? color : "#334155"}`,
                 borderRadius: 6,
@@ -525,7 +528,7 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
             const structured = await listProjects("structured");
             const child = structured
                 .filter(p => p.parent_project_id === projectId)
-                .sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
+                .sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? "")))[0];
             setStructuredChild(child ?? null);
         } catch (e) {
             console.warn("结构化项目列表读取失败", e);

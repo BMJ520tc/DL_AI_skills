@@ -74,23 +74,19 @@ export default function CanvasProjectView({ projectId, onBack }: CanvasProjectVi
     }
 
     return (
-        <div style={{ height: "100vh", position: "relative", background: "#0b1220" }}>
-            <FlowEditor key={projectId} initialGraph={graph} onSave={handleSave} />
-            {/* 悬浮头部（画布编辑器自身上方） */}
+        // 纵向布局：顶部信息栏占一行、画布占其余高度 —— 原先头部绝对定位会盖住画布自身的工具栏
+        <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: "#0b1220" }}>
             <div
                 style={{
-                    position: "absolute",
-                    top: 10,
-                    left: 10,
-                    zIndex: 20,
+                    flex: "0 0 auto",
                     display: "flex",
                     alignItems: "center",
                     gap: 10,
-                    background: "rgba(15, 23, 42, 0.92)",
-                    border: "1px solid #1f2937",
-                    borderRadius: 8,
+                    background: "#0f172a",
+                    borderBottom: "1px solid #1f2937",
                     padding: "6px 12px",
                     fontSize: 12,
+                    zIndex: 20,
                 }}
             >
                 <button
@@ -106,6 +102,9 @@ export default function CanvasProjectView({ projectId, onBack }: CanvasProjectVi
                 <span style={{ color: "#94a3b8", fontSize: 11 }}>
                     节点参数可直接编辑，改动点右上「保存到项目」落盘（GraphIR 全量快照；版本树归阶段4）
                 </span>
+            </div>
+            <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
+                <FlowEditor key={projectId} initialGraph={graph} onSave={handleSave} />
             </div>
         </div>
     );

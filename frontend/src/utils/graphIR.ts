@@ -1,5 +1,9 @@
 import type { Edge, Node } from "@xyflow/react";
 import type { GraphDisplay, GraphEdge, GraphHandle, GraphHandleKind, GraphIR, GraphNode } from "../types/graph";
+import { LEAF_W, ownContentH } from "./nodeSize";
+
+const PAD_X = 16;
+const PAD_BOTTOM = 16;
 
 const GRAPH_VERSION = 2;
 
@@ -109,7 +113,51 @@ export function buildGraphIR(nodes: Node[], edges: Edge[]): GraphIR {
 /**
  * Convert a GraphIR snapshot back into React Flow nodes/edges.
  */
+/** 旧 graph.json 可能没有 layout_hint（早期布局只给容器）→ 按同口径兜底补齐，
+ *  否则节点会按自然尺寸渲染、相互重叠；容器自底向上由子节点推出。 */
+function withFallbackHints(graph: GraphIR): void {
+    const childrenOf = (id: string) => graph.nodes.filter(n => n.parentId === id);
+    const hintOf = (n: (typeof graph.nodes)[number]) => (n.data as Record<string, unknown> | undefined)?.layout_hint as
+        | { width?: number; height?: number }
+        | undefined;
+
+    const fill = (n: (typeof graph.nodes)[number]): { width: number; height: number } => {
+        const kids = childrenOf(n.id);
+        let size: { width: number; height: number };
+        if (kids.length === 0) {
+            const params = (n.data as Record<string, unknown> | undefined)?.params as Record<string, unknown> | undefined;
+            size = { width: LEAF_W, height: ownContentH(params) };
+        } else {
+            const kidSizes = kids.map(fill);
+            const maxW = Math.max(...kidSizes.map(k => k.width));
+            const maxBottom = Math.max(...kids.map((k, i) => (k.position?.y ?? 0) + kidSizes[i].height));
+            size = { width: PAD_X * 2 + maxW, height: maxBottom + PAD_BOTTOM };
+        }
+        const existing = hintOf(n);
+        const merged = existing?.height ? { width: existing.width ?? size.width, height: existing.height } : size;
+        (n.data as Record<string, unknown>).layout_hint = merged;
+        return merged;
+    };
+
+    for (const n of graph.nodes) if (!n.parentId) fill(n);
+    for (const n of graph.nodes) if (!hintOf(n)) fill(n);  // 游离节点兜底
+}
+
+/** 层级深度（根=0）——React Flow 平铺渲染嵌套节点，容器有实底背景，
+ *  必须让子节点 z-index 高于祖先，否则子节点被父容器背景盖住（选中时才因 z-index 提升而露出）。 */
+function depthOf(n: GraphNode, byId: Map<string, GraphNode>): number {
+    let d = 0;
+    let cur: GraphNode | undefined = n;
+    while (cur?.parentId) {
+        d += 1;
+        cur = byId.get(cur.parentId);
+    }
+    return d;
+}
+
 export function applyGraphIR(graph: GraphIR): { nodes: Node[]; edges: Edge[] } {
+    withFallbackHints(graph);
+    const byId = new Map(graph.nodes.map(n => [n.id, n]));
     const nodes: Node[] = graph.nodes.map(n => ({
         id: n.id,
         type: n.type,
@@ -117,6 +165,7 @@ export function applyGraphIR(graph: GraphIR): { nodes: Node[]; edges: Edge[] } {
         parentId: n.parentId,
         extent: n.extent,
         ...(n.parentId ? { extent: n.extent || "parent" } : {}),
+        zIndex: 10 + depthOf(n, byId) * 10,   // 子节点恒在祖先之上
         data: { ...(n.data || {}), label: n.display?.title ?? n.label },
     }));
 
