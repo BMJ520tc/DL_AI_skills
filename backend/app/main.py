@@ -17,7 +17,7 @@ from app.services import (
 )
 from app.api import (
     tasks, projects, knowledge, agents, environments, search, analysis, preprocess, datasets, papers,
-    decompose, modules, networks,
+    decompose, modules, networks, versions,
 )
 
 
@@ -82,6 +82,7 @@ app.include_router(decompose.router)
 app.include_router(decompose.ir_router)
 app.include_router(modules.router)
 app.include_router(networks.router)
+app.include_router(versions.router)
 
 
 @app.post("/api/torchlens")
