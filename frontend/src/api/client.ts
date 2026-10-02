@@ -265,3 +265,70 @@ export const postIngestModule = (projectId: string) =>
     });
 
 export const listModules = () => request<ModuleItem[]>("/api/modules");
+
+// ---------------------------------------------------------------------------
+// 知识库通用列表（检索界面与三并列入口共用）
+// ---------------------------------------------------------------------------
+
+export const listKnowledge = (dataType: string, limit = 200) =>
+    request<Array<Record<string, unknown>>>(`/api/knowledge/list?data_type=${dataType}&limit=${limit}`);
+
+export const confirmKnowledgeItem = (knowledgeId: string) =>
+    request<{ knowledge_id: string; status: string }>(`/api/knowledge/confirm/${knowledgeId}`, { method: "POST" });
+
+// ---------------------------------------------------------------------------
+// 模块二：论文复现（三并列入口「先复现」，4.2~4.4）
+// ---------------------------------------------------------------------------
+
+export interface PaperDetail {
+    paper: Record<string, unknown>;
+    items: Array<Record<string, unknown>>;
+    reproduction_results: Array<Record<string, unknown>>;
+    conclusion: Record<string, unknown> | null;
+}
+
+export const getPaperDetail = (paperId: string) => request<PaperDetail>(`/api/papers/${paperId}`);
+
+export const postExtractItems = (paperId: string) =>
+    request<{ task_id: string; status: string }>(`/api/papers/${paperId}/extract`, { method: "POST" });
+
+export const postReproduce = (paperId: string, projectId: string) =>
+    request<{ task_id: string; status: string }>(`/api/papers/${paperId}/reproduce`, {
+        method: "POST",
+        body: JSON.stringify({ project_id: projectId }),
+    });
+
+export const postConclusion = (paperId: string) =>
+    request<{ task_id: string; status: string }>(`/api/papers/${paperId}/conclusion`, { method: "POST" });
+
+export const confirmPaperItem = (paperId: string, itemId: string) =>
+    request<{ item_id: string; status: string }>(`/api/papers/${paperId}/items/${itemId}/confirm`, { method: "POST" });
+
+// ---------------------------------------------------------------------------
+// 模块三：原始模型使用（三并列入口「先使用」，5.2~5.5）
+// ---------------------------------------------------------------------------
+
+export const postBaseline = (projectId: string) =>
+    request<{ task_id: string; status: string }>(`/api/projects/${projectId}/baseline`, { method: "POST" });
+
+export const getBaseline = (projectId: string) => request<Record<string, unknown>>(`/api/projects/${projectId}/baseline`);
+
+export const postAlign = (projectId: string, datasetId: string) =>
+    request<{ task_id: string; status: string }>(`/api/projects/${projectId}/datasets/align`, {
+        method: "POST",
+        body: JSON.stringify({ dataset_id: datasetId }),
+    });
+
+export const confirmAlignment = (datasetId: string) =>
+    request<{ status: string }>(`/api/datasets/${datasetId}/alignment/confirm`, { method: "POST" });
+
+export const postCompare = (projectId: string) =>
+    request<{ task_id: string; status: string }>(`/api/projects/${projectId}/compare`, { method: "POST" });
+
+export const postVisualize = (projectId: string, chart: string) =>
+    request<{ chart_type: string; html: string; degraded?: boolean }>(`/api/projects/${projectId}/visualize/${chart}`, {
+        method: "POST",
+    });
+
+/** 图表文件在新标签页打开的地址（经后端图表文件服务端点转发）。 */
+export const figureUrl = (projectId: string, chart: string) => `${API_BASE}/api/projects/${projectId}/figures/${chart}`;

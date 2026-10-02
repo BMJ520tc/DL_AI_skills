@@ -3,11 +3,15 @@ import json
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from app.services import analysis_service, project_manager
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
+
+# 可经 HTTP 打开的画布图表文件图型（模块三 5.5 三张图；与 visualize_service 的图型白名单一致）
+FIGURE_CHARTS = ("performance", "error_dist", "cases")
 
 
 class ProjectCreate(BaseModel):
@@ -26,6 +30,15 @@ def create_project(body: ProjectCreate) -> dict:
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    # 画布新建模型（阶段4 4a）：初始化空画布快照并直接置 ready（结构化项目无异步加载流程）
+    if body.project_type == "structured":
+        project = project_manager.get_project(project_id)
+        if project is not None:
+            _graph_path(project).write_text(
+                json.dumps({"nodes": [], "edges": []}, ensure_ascii=False), encoding="utf-8"
+            )
+            project_manager.update_status(project_id, "ready")
 
     if body.source_url:
         try:
@@ -81,3 +94,18 @@ def put_graph(project_id: str, body: dict) -> dict:
     _graph_path(project).write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
     project_manager.update_status(project_id, "ready")
     return {"status": "saved"}
+
+
+@router.get("/{project_id}/figures/{chart_type}")
+def get_figure(project_id: str, chart_type: str) -> HTMLResponse:
+    """模块三 5.5 图表文件服务：自包含 HTML 直接以页面打开（图表路径落盘为服务器本地文件，
+    前端无法直接引用，故经本项目端点转发；图型白名单与可视化服务一致，杜绝路径注入）。"""
+    if chart_type not in FIGURE_CHARTS:
+        raise HTTPException(status_code=404, detail=f"unknown chart type: {chart_type}")
+    project = project_manager.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    p = Path(project["workspace_path"]) / "reports" / "figures" / f"{chart_type}.html"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="figure not found（先运行该图型的可视化）")
+    return HTMLResponse(content=p.read_text(encoding="utf-8"), media_type="text/html")

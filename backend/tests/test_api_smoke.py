@@ -39,6 +39,7 @@ def test_route_surface_is_mounted(app_client):
         "/api/datasets/{dataset_id}/alignment/confirm",
         "/api/papers/{paper_id}/reproduce",
         "/api/projects/{project_id}/visualize/{chart_type}",
+        "/api/projects/{project_id}/figures/{chart_type}",
     ):
         assert expected in paths, f"路由缺失: {expected}"
     assert len(paths) >= 40

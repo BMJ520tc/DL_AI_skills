@@ -1,5 +1,6 @@
 // views/ModelViewerView.tsx — 模型查看器（模块四 B2，模块详细设计 6.1/6.2/6.3/6.4）。
-// 操作链：① 结构分析 → ② 拆解 IR → ③ 补形状 → ④ 再生成代码 → ⑤ 两步验证 → ⑥ 入库。
+// 三并列入口（需求四，阶段4 4a）：先复现 / 先使用 / 先拆解，用户自行选择。
+// 先拆解操作链：① 结构分析 → ② 拆解 IR → ③ 补形状 → ④ 再生成代码 → ⑤ 两步验证 → ⑥ 入库。
 // 左：IR 层级结构图（只读 ReactFlow，parentId 嵌套）；右：参数面板（PUT 调参）/
 // 代码（CodeViewer）/ 验证结果；另有数据流图（DiagramView + ELK，GraphIR 投影）。
 
@@ -31,6 +32,15 @@ import CodeViewer from "../components/CodeViewer";
 import DiagramView from "../components/DiagramView";
 import { useTaskPolling } from "../hooks/useTaskPolling";
 import { graphIRToFlow, irToGraphIR } from "../utils/irAdapter";
+import ReproducePanel from "./panels/ReproducePanel";
+import UseDatasetPanel from "./panels/UseDatasetPanel";
+
+const ENTRY_MODES = [
+    { kind: "reproduce", label: "先复现" },
+    { kind: "use", label: "先使用" },
+    { kind: "decompose", label: "先拆解" },
+] as const;
+type EntryMode = (typeof ENTRY_MODES)[number]["kind"];
 
 const KIND_COLORS: Record<string, string> = {
     module: "#3b82f6",
@@ -407,6 +417,7 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
     const [ingestedModules, setIngestedModules] = useState<ModuleItem[]>([]);
     const [structuredChild, setStructuredChild] = useState<Project | null>(null);
     const [entryClass, setEntryClass] = useState("");
+    const [entryMode, setEntryMode] = useState<EntryMode>("decompose");
     const [collapsedContainers, setCollapsedContainers] = useState<Set<string>>(() => new Set());
     const [treeCollapsed, setTreeCollapsed] = useState<Set<string>>(() => new Set());
 
@@ -775,22 +786,48 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                 </div>
             </div>
 
-            {/* 操作链 */}
+            {/* 操作链（三并列入口） */}
             <div style={{ padding: "12px 18px 6px", borderBottom: "1px solid #1f2937" }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
-                    <label style={{ fontSize: 11, color: "#94a3b8" }}>
-                        入口类（可选，多个根类歧义时指定）：
-                        <input
-                            style={{ ...inputStyle, width: 180, marginLeft: 6 }}
-                            placeholder="如 ResNet / MLP"
-                            value={entryClass}
-                            onChange={e => setEntryClass(e.target.value)}
-                            disabled={!!ir}
-                        />
-                    </label>
-                    {ir && <span style={{ fontSize: 11, color: "#64748b" }}>IR 已生成，入口 {ir.entry_class}</span>}
+                <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                    {ENTRY_MODES.map(m => (
+                        <button
+                            key={m.kind}
+                            style={
+                                entryMode === m.kind
+                                    ? { ...entryTabStyle, borderColor: "#0f766e", color: "#2dd4bf", background: "#0f2d2b" }
+                                    : entryTabStyle
+                            }
+                            onClick={() => setEntryMode(m.kind)}
+                        >
+                            {m.label}
+                        </button>
+                    ))}
+                    <span style={{ fontSize: 11, color: "#64748b", alignSelf: "center" }}>
+                        原始项目操作目录：三种用法并列，随时切换
+                    </span>
                 </div>
-                {steps}
+                {entryMode === "decompose" ? (
+                    <>
+                        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                            <label style={{ fontSize: 11, color: "#94a3b8" }}>
+                                入口类（可选，多个根类歧义时指定）：
+                                <input
+                                    style={{ ...inputStyle, width: 180, marginLeft: 6 }}
+                                    placeholder="如 ResNet / MLP"
+                                    value={entryClass}
+                                    onChange={e => setEntryClass(e.target.value)}
+                                    disabled={!!ir}
+                                />
+                            </label>
+                            {ir && <span style={{ fontSize: 11, color: "#64748b" }}>IR 已生成，入口 {ir.entry_class}</span>}
+                        </div>
+                        {steps}
+                    </>
+                ) : (
+                    <div style={{ maxHeight: 340, overflowY: "auto", paddingRight: 4 }}>
+                        {entryMode === "reproduce" ? <ReproducePanel projectId={projectId} /> : <UseDatasetPanel projectId={projectId} />}
+                    </div>
+                )}
             </div>
 
             {/* 任务/提示横幅 */}
@@ -1114,6 +1151,16 @@ const btnStyle: CSSProperties = {
     color: "#e2e8f0",
     borderRadius: 6,
     padding: "4px 10px",
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: "pointer",
+};
+const entryTabStyle: CSSProperties = {
+    border: "1px solid #334155",
+    background: "#0f172a",
+    color: "#94a3b8",
+    borderRadius: 999,
+    padding: "3px 14px",
     fontSize: 12,
     fontWeight: 600,
     cursor: "pointer",

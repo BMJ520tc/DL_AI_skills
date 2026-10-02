@@ -26,6 +26,9 @@ export default function ProjectListView({ onOpenViewer, onOpenCanvas, onOpenSand
     const [name, setName] = useState("");
     const [creating, setCreating] = useState(false);
     const [createError, setCreateError] = useState<string | null>(null);
+    const [modelName, setModelName] = useState("");
+    const [creatingModel, setCreatingModel] = useState(false);
+    const [createModelError, setCreateModelError] = useState<string | null>(null);
 
     const refresh = useCallback(async () => {
         try {
@@ -71,6 +74,25 @@ export default function ProjectListView({ onOpenViewer, onOpenCanvas, onOpenSand
             setCreateError(e instanceof ApiError && e.status === 400 ? `创建/加载失败：${msg}` : msg);
         } finally {
             setCreating(false);
+        }
+    };
+
+    // 画布新建模型（阶段4 4a）：创建空结构化项目并直接打开画布
+    const handleCreateModel = async () => {
+        setCreatingModel(true);
+        setCreateModelError(null);
+        try {
+            const { project_id } = await createProject({
+                project_type: "structured",
+                name: modelName.trim() || undefined,
+            });
+            setModelName("");
+            onOpenCanvas(project_id);
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            setCreateModelError(e instanceof ApiError && e.status === 400 ? `创建失败：${msg}` : msg);
+        } finally {
+            setCreatingModel(false);
         }
     };
 
@@ -193,9 +215,23 @@ export default function ProjectListView({ onOpenViewer, onOpenCanvas, onOpenSand
                             {renderTable(originals, false)}
                         </div>
                         <div style={card}>
-                            <h2 style={{ fontSize: 15, margin: "0 0 12px" }}>
-                                结构化项目 <span style={{ color: "#64748b", fontSize: 12, fontWeight: 400 }}>（模块入库后生成，画布可编辑）</span>
-                            </h2>
+                            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 12 }}>
+                                <h2 style={{ fontSize: 15, margin: 0 }}>
+                                    结构化项目 <span style={{ color: "#64748b", fontSize: 12, fontWeight: 400 }}>（模块入库后生成，也可直接新建，画布可编辑）</span>
+                                </h2>
+                                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                                    <input
+                                        style={{ ...input, flex: "none", minWidth: 180, maxWidth: 220, padding: "5px 10px", fontSize: 12 }}
+                                        placeholder="新模型名称（可选）"
+                                        value={modelName}
+                                        onChange={e => setModelName(e.target.value)}
+                                    />
+                                    <button style={btn} onClick={() => void handleCreateModel()} disabled={creatingModel}>
+                                        {creatingModel ? "创建中…" : "＋ 新建模型"}
+                                    </button>
+                                </div>
+                            </div>
+                            {createModelError && <div style={{ color: "#f87171", fontSize: 12, marginBottom: 8 }}>{createModelError}</div>}
                             {renderTable(structured, true)}
                         </div>
                     </>

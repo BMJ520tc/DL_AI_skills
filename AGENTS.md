@@ -55,29 +55,33 @@ Python 的 FastAPI）。`agents/prompts/` 里是交给大模型的任务提示�
 ## 四、常用命令
 
 ```powershell
-# 后端自动化用例（当前 80 个，全部通过）
-D:\python.exe scripts/run_tests.py
+# 后端自动化用例（当前 84 个，全部通过）
+backend\.venv\Scripts\python.exe scripts/run_tests.py
 
 # 前端：代码规范检查（当前 0 问题）与构建
 cd frontend; npm run lint; npm run build
 #   注意：构建完必须真的打开一次产物确认界面能出来（见第三节第 2 条）
 
+# 阶段4 起：构建产物无头浏览器自检（临时库后端 + vite preview + 无头 Edge，不动真实数据）
+backend\.venv\Scripts\python.exe scripts/ui_check_4a.py
+
 # 不需要模型接口凭证的端到端自检：
 #   在项目自己的运行环境里「补形状 → 回填参数 → 再生成代码 → 结构比对 + 数值比对」，
 #   并附带一次「参数写法变了编号是否还一致」的回归。产物落在 data/_acceptance/ 下，不动项目数据。
-D:\python.exe scripts/decompose_e2e_check.py --project-id dc21142917844c05b196fac086b484dc --ab
+backend\.venv\Scripts\python.exe scripts/decompose_e2e_check.py --project-id dc21142917844c05b196fac086b484dc --ab
 
 # 模块四完整验收（需要模型接口凭证，会调用大模型）
-D:\python.exe scripts/m3_acceptance.py --mode all --source examples/m3_sample_repo
+backend\.venv\Scripts\python.exe scripts/m3_acceptance.py --mode all --source examples/m3_sample_repo
 
 # 启动后端（改完代码记得重启；下载依赖建议走国内镜像源）
-cd backend; $env:PIP_INDEX_URL="https://mirrors.cloud.tencent.com/pypi/simple"; D:\python.exe -m uvicorn app.main:app --port 8000
+cd backend; $env:PIP_INDEX_URL="https://mirrors.cloud.tencent.com/pypi/simple"; .\.venv\Scripts\python.exe -m uvicorn app.main:app --port 8000
 ```
 
 ## 五、现在到哪一步了
 
 前五个阶段的目标（基线准备、模型加载与代码分析、跨数据集对比、论文自动复现、模型拆解入库）都已验收通过；
-**下一个阶段是「画布自建」**——把标准模块接进画布、给新模型加运行通道、做版本管理与回退。
+**阶段4「画布自建」进行中**：4a（三并列入口 / 画布新建模型 / 守卫回归）已完成并通过构建产物界面自检，
+下一步 4b（params_schema 参数面板联动、模块库注入守卫回归）→ 4c（运行通道）→ 4d-1（git 提交）→ M4 验收。
 本地主干领先远端几个提交，尚未推送。
 
 ## 六、提交约定
