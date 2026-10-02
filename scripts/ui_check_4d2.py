@@ -361,9 +361,10 @@ def main() -> int:
             return 1
         wait_for(cdp, "document.body.innerText.includes('+++ ')", True,
                  "代码差异渲染（再生成代码 diff）")
+        # 内容 + 行（排除 diff 头行 +++ …）
         plus_lines = cdp.evaluate(
             "JSON.stringify([...document.querySelectorAll('pre div')]"
-            ".filter(d => d.textContent.startsWith('+')).length)")
+            ".filter(d => d.textContent.startsWith('+') && !d.textContent.startsWith('+++')).length)")
         check("对比出代码差异（+ 行/新增内容）", plus_lines not in (None, "0", "null"),
               f"+ 行数={plus_lines}")
         if not click_button(cdp, "参数差异", exact=True):

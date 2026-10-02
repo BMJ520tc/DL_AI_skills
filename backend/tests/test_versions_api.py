@@ -311,9 +311,9 @@ def test_compare_versions_code_and_param_diff(tmp_versions):
     r = client.get(f"/api/versions/{project_id}/compare", params={"v1": v_old, "v2": v_new})
     assert r.status_code == 200, r.text
     body = r.json()
-    # 代码差异：再生成代码的 unified diff（+ 行为新增/变化内容）
+    # 代码差异：再生成代码的 unified diff（内容 + 行为新增/变化，排除 ---/+++ 头行）
     assert body["code_diff_error"] is None
-    assert any(line.startswith("+") for line in body["code_diff"])
+    assert any(line.startswith("+") and not line.startswith("+++") for line in body["code_diff"])
     assert body["code_diff"][0].startswith("--- ")
     # 参数差异表：新增 n4、n3 的 out_features 变化
     pd = body["param_diff"]
