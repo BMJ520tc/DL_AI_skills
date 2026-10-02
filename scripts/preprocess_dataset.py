@@ -1,9 +1,13 @@
 """模块三 5.1 数据预处理固定脚本（模块详细设计 5.1）。
 
 用法: python preprocess_dataset.py <input> <out_dir> [--dataset-name NAME] [--task-type T]
+                                 [--image-size WxH]
 
-支持: CSV / Excel(.xlsx) / 图片目录 / 压缩包(zip、tar)；
-      FASTA/PDB 与 .xls 识别后返回 unsupported（本阶段只留接口位）。
+支持: CSV / Excel(.xlsx) / FASTA / PDB / 图片目录 / 压缩包(zip、tar)；
+      旧版 .xls 识别后返回 unsupported（提示另存为 .xlsx）。
+
+图片目录默认只做色彩空间归一（统一到 RGB，必要时保存归一副本），
+传 --image-size 时额外缩放到目标尺寸（默认不缩放，避免破坏原始数据）。
 
 输出: <out_dir>/preprocessed.csv（统一 schema）与
       <out_dir>/dataset.schema.json（统一 schema + alignment + 清洗统计）。
@@ -119,6 +123,57 @@ def _read_excel(path: Path) -> tuple[list[dict], list[str]]:
     return rows, header
 
 
+def _read_fasta(path: Path) -> tuple[list[dict], list[str]]:
+    """FASTA：``>id`` 起始一条记录，其后各行拼成序列（纯标准库，不引入 biopython）。"""
+    rows: list[dict] = []
+    current_id: str | None = None
+    parts: list[str] = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        if text.startswith(">"):
+            if current_id is not None:
+                rows.append({"id": current_id, "sequence": "".join(parts)})
+            header = text[1:].split()
+            current_id = (header[0] if header else "") or f"seq{len(rows) + 1}"
+            parts = []
+        elif current_id is not None:
+            parts.append(text)
+    if current_id is not None:
+        rows.append({"id": current_id, "sequence": "".join(parts)})
+    return rows, ["id", "sequence"]
+
+
+def _read_pdb(path: Path) -> tuple[list[dict], list[str]]:
+    """PDB：最少解析 ATOM/HETATM 固定列，产出每原子一行的表（纯标准库）。"""
+    columns = ["id", "residue", "chain", "res_seq", "atom", "x", "y", "z"]
+    rows: list[dict] = []
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if not (line.startswith("ATOM") or line.startswith("HETATM")):
+            continue
+        try:
+            x = float(line[30:38])
+            y = float(line[38:46])
+            z = float(line[46:54])
+        except ValueError:
+            continue
+        atom = line[12:16].strip()
+        chain = line[21:22].strip()
+        res_seq = line[22:26].strip()
+        rows.append({
+            "id": f"{chain or '_'}:{res_seq}:{atom}",
+            "residue": line[17:20].strip(),
+            "chain": chain,
+            "res_seq": res_seq,
+            "atom": atom,
+            "x": x,
+            "y": y,
+            "z": z,
+        })
+    return rows, columns
+
+
 def _image_label_and_split(p: Path, root: Path) -> tuple[str, str]:
     """从图片所在目录推导 (label, split)。
 
@@ -139,53 +194,127 @@ def _image_label_and_split(p: Path, root: Path) -> tuple[str, str]:
     return label, split
 
 
-def _read_image_dir(path: Path) -> tuple[list[dict], list[str]]:
+def _read_image_dir(
+    path: Path, out_dir: Path | None = None, target_size: tuple[int, int] | None = None
+) -> tuple[list[dict], list[str], dict]:
+    """读图片目录并做归一：色彩空间统一到 RGB，可选缩放到 target_size（默认不缩放）。
+
+    需要归一（非 RGB 或指定了目标尺寸）时把副本写到 ``<out_dir>/_normalized/``，
+    行内 path（即统一后的 input）指向该副本，使归一结果可持续访问。
+    返回 (行, 列名, 归一统计)——统计落进 alignment.images。
+    """
     try:
         from PIL import Image
     except ImportError as e:
         raise RuntimeError("缺少 Pillow，无法读取图片") from e
 
     rows: list[dict] = []
+    stats = {
+        "color_space": "RGB",
+        "n_images": 0,
+        "converted_to_rgb": 0,
+        "target_size": list(target_size) if target_size else None,
+        "resized": 0,
+        "normalized_dir": None,
+    }
+    normalized_root: Path | None = None
+    has_orig = False
     for p in sorted(path.rglob("*")):
         if p.suffix.lower() not in IMAGE_EXT:
             continue
         label, split = _image_label_and_split(p, path)
-        width = height = None
-        mode = None
         try:
             with Image.open(p) as im:
                 width, height, mode = im.width, im.height, im.mode
+                orig_width, orig_height, orig_mode = width, height, mode
+                needs_norm = mode != "RGB" or target_size is not None
+                normed = False
+                out_path = p
+                if needs_norm and out_dir is not None:
+                    if normalized_root is None:
+                        normalized_root = out_dir / "_normalized"
+                        stats["normalized_dir"] = str(normalized_root)
+                    norm = im.convert("RGB")
+                    if target_size is not None:
+                        norm = norm.resize(target_size, getattr(Image, "Resampling", Image).LANCZOS)
+                        stats["resized"] += 1
+                    if mode != "RGB":
+                        stats["converted_to_rgb"] += 1
+                    out_path = normalized_root / p.relative_to(path)
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    norm.save(out_path)
+                    # 行的 width/height/mode 必须描述**落盘的归一后文件**，否则下游按元数据
+                    # 判断尺寸/通道会与真实文件不符；原图信息另存 orig_* 以便追溯
+                    width, height, mode = norm.width, norm.height, norm.mode
+                    normed = True
         except OSError:
             continue
-        row = {"path": str(p), "label": label, "width": width, "height": height, "mode": mode}
+        stats["n_images"] += 1
+        row = {"path": str(out_path), "label": label, "width": width, "height": height, "mode": mode}
+        if normed:
+            row["orig_width"], row["orig_height"], row["orig_mode"] = orig_width, orig_height, orig_mode
+            has_orig = True
         if split:
             row["split"] = split
         rows.append(row)
     columns = ["path", "label", "width", "height", "mode"]
     if any("split" in r for r in rows):
         columns.insert(1, "split")
-    return rows, columns
+    if has_orig:
+        columns += ["orig_width", "orig_height", "orig_mode"]
+    return rows, columns, stats
 
 
-def _read_one(path: Path) -> tuple[list[dict], list[str]]:
+def _read_one(
+    path: Path, out_dir: Path | None = None, target_size: tuple[int, int] | None = None
+) -> tuple[list[dict], list[str], dict | None]:
     fmt = detect_format(path)
     if fmt == "csv":
-        return _read_csv(path)
+        rows, columns = _read_csv(path)
+        return rows, columns, None
     if fmt == "excel":
-        return _read_excel(path)
+        rows, columns = _read_excel(path)
+        return rows, columns, None
+    if fmt in {"fasta", "fa", "fna"}:
+        rows, columns = _read_fasta(path)
+        return rows, columns, None
+    if fmt in {"pdb", "ent"}:
+        rows, columns = _read_pdb(path)
+        return rows, columns, None
     if fmt == "image_dir":
-        return _read_image_dir(path)
+        return _read_image_dir(path, out_dir, target_size)
     raise RuntimeError(f"不可直接读取的格式: {fmt}")
+
+
+_MAX_ARCHIVE_MEMBERS = 200_000
+_MAX_ARCHIVE_BYTES = 5 * 1024 ** 3  # 5 GiB，防解包炸弹
+
+
+def _check_archive_limits(members: list) -> None:
+    """解包前估算规模：条目数与解压后总字节超限即拒绝（含路径逃逸由 extractall(filter=data) 兜）。"""
+    total = 0
+    for _name, size in members:
+        total += int(size or 0)
+    if len(members) > _MAX_ARCHIVE_MEMBERS or total > _MAX_ARCHIVE_BYTES:
+        raise RuntimeError(
+            f"压缩包规模超限（条目 {len(members)}、解压后约 {total / 1024 ** 3:.1f} GiB），已拒绝解包"
+        )
 
 
 def _extract_archive(path: Path, dest: Path) -> None:
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as z:
+            _check_archive_limits([(i.filename, i.file_size) for i in z.infolist()])
             z.extractall(dest)
         return
     if tarfile.is_tarfile(path):
         with tarfile.open(path) as t:
-            t.extractall(dest)
+            _check_archive_limits([(m.name, m.size) for m in t.getmembers()])
+            try:
+                # filter="data" 由 stdlib 消毒：拒绝绝对路径、`..` 逃逸、符号链接与设备文件
+                t.extractall(dest, filter="data")
+            except TypeError:  # 极老 Python 无 filter 参数（当前环境 3.13，有）
+                t.extractall(dest)
         return
     raise RuntimeError(f"无法识别的压缩包: {path}")
 
@@ -289,6 +418,7 @@ def normalize_units(unified: list[dict], columns: list[str]) -> tuple[list[dict]
     """
     units: dict = {}
     rename: dict = {}
+    claimed: dict[str, str] = {}  # 目标列名 -> 源列名（detect 同量纲多单位冲突）
     for col in columns:
         if not col.startswith(META_PREFIX):
             continue
@@ -307,12 +437,19 @@ def normalize_units(unified: list[dict], columns: list[str]) -> tuple[list[dict]
             continue
         new_orig = f"{orig[:m.start()].rstrip('_ -')}_{base}"
         new_col = META_PREFIX + new_orig
+        if new_col != col and (new_col in claimed or new_col in columns):
+            # 同量纲多单位（latency_ms 与 latency_us 都归到 latency_s）会互相覆盖并产生重名列：
+            # 保留原列名不做换算，并如实记录冲突，交人工决定如何合并
+            units[orig] = {"column": orig, "from": token, "to": base, "factor": factor,
+                           "skipped": f"目标列名与 {claimed.get(new_col, new_col)} 冲突，未换算"}
+            continue
         for row in unified:
             value = _to_float(row.get(col))
             row[new_col] = round(value * factor, 10) if value is not None else row.get(col)
             if new_col != col:  # 同名时不能 pop，否则刚写入的值会被删掉
                 row.pop(col, None)
         rename[col] = new_col
+        claimed[new_col] = col
         units[orig] = {"column": new_orig, "from": token, "to": base, "factor": factor}
     return unified, [rename.get(c, c) for c in columns], units
 
@@ -368,7 +505,8 @@ def clean(unified: list[dict], columns: list[str]) -> tuple[list[dict], dict]:
         deduped.append(row)
 
     # 缺失值：整行缺失 >50% 删除；数值列填中位数、其余填众数
-    value_cols = list(columns)
+    # id 列不参与填充/截断——对它补值或裁剪会伪造/重复主键（数值型 id 被填成中位数即重复）
+    value_cols = [c for c in columns if c != "id"]
     kept: list[dict] = []
     for row in deduped:
         missing = sum(1 for c in value_cols if _is_missing(row.get(c)))
@@ -445,15 +583,20 @@ def _write_outputs(out_dir: Path, rows: list[dict], columns: list[str]) -> Path:
     return csv_path
 
 
-def run(input_path: Path, out_dir: Path, dataset_name: str, task_type: str) -> dict:
+def run(
+    input_path: Path,
+    out_dir: Path,
+    dataset_name: str,
+    task_type: str,
+    image_size: tuple[int, int] | None = None,
+) -> dict:
     fmt = detect_format(input_path)
-    if fmt in {"fasta", "fa", "fna", "pdb", "ent"}:
-        return _fail(fmt, f"暂不支持 {fmt.upper()} 格式（当前支持 CSV/Excel/图片/压缩包）")
     if fmt == "xls":
         return _fail(fmt, "暂不支持旧版 .xls（请另存为 .xlsx）")
     if fmt == "unknown":
         return _fail(fmt, f"无法识别格式: {input_path.name}")
 
+    image_stats: dict | None = None
     if fmt == "archive":
         # 解压到产出目录下的 _files/：图片类数据集的统一 CSV 里 input 必须指向可持续访问的路径，
         # 若解压到临时目录，本次运行结束即被清理，CSV 中的图片路径会全部失效（真实数据集暴露的问题）。
@@ -468,7 +611,7 @@ def run(input_path: Path, out_dir: Path, dataset_name: str, task_type: str) -> d
         # 递归一次：优先取表格，其次取图片/子目录
         table = next((p for p in inner if p.suffix.lower() in TABLE_EXT), None)
         if table is not None:
-            rows, columns = _read_one(table)
+            rows, columns, image_stats = _read_one(table, out_dir, image_size)
             fmt = detect_format(table)
         else:
             img_files = [p for p in inner if p.suffix.lower() in IMAGE_EXT]
@@ -481,10 +624,10 @@ def run(input_path: Path, out_dir: Path, dataset_name: str, task_type: str) -> d
             img_root = extract_dir
             if single_top and (extract_dir / single_top).is_dir():
                 img_root = extract_dir / single_top
-            rows, columns = _read_image_dir(img_root)
+            rows, columns, image_stats = _read_image_dir(img_root, out_dir, image_size)
             fmt = "image_dir"
     else:
-        rows, columns = _read_one(input_path)
+        rows, columns, image_stats = _read_one(input_path, out_dir, image_size)
 
     if not rows:
         return _fail(fmt, "未读取到任何数据行")
@@ -519,6 +662,9 @@ def run(input_path: Path, out_dir: Path, dataset_name: str, task_type: str) -> d
         "units": units,
         "version": "1.0",
     }
+    if image_stats is not None:
+        # 图片归一统计（色彩空间/RGB 转换/缩放）落进 alignment.images（5.6 约定结构）
+        summary["alignment"]["images"] = image_stats
     (out_dir / "dataset.schema.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
@@ -531,14 +677,25 @@ def main() -> int:
     ap.add_argument("out_dir")
     ap.add_argument("--dataset-name", default="")
     ap.add_argument("--task-type", default="classification")
+    ap.add_argument("--image-size", default="", help="图片目标尺寸 WxH（如 224x224），留空则不缩放")
     args = ap.parse_args()
+
+    image_size: tuple[int, int] | None = None
+    if args.image_size.strip():
+        m = re.match(r"^(\d+)\s*[xX*×]\s*(\d+)$", args.image_size.strip())
+        if not m:
+            print(json.dumps(
+                {"status": "error", "message": "--image-size 需为 WxH 形式，如 224x224"}, ensure_ascii=False
+            ))
+            return 1
+        image_size = (int(m.group(1)), int(m.group(2)))
 
     input_path = Path(args.input)
     if not input_path.exists():
         print(json.dumps({"status": "error", "message": f"输入不存在: {input_path}"}, ensure_ascii=False))
         return 1
     try:
-        summary = run(input_path, Path(args.out_dir), args.dataset_name, args.task_type)
+        summary = run(input_path, Path(args.out_dir), args.dataset_name, args.task_type, image_size)
     except Exception as e:  # noqa: BLE001
         print(json.dumps({"status": "error", "message": str(e)}, ensure_ascii=False))
         return 1

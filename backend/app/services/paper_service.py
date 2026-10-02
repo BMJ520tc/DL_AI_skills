@@ -19,7 +19,11 @@ from pathlib import Path
 from typing import Optional
 
 from app.config import PAPERS_DIR, PROJECT_ROOT
-from app.services import agent_service, analysis_service, env_manager, knowledge_service, project_manager, task_manager
+from app.ids import fs_name, safe_id
+from app.services import (
+    agent_service, analysis_service, env_manager, knowledge_service, proc_util,
+    project_manager, task_manager,
+)
 
 TASK_PARSE = "pdf_parse"
 TASK_EXTRACT = "extract_items"
@@ -86,7 +90,7 @@ def _now() -> str:
 
 
 def _paper_dir(paper_id: str) -> Path:
-    d = PAPERS_DIR / paper_id
+    d = PAPERS_DIR / fs_name(paper_id, "paper_id")
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -199,11 +203,11 @@ async def _run_parse(params: dict, task_id: str) -> None:
     idx_path = d / "section_index.json"
     tables_path = d / "tables.json"
 
-    await asyncio.to_thread(
-        subprocess.run,
+    rc, out = await proc_util.run_command(
         [sys.executable, str(PDF_SCRIPT), str(pdf_path), str(md_path), str(idx_path), str(tables_path)],
-        check=True, capture_output=True,
     )
+    if rc != 0:
+        raise RuntimeError(f"PDF 解析脚本失败（rc={rc}）: {out[-1500:]}")
     index = json.loads(idx_path.read_text(encoding="utf-8"))
 
     agent_fix = "skipped"
@@ -217,11 +221,11 @@ async def _run_parse(params: dict, task_id: str) -> None:
         except Exception as e:  # noqa: BLE001
             agent_fix = f"failed: {e}"
         # 不论是否修正，都从当前 markdown 重建索引（无分页信息）
-        await asyncio.to_thread(
-            subprocess.run,
+        rc, out = await proc_util.run_command(
             [sys.executable, str(PDF_SCRIPT), "--index-only", str(md_path), str(idx_path)],
-            check=True, capture_output=True,
         )
+        if rc != 0:
+            raise RuntimeError(f"索引重建失败（rc={rc}）: {out[-800:]}")
         index = json.loads(idx_path.read_text(encoding="utf-8"))
 
     knowledge_service.update_paper(
@@ -302,17 +306,17 @@ def reproduce(paper_id: str, project_id: str) -> str:
     )
 
 
-def _run_item(python: str, script: Path, source: Path, item_json: Path, out_json: Path, cwd: Path) -> dict:
+async def _run_item(python: str, script: Path, source: Path, item_json: Path, out_json: Path, cwd: Path) -> dict:
+    """跑一条复现；走 proc_util（取消/超时即杀进程树）。"""
     try:
-        proc = subprocess.run(
+        rc, log = await proc_util.run_command(
             [python, str(script), str(source), str(item_json), str(out_json)],
-            cwd=str(cwd), capture_output=True, text=True, timeout=REPRODUCE_TIMEOUT_S,
+            cwd=str(cwd), timeout=REPRODUCE_TIMEOUT_S,
         )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"复现运行超时（>{REPRODUCE_TIMEOUT_S}s）", "log": ""}
-    log = (proc.stdout or "") + (proc.stderr or "")
-    error = None if proc.returncode == 0 else (log[-2000:] or f"退出码 {proc.returncode}")
-    return {"ok": proc.returncode == 0, "error": error, "log": log}
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": f"复现运行超时（>{REPRODUCE_TIMEOUT_S}s，已终止进程树）", "log": ""}
+    error = None if rc == 0 else (log[-2000:] or f"退出码 {rc}")
+    return {"ok": rc == 0, "error": error, "log": log}
 
 
 async def _fill_reproduce_script(source: Path, run_dir: Path, items: list[dict]) -> None:
@@ -379,7 +383,7 @@ async def _run_reproduce(params: dict, task_id: str) -> None:
             item_json.write_text(json.dumps(it, ensure_ascii=False), encoding="utf-8")
 
             started = _now()
-            run = await asyncio.to_thread(_run_item, python, script, source, item_json, out_json, run_dir)
+            run = await _run_item(python, script, source, item_json, out_json, run_dir)
 
             actual = None
             if run["ok"] and out_json.exists():
@@ -424,14 +428,35 @@ def conclusion(paper_id: str) -> str:
     return task_manager.create_task(TASK_CONCLUSION, params={"paper_id": paper_id})
 
 
-def _classify(actual, reported) -> tuple[Optional[float], int, str]:
-    """相对误差分档（D6）：返回 (deviation, passed_threshold, verdict)。"""
+_PERCENT_UNITS = {"%", "percent", "percentage", "percent improvement", "% improvement", "百分数", "百分比"}
+
+
+def _align_unit(a: float, r: float, unit: Optional[str]) -> tuple[float, float]:
+    """百分比单位下的量纲归一：一侧是小数(0~1)、另一侧是百分数(>1)时统一到百分数。
+
+    否则「报告 91.5% vs 实测 0.915」会被算成 99% 偏差，恒判「不一致」。
+    """
+    u = (unit or "").strip().lower()
+    if u in _PERCENT_UNITS:
+        if 0 < r <= 1 < a:
+            r *= 100.0
+        elif 0 < a <= 1 < r:
+            a *= 100.0
+    return a, r
+
+
+def _classify(actual, reported, unit: Optional[str] = None) -> tuple[Optional[float], int, str]:
+    """相对误差分档（D6）：返回 (deviation, passed_threshold, verdict)。
+
+    报告值缺失/非数值（如「未报告」「>50% improvement」）或为 0 → **无法复现**：
+    无从比较，不能算作「不一致」（原先一律判不一致，会污染总体可信度）。
+    """
     if actual is None:
         return None, 0, VERDICT_UNREPRODUCIBLE
     a, r = _to_float(actual), _to_float(reported)
     if a is None or r is None or r == 0:
-        # 报告值非数值/为 0 无法算相对误差，数值无法比较 → 不一致
-        return None, 0, VERDICT_INCONSISTENT
+        return None, 0, VERDICT_UNREPRODUCIBLE
+    a, r = _align_unit(a, r, unit)
     deviation = abs(a - r) / abs(r)
     if deviation <= DEVIATION_CONSISTENT:
         return deviation, 1, VERDICT_CONSISTENT
@@ -457,7 +482,10 @@ async def _run_conclusion(params: dict, task_id: str) -> None:
 
     item_results = []
     for r in results:
-        deviation, passed, verdict = _classify(r.get("metric_value_actual"), r.get("metric_value_reported"))
+        item = knowledge_service.get_item("experiment_item", r.get("item_id") or "") or {}
+        deviation, passed, verdict = _classify(
+            r.get("metric_value_actual"), r.get("metric_value_reported"), item.get("metric_unit")
+        )
         knowledge_service.update_reproduction_result(
             r["result_id"], deviation=deviation, passed_threshold=passed, verdict=verdict
         )

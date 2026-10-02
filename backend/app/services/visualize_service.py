@@ -4,12 +4,13 @@
 → 调用固定脚本生成自包含 HTML → 返回文件路径。
 某张图缺字段时由脚本内降级提示，不影响其他图。
 """
+import asyncio
 import json
-import subprocess
 import sys
 from pathlib import Path
 
 from app.config import PROJECT_ROOT
+from app.services import proc_util
 from app.contracts import ordered_metrics
 from app.services import knowledge_service, project_manager
 
@@ -84,7 +85,8 @@ def _is_number(value) -> bool:
 
 
 def _error_dist_payload(predictions: list[dict]) -> dict:
-    numeric = all(_is_number(p.get("y_true")) and _is_number(p.get("y_pred")) for p in predictions[:5]) \
+    # 必须校验**全部**行：只抽查前 5 条时，第 6 条起的非数值会让后面的 float() 抛错打成 500
+    numeric = all(_is_number(p.get("y_true")) and _is_number(p.get("y_pred")) for p in predictions) \
         and bool(predictions)
     if numeric:
         values = [abs(float(p["y_true"]) - float(p["y_pred"])) for p in predictions]
@@ -137,7 +139,7 @@ def _payload_for(chart_type: str, project_id: str) -> dict:
     raise ValueError(f"unknown chart_type: {chart_type}")
 
 
-def run(project_id: str, chart_type: str) -> dict:
+async def run(project_id: str, chart_type: str) -> dict:
     """生成一张图，返回 {chart_type, html, degraded}。"""
     project_manager.require_type(project_id, {"original"})
     if chart_type not in SCRIPTS:
@@ -154,9 +156,12 @@ def run(project_id: str, chart_type: str) -> dict:
 
     html_path = out_dir / f"{chart_type}.html"
     cmd = [sys.executable, str(SCRIPTS[chart_type]), str(input_json), str(html_path), str(ECHARTS_PATH)]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    if proc.returncode != 0 or not html_path.exists():
-        raise RuntimeError(f"可视化脚本失败（{chart_type}）：{((proc.stdout or '') + (proc.stderr or ''))[-1500:]}")
+    try:
+        rc, out = await proc_util.run_command(cmd, timeout=300)
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"可视化脚本超时（{chart_type}，已终止进程树）")
+    if rc != 0 or not html_path.exists():
+        raise RuntimeError(f"可视化脚本失败（{chart_type}）：{out[-1500:]}")
 
     return {
         "chart_type": chart_type,

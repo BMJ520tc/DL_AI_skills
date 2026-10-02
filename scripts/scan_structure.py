@@ -18,6 +18,42 @@ INFER_HINTS = ("eval", "infer", "predict", "valid", "test")
 DYNAMIC_FUNCS = {"getattr", "eval", "exec", "type", "__import__"}
 
 
+def _conditional_module_attrs(class_node: ast.ClassDef) -> list[str]:
+    """条件/循环/异常分支里的 `self.x = <Call>(...)` 属性名。
+
+    这类模块在构造期是否真的被赋值取决于运行时条件（如 `if stride != 1: self.shortcut = ...`），
+    静态等价描述不可靠 → 交 agent 动态补充（需求一.3「条件分支等」）。
+    """
+    out: list[str] = []
+
+    def scan(stmts: list, in_branch: bool) -> None:
+        for st in stmts:
+            if isinstance(st, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+                scan(st.body, True)
+                scan(getattr(st, "orelse", []), True)
+            elif isinstance(st, ast.Try):
+                scan(st.body, True)
+                for handler in st.handlers:
+                    scan(handler.body, True)
+                scan(st.finalbody, True)
+            elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if st.name == "__init__":
+                    scan(st.body, in_branch)  # 构造期赋值就在 __init__ 里，继续按当前条件上下文扫
+                continue
+            elif isinstance(st, ast.ClassDef):
+                continue
+            elif isinstance(st, ast.Assign) and in_branch:
+                for target in st.targets:
+                    if (isinstance(target, ast.Attribute)
+                            and isinstance(target.value, ast.Name)
+                            and target.value.id == "self"
+                            and isinstance(st.value, ast.Call)):
+                        out.append(target.attr)
+
+    scan(class_node.body, False)
+    return out
+
+
 def _parse(path: Path):
     try:
         return ast.parse(path.read_text(encoding="utf-8", errors="ignore"), filename=str(path))
@@ -128,6 +164,11 @@ def scan(source_dir: str) -> dict:
                 report["module_hierarchy"].append(
                     {"file": rel, "class": node.name, "parent": _parent_class(node)}
                 )
+                for attr in _conditional_module_attrs(node):
+                    report["uncertain"].append({
+                        "file": rel,
+                        "reason": f"conditional module instantiation: {node.name}.{attr}",
+                    })
 
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 low = node.name.lower()

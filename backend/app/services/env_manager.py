@@ -15,9 +15,10 @@ from pathlib import Path
 from typing import Optional
 
 from app.config import CONDA_PATH, ENV_VENV_PYTHON, PIP_FALLBACK_INDEX, PIP_INDEX_URL
-from app.services import agent_service, knowledge_service, project_manager, task_manager
+from app.services import agent_service, knowledge_service, proc_util, project_manager, task_manager
 
 ENV_TASK_TYPE = "env_create"
+INSTALL_TIMEOUT_S = 600  # 单次 pip 安装上限（超时即杀进程树）
 
 FIX_SCHEMA = {
     "type": "object",
@@ -84,6 +85,7 @@ async def _run_env_create(params: dict, task_id: str) -> None:
              "started_at": created_at, "finished_at": _now()}
         )
         project_manager.update_status(project_id, "env_failed")
+        _draft_dependency_conflict(project_id, f"创建({env_type})", err)
         raise RuntimeError(f"环境创建失败({env_type}): {err}")
 
     knowledge_service.record_run(
@@ -98,7 +100,36 @@ async def _run_env_create(params: dict, task_id: str) -> None:
         project_manager.update_status(project_id, "env_ready")
     else:
         project_manager.update_status(project_id, "env_failed")
+        _draft_dependency_conflict(project_id, "依赖安装（修正循环耗尽）", "")
         raise RuntimeError("环境安装失败（依赖修正循环耗尽）")
+
+
+def _draft_dependency_conflict(project_id: str, stage: str, err: str) -> None:
+    """环境装不上 → 起草一条 dependency_conflict 蒸馏知识（需求六.1「任务结束提炼入库」）。
+
+    只写 draft（待确认），失败绝不影响环境创建本身的报错路径。
+    """
+    try:
+        latest = knowledge_service.get_latest_run(project_id, "env_install", "failed") or {}
+        detail = (latest.get("error") or err or "").strip()
+        sources = []
+        if latest.get("run_id"):
+            sources.append({"type": "run_record", "ref": latest["run_id"]})
+        knowledge_service.record_knowledge({
+            "type": "dependency_conflict",
+            "title": f"环境自建失败（{stage}）：项目 {project_id[:8]}",
+            "content": (
+                f"阶段：{stage}；失败详情（依赖修正循环耗尽后的原始报错）：{detail[:800]}。"
+                "后续同类项目遇到相同报错时，优先按此调整依赖版本或换环境类型。"
+            ),
+            "structured": {"project_id": project_id, "stage": stage, "error": detail[:2000]},
+            "sources": sources,
+            "confidence": "low",
+            "scope": {"project_id": project_id},
+            "status": "draft",
+        })
+    except Exception:  # noqa: BLE001 —— 蒸馏是旁路，绝不影响主流程报错
+        pass
 
 
 def _conda_create_cmd(source: Path, env_dir: Path) -> list[str]:
@@ -131,9 +162,15 @@ def _decode_err(e: subprocess.CalledProcessError) -> str:
     return err.decode(errors="ignore")[-2000:] if isinstance(err, bytes) else str(err)[-2000:]
 
 
-def _run_create(cmd: list[str], index_url: Optional[str]) -> None:
+async def _run_create(cmd: list[str], index_url: Optional[str]) -> None:
+    """执行环境创建命令；失败抛 RuntimeError（输出尾部入错误信息）。
+
+    走 proc_util：任务取消/超时即杀**进程树**，避免「任务已 cancelled 但 conda/pip 还在写环境」。
+    """
     env = {**os.environ, "PIP_INDEX_URL": index_url} if index_url else None
-    subprocess.run(cmd, check=True, capture_output=True, env=env)
+    rc, out = await proc_util.run_command(cmd, env=env)
+    if rc != 0:
+        raise RuntimeError(f"环境创建命令失败（rc={rc}）: {out[-2000:]}")
 
 
 async def _create_env_dir(env_type: str, source: Path, env_dir: Path, cmd: list[str]) -> Optional[str]:
@@ -143,16 +180,16 @@ async def _create_env_dir(env_type: str, source: Path, env_dir: Path, cmd: list[
     不经过 _install_with_fix，故索引不可达时同样切备源重试一次（用 env update 覆盖 pip 段）。
     """
     try:
-        await asyncio.to_thread(_run_create, cmd, None)
+        await _run_create(cmd, None)
         return None
-    except subprocess.CalledProcessError as e:
-        err = _decode_err(e)
+    except RuntimeError as e:
+        err = str(e)
     if env_type == "conda" and PIP_FALLBACK_INDEX and _is_index_error(err):
         try:
-            await asyncio.to_thread(_run_create, _conda_update_cmd(source, env_dir), PIP_FALLBACK_INDEX)
+            await _run_create(_conda_update_cmd(source, env_dir), PIP_FALLBACK_INDEX)
             return None
-        except subprocess.CalledProcessError as e2:
-            return _decode_err(e2)
+        except RuntimeError as e2:
+            return str(e2)
     return err
 
 
@@ -165,14 +202,14 @@ async def _install_with_fix(
     index_url = PIP_INDEX_URL  # None → 用 pip 自身配置（用户 pip.ini）
 
     for attempt in range(1, 4):
-        result = await asyncio.to_thread(_try_install, pip, req_file, index_url)
+        result = await _try_install(pip, req_file, index_url)
         _record_install(project_id, task_id, attempt, result, versions, env_type)
         if result["ok"]:
             return True
         # 索引不可达（非依赖冲突）：切备源重试一次，不消耗依赖修正循环
         if index_url != PIP_FALLBACK_INDEX and _is_index_error(result["error"]):
             index_url = PIP_FALLBACK_INDEX
-            result = await asyncio.to_thread(_try_install, pip, req_file, index_url)
+            result = await _try_install(pip, req_file, index_url)
             _record_install(project_id, task_id, attempt, result, versions, env_type, step="pip_install_fallback")
             if result["ok"]:
                 return True
@@ -278,7 +315,7 @@ def detect_versions(source: Path, python_exe: Optional[str] = None) -> dict:
     return info
 
 
-def _try_install(pip: str, req_file: Optional[Path], index_url: Optional[str] = None) -> dict:
+async def _try_install(pip: str, req_file: Optional[Path], index_url: Optional[str] = None) -> dict:
     if req_file is None or not req_file.exists():
         # 无依赖清单（如 conda 项目仅 environment.yml），跳过 pip 安装
         return {"ok": True, "error": None, "command": None, "index_url": index_url,
@@ -286,11 +323,13 @@ def _try_install(pip: str, req_file: Optional[Path], index_url: Optional[str] = 
     cmd = _install_cmd(pip, req_file, index_url)
     started = _now()
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        ok = proc.returncode == 0
-        error = None if ok else (proc.stderr or proc.stdout)[-2000:]
-    except subprocess.TimeoutExpired:
-        ok, error = False, "pip install 超时"
+        rc, out = await proc_util.run_command(cmd, timeout=INSTALL_TIMEOUT_S)
+        ok = rc == 0
+        error = None if ok else out[-2000:]
+    except asyncio.TimeoutError:
+        ok, error = False, f"pip install 超时（>{INSTALL_TIMEOUT_S}s，已终止进程树）"
+    except asyncio.CancelledError:
+        raise  # 取消要真的停：proc_util 已杀进程树，继续向上抛让任务置 cancelled
     except Exception as e:  # noqa: BLE001
         ok, error = False, str(e)
     return {"ok": ok, "error": error, "command": " ".join(cmd), "index_url": index_url,

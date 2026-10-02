@@ -6,13 +6,13 @@
 import asyncio
 import hashlib
 import json
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from app.config import DATASETS_DIR, PROJECT_ROOT
+from app.services import proc_util
 from app.services import agent_service, knowledge_service, project_manager, task_manager
 
 TASK_TYPE = "preprocess"
@@ -96,15 +96,15 @@ def _resolve_dirs(params: dict, task_id: str) -> tuple[Path, Path, str]:
     return DATASETS_DIR / stable_key, result_dir, name or input_path.stem
 
 
-def _run_script(input_path: str, out_dir: Path, name: str, task_type: str) -> dict:
+async def _run_script(input_path: str, out_dir: Path, name: str, task_type: str) -> dict:
     cmd = [
         sys.executable, str(PREPROCESS_SCRIPT), input_path, str(out_dir),
         "--dataset-name", name, "--task-type", task_type,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-    stdout = (proc.stdout or "").strip()
+    rc, raw = await proc_util.run_command(cmd, timeout=900)
+    stdout = (raw or "").strip()
     if not stdout:
-        raise RuntimeError(f"预处理脚本无输出（退出码 {proc.returncode}）：{(proc.stderr or '')[-1500:]}")
+        raise RuntimeError(f"预处理脚本无输出（退出码 {rc}）：{raw[-1500:]}")
     try:
         return json.loads(stdout.splitlines()[-1])
     except json.JSONDecodeError:
@@ -134,7 +134,7 @@ async def _run(params: dict, task_id: str) -> None:
     input_path = params["input_path"]
     task_type = params.get("task_type") or "classification"
 
-    summary = await asyncio.to_thread(_run_script, input_path, out_dir, name, task_type)
+    summary = await _run_script(input_path, out_dir, name, task_type)
     if summary.get("status") != "ok":
         result_dir.mkdir(parents=True, exist_ok=True)
         (result_dir / "result.json").write_text(

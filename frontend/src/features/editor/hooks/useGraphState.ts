@@ -9,13 +9,23 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GraphIR } from "../../../types/graph";
 import { applyGraphIR, buildGraphIR } from "../../../utils/graphIR";
+import { graphIRToFlow } from "../../../utils/irAdapter";
 import { syncIdFromNodes } from "../utils/idUtils";
 
-export function useGraphState() {
+/** initialGraph 传入时进入外部画布模式（模块四 B3）：从 GraphIR 快照初始化、
+ *  不再读写 localStorage（避免结构化项目画布污染沙盒编辑器的本地存档）。 */
+export function useGraphState(initialGraph?: GraphIR | null) {
+    const external = useRef(!!initialGraph);
+
     // -------------------------------------------------------------------------
     // 1. Storage & Initialization
     // -------------------------------------------------------------------------
     const [nodes, setNodes] = useState<Node[]>(() => {
+        if (external.current && initialGraph) {
+            const restored = graphIRToFlow(initialGraph);
+            syncIdFromNodes(restored.nodes);
+            return restored.nodes;
+        }
         const savedGraph = localStorage.getItem("graphIR");
         if (savedGraph) {
             try {
@@ -37,6 +47,9 @@ export function useGraphState() {
     });
 
     const [edges, setEdges] = useState<Edge[]>(() => {
+        if (external.current && initialGraph) {
+            return graphIRToFlow(initialGraph).edges;
+        }
         const savedGraph = localStorage.getItem("graphIR");
         if (savedGraph) {
             try {
@@ -146,10 +159,12 @@ export function useGraphState() {
 
     // Sync to localStorage and History on every change
     useEffect(() => {
-        const graph = buildGraphIR(nodes, edges);
-        localStorage.setItem("graphIR", JSON.stringify(graph));
-        localStorage.setItem("nodes", JSON.stringify(nodes));
-        localStorage.setItem("edges", JSON.stringify(edges));
+        if (!external.current) {
+            const graph = buildGraphIR(nodes, edges);
+            localStorage.setItem("graphIR", JSON.stringify(graph));
+            localStorage.setItem("nodes", JSON.stringify(nodes));
+            localStorage.setItem("edges", JSON.stringify(edges));
+        }
 
         const restoring = isRestoring.current;
         const skipping = skipHistory.current;

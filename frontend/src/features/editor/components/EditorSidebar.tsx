@@ -62,6 +62,8 @@ type EditorSidebarProps = {
     showLiveCode: boolean;
     modules: SavedModule[];
     handleDeleteModule: (id: string) => void;
+    /** 可选：为 true 时隐藏「显示实时代码」入口（外部画布模式）。 */
+    hideGenerateCode?: boolean;
 };
 
 export function EditorSidebar({
@@ -74,6 +76,7 @@ export function EditorSidebar({
     showLiveCode,
     modules,
     handleDeleteModule,
+    hideGenerateCode = false,
 }: EditorSidebarProps) {
     const {
         searchQuery,
@@ -121,23 +124,25 @@ export function EditorSidebar({
 
     const renderFooter = () => (
         <div style={{ padding: "16px", borderTop: `1px solid ${THEME.border}`, background: THEME.bg, display: "flex", flexDirection: "column", gap: "12px" }}>
-            <button
-                onClick={onGenerateCode}
-                style={{
-                    width: "100%",
-                    padding: "12px",
-                    background: showLiveCode ? "rgba(14, 165, 233, 0.15)" : THEME.itemBg,
-                    color: showLiveCode ? THEME.accent : THEME.textPrimary,
-                    border: `1px solid ${showLiveCode ? THEME.accent : THEME.border}`,
-                    borderRadius: "6px",
-                    cursor: "pointer",
-                    fontSize: "13px",
-                    fontWeight: 600,
-                    transition: "all 0.2s"
-                }}
-            >
-                {showLiveCode ? "隐藏实时代码" : "显示实时代码"}
-            </button>
+            {!hideGenerateCode && (
+                <button
+                    onClick={onGenerateCode}
+                    style={{
+                        width: "100%",
+                        padding: "12px",
+                        background: showLiveCode ? "rgba(14, 165, 233, 0.15)" : THEME.itemBg,
+                        color: showLiveCode ? THEME.accent : THEME.textPrimary,
+                        border: `1px solid ${showLiveCode ? THEME.accent : THEME.border}`,
+                        borderRadius: "6px",
+                        cursor: "pointer",
+                        fontSize: "13px",
+                        fontWeight: 600,
+                        transition: "all 0.2s"
+                    }}
+                >
+                    {showLiveCode ? "隐藏实时代码" : "显示实时代码"}
+                </button>
+            )}
             <div style={{ display: "flex", gap: "8px" }}>
                 <button
                     onClick={handleReset}
@@ -270,37 +275,71 @@ export function EditorSidebar({
                                                     onMouseLeave={e => { e.currentTarget.style.borderColor = THEME.border; e.currentTarget.style.transform = "none"; }}
                                                 >
                                                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "4px" }}>
-                                                        <span style={{ color: THEME.textPrimary, fontSize: "14px", fontWeight: 600 }}>{mod.name}</span>
+                                                        <span style={{ color: THEME.textPrimary, fontSize: "14px", fontWeight: 600 }}>
+                                                            {mod.name}
+                                                            {mod.origin === "backend" && (
+                                                                <span
+                                                                    title="来自后端标准化模块库（只读，不写入本地）"
+                                                                    style={{
+                                                                        marginLeft: 6,
+                                                                        fontSize: 10,
+                                                                        fontWeight: 600,
+                                                                        color: "#7dd3fc",
+                                                                        border: "1px solid #0ea5e9",
+                                                                        borderRadius: 4,
+                                                                        padding: "0 4px",
+                                                                        verticalAlign: "middle",
+                                                                    }}
+                                                                >
+                                                                    后端模块库
+                                                                </span>
+                                                            )}
+                                                        </span>
                                                         <span style={{ fontSize: "11px", color: THEME.textSecondary, fontFamily: "monospace" }}>{mod.version}</span>
                                                     </div>
                                                     <div style={{ fontSize: "12px", color: THEME.textSecondary, marginBottom: "12px" }}>
                                                         {mod.handles.inputs.length} Inputs • {mod.handles.outputs.length} Outputs
                                                     </div>
                                                     <div style={{ display: "flex", gap: "8px" }}>
-                                                        <button
-                                                            onClick={(e) => { e.stopPropagation(); openModuleEditor(mod.id); }}
-                                                            style={{
-                                                                flex: 1, padding: "6px", fontSize: "11px",
-                                                                background: THEME.hover, border: "none",
-                                                                color: THEME.textPrimary, borderRadius: "4px",
-                                                                cursor: "pointer", fontWeight: 500
-                                                            }}
-                                                        >
-                                                            编辑
-                                                        </button>
-                                                        <button
-                                                            onClick={(e) => { e.stopPropagation(); handleDeleteModule(mod.id); }}
-                                                            style={{
-                                                                flex: 1, padding: "6px", fontSize: "11px",
-                                                                background: "transparent", border: `1px solid ${THEME.border}`,
-                                                                color: THEME.textSecondary, borderRadius: "4px",
-                                                                cursor: "pointer"
-                                                            }}
-                                                            onMouseEnter={e => { e.currentTarget.style.color = THEME.danger; e.currentTarget.style.borderColor = THEME.danger }}
-                                                            onMouseLeave={e => { e.currentTarget.style.color = THEME.textSecondary; e.currentTarget.style.borderColor = THEME.border }}
-                                                        >
-                                                            删除
-                                                        </button>
+                                                        {mod.origin === "backend" ? (
+                                                            // 后端模块只读：不可编辑（否则保存会把后端模块写进 localStorage 形成影子覆盖）
+                                                            <span
+                                                                style={{
+                                                                    flex: 1, padding: "6px", fontSize: "11px", textAlign: "center",
+                                                                    color: THEME.textSecondary, border: `1px dashed ${THEME.border}`,
+                                                                    borderRadius: "4px"
+                                                                }}
+                                                            >
+                                                                只读（后端模块库）
+                                                            </span>
+                                                        ) : (
+                                                            <>
+                                                                <button
+                                                                    onClick={(e) => { e.stopPropagation(); openModuleEditor(mod.id); }}
+                                                                    style={{
+                                                                        flex: 1, padding: "6px", fontSize: "11px",
+                                                                        background: THEME.hover, border: "none",
+                                                                        color: THEME.textPrimary, borderRadius: "4px",
+                                                                        cursor: "pointer", fontWeight: 500
+                                                                    }}
+                                                                >
+                                                                    编辑
+                                                                </button>
+                                                                <button
+                                                                    onClick={(e) => { e.stopPropagation(); handleDeleteModule(mod.id); }}
+                                                                    style={{
+                                                                        flex: 1, padding: "6px", fontSize: "11px",
+                                                                        background: "transparent", border: `1px solid ${THEME.border}`,
+                                                                        color: THEME.textSecondary, borderRadius: "4px",
+                                                                        cursor: "pointer"
+                                                                    }}
+                                                                    onMouseEnter={e => { e.currentTarget.style.color = THEME.danger; e.currentTarget.style.borderColor = THEME.danger }}
+                                                                    onMouseLeave={e => { e.currentTarget.style.color = THEME.textSecondary; e.currentTarget.style.borderColor = THEME.border }}
+                                                                >
+                                                                    删除
+                                                                </button>
+                                                            </>
+                                                        )}
                                                     </div>
                                                     {/* Custom modules also get a subtle grip handle on hover if needed, or rely on the whole card */}
                                                 </div>

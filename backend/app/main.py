@@ -5,7 +5,7 @@
 """
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import CLAUDE_CLI_PATH, CORS_ORIGINS, CORS_ORIGIN_REGEX, ensure_data_dirs
@@ -13,10 +13,11 @@ from app.db.connection import init_db
 from app.services import (
     task_manager, agent_service, env_manager, analysis_service,
     preprocess_service, baseline_service, dataset_service, compare_service, download_service,
-    paper_service,
+    paper_service, decompose_service,
 )
 from app.api import (
     tasks, projects, knowledge, agents, environments, search, analysis, preprocess, datasets, papers,
+    decompose, modules,
 )
 
 
@@ -34,6 +35,7 @@ async def lifespan(app: FastAPI):
     dataset_service.register()
     compare_service.register()
     paper_service.register()
+    decompose_service.register()
     await task_manager.start()
     yield
     await task_manager.stop()
@@ -75,6 +77,25 @@ app.include_router(analysis.router)
 app.include_router(preprocess.router)
 app.include_router(datasets.router)
 app.include_router(papers.router)
+app.include_router(decompose.router)
+app.include_router(decompose.ir_router)
+app.include_router(modules.router)
+
+
+@app.post("/api/torchlens")
+def torchlens_unavailable() -> dict:
+    """沙盒画布的形状追踪通道（基底 torchlens）。
+
+    实现位于独立进程 `backend/runner.py`（容器通道，属可选扩展，默认不启用）。
+    本端点显式返回 503（而非 404），让前端能给出「追踪不可用，需启动 runner」的明确提示。
+    """
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "形状追踪不可用：torchlens 通道需独立启动 backend/runner.py（容器为可选扩展，默认未启用）；"
+            "独立的形状追踪请用模块四的 POST /api/projects/{id}/decompose/trace"
+        ),
+    )
 
 
 @app.get("/api/health")

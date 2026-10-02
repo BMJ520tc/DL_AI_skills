@@ -3,8 +3,10 @@
 两类项目: original（仅分析与运行）与 structured（画布可编辑）。
 阶段1 只实现 original；structured 目录骨架预留，git 版本仓库归 7.6（阶段4）。
 """
+import shutil
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from app.config import PROJECTS_DIR
@@ -79,6 +81,23 @@ def update_status(project_id: str, status: str) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def delete_project(project_id: str) -> bool:
+    """删除项目记录与工作区目录（失败补偿用，如入库链路中途失败要清掉半成品结构化项目）。"""
+    project = get_project(project_id)
+    if project is None:
+        return False
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM project WHERE project_id = ?", (project_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    ws = project.get("workspace_path")
+    if ws:
+        shutil.rmtree(Path(ws), ignore_errors=True)
+    return True
 
 
 def require_type(project_id: str, allowed_types: set[str]) -> dict:

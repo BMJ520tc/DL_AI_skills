@@ -115,11 +115,38 @@ CMD_SCHEMA = {
 
 
 ENTRY_SCRIPTS = ("train.py", "main.py", "run.py")
+# 「脚本目录」来源：扫描这些子目录下的常见入口（*.sh 与 ENTRY_SCRIPTS 中的 .py）
+ENTRY_DIRS = ("scripts", "bin")
+
+
+def _script_dir_candidates(source: Path) -> list[list[str]]:
+    """扫描 scripts/、bin/ 下的常见入口：*.sh 用 bash 运行，main.py/run.py/train.py 直接运行。
+
+    每个 .py 入口先给 `--help` 变体（快速验证环境/导入可用），再给直接运行变体。
+    """
+    found: list[list[str]] = []
+    for dirname in ENTRY_DIRS:
+        root = source / dirname
+        if not root.is_dir():
+            continue
+        for p in sorted(root.rglob("*")):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(source).as_posix()
+            if p.suffix.lower() == ".sh":
+                found.append(["bash", rel])
+            elif p.suffix.lower() == ".py" and p.name in ENTRY_SCRIPTS:
+                found.append([rel, "--help"])
+                found.append([rel])
+    return found
 
 
 def _candidate_commands(source: Path) -> list[list[str]]:
-    """3.5 候选命令列表，按优先级：README → 脚本目录；脚本目录先试 --help
-    （快速验证环境/导入可用），再直接运行。全部失败则交 agent 构造（见 _run_verify）。"""
+    """3.5 候选命令列表，按优先级：README → 根目录入口脚本 → scripts/bin 脚本目录。
+
+    入口脚本先试 --help（快速验证环境/导入可用），再直接运行；三来源合并去重。
+    全部失败则交 agent 构造（见 _run_verify）。
+    """
     cands: list[list[str]] = []
     readme = _extract_from_readme(source)
     if readme:
@@ -130,6 +157,9 @@ def _candidate_commands(source: Path) -> list[list[str]]:
     for name in ENTRY_SCRIPTS:
         if (source / name).exists() and [name] not in cands:
             cands.append([name])
+    for cand in _script_dir_candidates(source):
+        if cand not in cands:
+            cands.append(cand)
     return cands
 
 
@@ -221,8 +251,17 @@ def _run_with_grace(full_cmd: list[str], cwd: str, grace_s: int) -> dict:
 
 
 async def _try_command(python: str, cmd: list[str], source: Path, grace_s: int = GRACE_S) -> dict:
-    """运行一条候选命令，返回 {ok, error, mode, command, started_at, finished_at}。"""
-    full_cmd = [python, *cmd]
+    """运行一条候选命令，返回 {ok, error, mode, command, started_at, finished_at}。
+
+    shell 脚本（`bash x.sh` 或 `x.sh`）**不能**再加 python 前缀——否则实际执行
+    `python bash x.sh` 必然失败，scripts/bin 下的入口永远跑不通。
+    """
+    if cmd and cmd[0] in ("bash", "sh"):
+        full_cmd = ["bash", *cmd[1:]]
+    elif cmd and str(cmd[0]).lower().endswith((".sh", ".bash")):
+        full_cmd = ["bash", *cmd]
+    else:
+        full_cmd = [python, *cmd]
     started = _now()
     try:
         result = await asyncio.to_thread(_run_with_grace, full_cmd, str(source), grace_s)

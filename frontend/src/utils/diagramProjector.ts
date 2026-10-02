@@ -54,6 +54,12 @@ function formatParams(node: GraphNode): string | undefined {
 function formatShape(node: GraphNode): string | undefined {
     if (node.display?.shape) return node.display.shape;
     const data = (node.data || {}) as Record<string, unknown>;
+    const fmt = (s: unknown) => (Array.isArray(s) && s.length ? `[${(s as Array<unknown>).join(", ")}]` : "未知");
+    const inShape = data.__in_shape ?? data.input_shape;
+    const outShape = data.__out_shape ?? data.output_shape;
+    if (Array.isArray(inShape) || Array.isArray(outShape)) {
+        return `${fmt(inShape)} → ${fmt(outShape)}`;
+    }
     const shape = data.__shape;
     if (Array.isArray(shape)) return `shape: [${(shape as Array<unknown>).join(",")}]`;
     return undefined;

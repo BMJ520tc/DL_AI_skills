@@ -1,7 +1,7 @@
 import { type Edge, type Node, useReactFlow } from "@xyflow/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { buildGraphIR } from "../../../utils/graphIR";
-import { runTorchLensTrace } from "../../../utils/traceService";
+import { runTorchLensTrace, TRACE_UNAVAILABLE_REASON } from "../../../utils/traceService";
 import { buildShapeComparisons, compareTraceShapes } from "../../../utils/traceAnalysis";
 import { LAYER_REGISTRY } from "../../../types/nodeTypes";
 import { verifyShapes, type ShapeFailure, type ShapeResult } from "../../../utils/shape_verifier";
@@ -24,6 +24,8 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
     const [traceData, setTraceData] = useState<TraceResponse | null>(null);
     const [traceLoading, setTraceLoading] = useState(false);
     const [traceError, setTraceError] = useState<string | null>(null);
+    // 追踪端点不可用时的可见提示（需求五.2）；null 表示正常。
+    const [traceNotice, setTraceNotice] = useState<string | null>(null);
     const [traceSeedPreset, setTraceSeedPreset] = useState("42");
     const [traceSeedCustom, setTraceSeedCustom] = useState("");
 
@@ -107,9 +109,11 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
     const shapeResultRef = useRef<string>("");
     useEffect(() => {
         if (!shapeResult?.shapes) return;
+        // 本轮没有任何形状结果（如外部画布模式传入空 nodes/edges）时不清空已有 __shape
+        if (Object.keys(shapeResult.shapes).length === 0) return;
         const currentShapesStr = JSON.stringify(shapeResult.shapes);
         if (shapeResultRef.current === currentShapesStr) return;
-        
+
         setNodes(currentNodes => {
             const deepEqual = (a: any, b: any): boolean => {
                 if (a === b) return true;
@@ -127,7 +131,9 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
             let hasChanges = false;
             const nextNodes = currentNodes.map(n => {
                 const shapeEntry = shapeResult.shapes[n.id];
-                const newShapeArray = shapeEntry ? shapeEntry.defaultShape : undefined;
+                // 该节点本轮无形状结果：保留原有 __shape，绝不写入 undefined
+                if (!shapeEntry) return n;
+                const newShapeArray = shapeEntry.defaultShape;
                 const currentShapeArray =
                     n.data && typeof n.data === "object" ? (n.data as { __shape?: number[] }).__shape : undefined;
                 const isSame = deepEqual(currentShapeArray, newShapeArray);
@@ -150,6 +156,7 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
     const handleTrace = useCallback(async () => {
         setTraceLoading(true);
         setTraceError(null);
+        setTraceNotice(null);
         try {
             const graph = buildGraphIR(nodes, edges);
             const resp = await runTorchLensTrace({
@@ -157,6 +164,10 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
                 inputShapes: getTraceInputShapes(),
                 code: generatedCode,
             });
+            // 端点缺失 / 独立 runner 不可用：给出可见提示，但不阻断画布其它功能
+            if (resp.unavailable) {
+                setTraceNotice(resp.unavailableReason ?? TRACE_UNAVAILABLE_REASON);
+            }
             const shapeWarnings = compareTraceShapes(resp, shapeResult, edges, nodes, LAYER_REGISTRY);
             setTraceData({
                 ...resp,
@@ -165,6 +176,7 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
             setShowTrace(true);
         } catch (err) {
             setTraceError("Trace failed. Backend unavailable or returned error.");
+            setTraceNotice(TRACE_UNAVAILABLE_REASON);
             console.error("Trace failed", err);
         } finally {
             setTraceLoading(false);
@@ -255,6 +267,7 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
         traceData, setTraceData,
         traceLoading, setTraceLoading,
         traceError, setTraceError,
+        traceNotice, setTraceNotice,
         traceSeedPreset, setTraceSeedPreset,
         traceSeedCustom, setTraceSeedCustom,
         shapeResult,

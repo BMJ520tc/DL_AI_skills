@@ -1,7 +1,9 @@
 import { type Edge, type Node } from "@xyflow/react";
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { listModules as listBackendModules, type ModuleItem } from "../../../api/client";
 import type { FieldSpec } from "../../../node_gen/BaseClass";
 import type { ModuleRefData } from "../../../nodes/ModuleRefNode";
+import type { GraphIR } from "../../../types/graph";
 import { sanitizeIdent } from "../../../utils/codeCompile";
 import { applyGraphIR, buildGraphIR } from "../../../utils/graphIR";
 import {
@@ -11,9 +13,44 @@ import {
     resolveModuleName,
     saveExistingModule,
     saveModule,
+    setTransientModules,
     type SavedModule,
 } from "../../../utils/moduleRegistry";
 import { getActiveModule, popModule, pushModule, type OpenModule } from "../../../utils/stackNavigation";
+
+/** 后端 ModuleItem.saved_module_compat → 基底 SavedModule（只读注入，不落 localStorage）。 */
+function compatToSavedModule(item: ModuleItem): SavedModule | null {
+    if (!item.saved_module_compat) return null;
+    let raw: unknown;
+    try {
+        raw = JSON.parse(item.saved_module_compat);
+    } catch {
+        return null;
+    }
+    if (!raw || typeof raw !== "object") return null;
+    const m = raw as Record<string, unknown>;
+    const graph = m.graph as GraphIR | undefined;
+    if (!graph || typeof graph !== "object" || !Array.isArray(graph.nodes)) return null;
+    const handlesRaw = (m.handles ?? {}) as { inputs?: unknown; outputs?: unknown };
+    const toArr = (value: unknown): string[] =>
+        Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+    const inputs = toArr(handlesRaw.inputs);
+    const outputs = toArr(handlesRaw.outputs);
+    return {
+        id: typeof m.id === "string" && m.id ? m.id : `${item.module_id}@${item.module_version}`,
+        name: typeof m.name === "string" && m.name ? m.name : item.name ?? item.module_id,
+        version: typeof m.version === "string" && m.version ? m.version : item.module_version,
+        graph,
+        handles: {
+            inputs: inputs.length ? inputs : ["in"],
+            outputs: outputs.length ? outputs : ["out"],
+        },
+        description: typeof m.description === "string" ? m.description : item.description ?? undefined,
+        createdAt: typeof m.createdAt === "string" ? m.createdAt : item.created_at,
+        updatedAt: typeof m.updatedAt === "string" ? m.updatedAt : item.updated_at,
+        origin: "backend",
+    };
+}
 
 export type ModuleHandles = { inputs: string[]; outputs: string[] };
 
@@ -34,6 +71,28 @@ type UseModuleSystemProps = {
 export function useModuleSystem({ nodes, edges, setNodes, getNodeSchema }: UseModuleSystemProps) {
     const [modules, setModules] = useState<SavedModule[]>(() => listModules());
     const [moduleStack, setModuleStack] = useState<OpenModule[]>([]);
+
+    // 需求五.2：从后端拉取已入库标准化模块，注入只读内存模块库并与本地模块合并展示。
+    // 后端未启动 / 无模块 / 解析失败一律静默降级，仅保留本地模块（不写回 localStorage）。
+    useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+            try {
+                const items = await listBackendModules();
+                if (cancelled) return;
+                const converted = items
+                    .map(compatToSavedModule)
+                    .filter((m): m is SavedModule => m !== null);
+                setTransientModules(converted);
+                setModules(listModules());
+            } catch (error) {
+                console.warn("后端模块库不可用，仅展示本地模块", error);
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, []);
     const openModule = getActiveModule(moduleStack);
     const [showModuleDiagram, setShowModuleDiagram] = useState(false);
 
@@ -311,6 +370,11 @@ export function useModuleSystem({ nodes, edges, setNodes, getNodeSchema }: UseMo
     const saveExistingModuleChanges = useCallback(() => {
         setModuleNameWarning(false);
         if (!openModule) return;
+        if (openModule.module.origin === "backend") {
+            // 后端模块为只读内存覆盖层：直接保存会以同 id 写进 localStorage 形成影子覆盖
+            alert("后端模块库模块为只读，不可直接保存修改；如需改动请另存为新模块。");
+            return;
+        }
 
         const name = moduleNameInput.trim();
         if (!name) {

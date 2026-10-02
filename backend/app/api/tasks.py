@@ -34,13 +34,21 @@ def get_task(task_id: str) -> dict:
 
 @router.post("/{task_id}/cancel")
 def cancel_task(task_id: str) -> dict:
+    """仅 queued 任务可取消；任务不存在 → 404，状态不符 → 409。"""
+    task = task_manager.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
     if not task_manager.cancel_task(task_id):
-        raise HTTPException(status_code=409, detail="only queued task can be cancelled")
+        raise HTTPException(status_code=409, detail=f"only queued task can be cancelled (status={task['status']})")
     return {"status": "cancelled"}
 
 
 @router.post("/{task_id}/retry")
 def retry_task(task_id: str) -> dict:
+    """仅 failed 任务可重试；任务不存在 → 404，状态不符 → 409。"""
+    task = task_manager.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
     if not task_manager.retry_task(task_id):
-        raise HTTPException(status_code=409, detail="only failed task can be retried")
+        raise HTTPException(status_code=409, detail=f"only failed task can be retried (status={task['status']})")
     return {"status": "queued"}

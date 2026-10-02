@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from app.config import DATASETS_DIR
+from app.ids import fs_name, safe_id
 from app.services import agent_service, download_service, knowledge_service, project_manager, task_manager
 
 TASK_TYPE = "align"
@@ -130,7 +131,9 @@ def source_url(source: str, source_id: str) -> str | None:
 
 def download_dataset(source: str, source_id: str, name: str, task_type: str | None = None) -> str:
     """下载外部数据集并登记（复用 2.4 的 download_dataset），返回 dataset_id。"""
-    dest = DATASETS_DIR / f"{source}_{source_id}"
+    safe_id(source, "source")
+    safe_id(source_id, "source_id")
+    dest = DATASETS_DIR / f"{fs_name(source, 'source')}_{fs_name(source_id, 'source_id')}"
     download_service.download_dataset(source, source_id, dest)
     return knowledge_service.register_dataset({
         "name": name,

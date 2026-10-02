@@ -24,4 +24,7 @@ export interface TraceResponse {
     warnings?: string[];
     svgBase64?: string;
     summaryText?: string;
+    /** 端点/独立 runner 不可用时的结构化标记（需求五.2 沙盒追踪提示）。 */
+    unavailable?: boolean;
+    unavailableReason?: string;
 }

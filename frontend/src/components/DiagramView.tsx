@@ -91,6 +91,7 @@ export default function DiagramView({
     graph,
     extraActions,
     fullscreen = true,
+    showShapes: showShapesProp,
 }: {
     nodes: Node[];
     edges: Edge[];
@@ -99,12 +100,15 @@ export default function DiagramView({
     graph?: GraphIR;
     extraActions?: ReactNode;
     fullscreen?: boolean;
+    /** 受控形状开关（传入时由外部驱动，隐藏内置勾选框）。 */
+    showShapes?: boolean;
 }) {
     const [layout, setLayout] = useState<LayoutResult | null>(null);
     const svgRef = useRef<SVGSVGElement | null>(null);
     const [exporting, setExporting] = useState(false);
     const [showLabels, setShowLabels] = useState(true);
-    const [showShapes, setShowShapes] = useState(true);
+    const [showShapesState, setShowShapesState] = useState(true);
+    const showShapes = showShapesProp ?? showShapesState;
     const [sizingMode, setSizingMode] = useState<"spacious" | "compact">("spacious");
     const [dir, setDir] = useState<LayoutDirection>(direction);
     const graphInput = useMemo<GraphIR>(() => graph ?? buildGraphIR(nodes, edges), [graph, nodes, edges]);
@@ -242,10 +246,12 @@ export default function DiagramView({
                             <input type="checkbox" checked={showLabels} onChange={e => setShowLabels(e.target.checked)} />
                             Show labels
                         </label>
-                        <label style={{ display: "flex", gap: 6, alignItems: "center", color: "#cbd5e1", fontSize: 12 }}>
-                            <input type="checkbox" checked={showShapes} onChange={e => setShowShapes(e.target.checked)} />
-                            Show shapes
-                        </label>
+                        {showShapesProp === undefined && (
+                            <label style={{ display: "flex", gap: 6, alignItems: "center", color: "#cbd5e1", fontSize: 12 }}>
+                                <input type="checkbox" checked={showShapesState} onChange={e => setShowShapesState(e.target.checked)} />
+                                Show shapes
+                            </label>
+                        )}
                     </div>
                     <div style={{ display: "flex", gap: 8 }}>
                         <button

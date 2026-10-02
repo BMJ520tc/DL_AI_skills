@@ -1,6 +1,8 @@
 import { ReactFlowProvider } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import React, { useMemo, useRef, useState } from "react";
+import type { GraphIR } from "./types/graph";
+import { buildGraphIR } from "./utils/graphIR";
 
 // Components
 import DiagramView from "./components/DiagramView";
@@ -30,7 +32,14 @@ import { estimateGraphCost } from "./utils/computeEstimator";
 
 const TRACE_SEED_PRESETS = [42, 1337, 1234, 2020, 2021];
 
-function FlowContent() {
+export type FlowEditorProps = {
+    /** 外部画布模式（模块四 B3）：以 GraphIR 快照初始化且不读写 localStorage。 */
+    initialGraph?: GraphIR | null;
+    /** 保存回调（结构化项目画布 → PUT /api/projects/{id}/graph）。 */
+    onSave?: (graph: GraphIR) => Promise<void>;
+};
+
+function FlowContent({ initialGraph, onSave }: FlowEditorProps) {
     // 1. Core Graph State
     const {
         nodes, setNodes,
@@ -38,18 +47,24 @@ function FlowContent() {
         onNodesChange, onEdgesChange,
         canUndo, canRedo, handleUndo, handleRedo,
         edgesWithHandlers
-    } = useGraphState();
+    } = useGraphState(initialGraph);
+
+    // 外部画布模式（结构化项目画布）：画布代码生成/形状追踪对 ir 节点不生效（阶段3实施方案 3.8）。
+    // 传空数组使两个系统空转；hook 调用顺序保持无条件，仅数据源按 props 切换。
+    const isExternal = !!initialGraph;
+    const codeNodes = useMemo(() => (isExternal ? [] : nodes), [isExternal, nodes]);
+    const codeEdges = useMemo(() => (isExternal ? [] : edges), [isExternal, edges]);
 
     // 2. Code Generation
-    const { generated, generatedCode, onDownloadCode } = useCodeGeneration(nodes, edges);
+    const { generated, generatedCode, onDownloadCode } = useCodeGeneration(codeNodes, codeEdges);
 
     // 3. Layout & UI State
     const layout = useGraphLayout();
 
     // 4. Trace & Analysis
     const trace = useTraceSystem({
-        nodes,
-        edges,
+        nodes: codeNodes,
+        edges: codeEdges,
         setNodes,
         generatedCode
     });
@@ -127,11 +142,29 @@ function FlowContent() {
         return estimateGraphCost(nodes, edges, trace.shapeResult, LAYER_REGISTRY);
     }, [nodes, edges, trace.shapeResult]);
 
-    // Helper for generating code toggle
-    const handleGenerateCode = () => layout.setShowLiveCode(v => !v);
+    // Helper for generating code toggle（外部画布模式无代码生成）
+    const handleGenerateCode = () => {
+        if (isExternal) return;
+        layout.setShowLiveCode(v => !v);
+    };
 
     // 知识库检索面板开关（独立于画布状态，不影响既有编辑流程）
     const [showKnowledge, setShowKnowledge] = useState(false);
+
+    // 画布保存（模块四 B3 结构化项目最小闭环：全量 GraphIR v2 快照覆盖）
+    const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+    const handleSaveGraph = async () => {
+        if (!onSave || saveState === "saving") return;
+        setSaveState("saving");
+        try {
+            await onSave(buildGraphIR(nodes, edges));
+            setSaveState("saved");
+            setTimeout(() => setSaveState("idle"), 2000);
+        } catch (err) {
+            console.error("保存画布失败", err);
+            setSaveState("error");
+        }
+    };
 
     // File Upload (ref needed)
     const uploadInputRef = useRef<HTMLInputElement>(null);
@@ -181,6 +214,7 @@ function FlowContent() {
                 showLiveCode={layout.showLiveCode}
                 modules={modSys.modules}
                 handleDeleteModule={modSys.handleDeleteModule}
+                hideGenerateCode={isExternal}
             />
 
             <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", position: "relative", overflow: "hidden" }}>
@@ -221,8 +255,9 @@ function FlowContent() {
                     onToggleDiagnostics={() => layout.setShowDiagnostics(v => !v)}
                     onToggleComputePanel={() => layout.setShowComputePanel(v => !v)}
                     onOpenKnowledge={() => setShowKnowledge(true)}
+                    hideTrace={isExternal}
                     statusSlot={
-                        trace.shapeResult && trace.shapeResult.ok ? (
+                        isExternal ? null : trace.shapeResult && trace.shapeResult.ok ? (
                             <div
                                 style={{
                                     display: "inline-flex",
@@ -267,6 +302,75 @@ function FlowContent() {
                     setMainFlowRef={(rf) => { mainFlowRef.current = rf; }}
                 />
 
+                {/* 形状追踪不可用提示（需求五.2）：端点缺失/runner 未起时可见，不静默失败 */}
+                {!isExternal && trace.traceNotice && (
+                    <div
+                        style={{
+                            position: "absolute",
+                            top: 56,
+                            left: 12,
+                            right: 12,
+                            zIndex: 9,
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 10,
+                            background: "#3f2d0f",
+                            border: "1px solid #d97706",
+                            color: "#fde68a",
+                            borderRadius: 8,
+                            padding: "8px 12px",
+                            fontSize: 12,
+                            boxShadow: "0 8px 20px rgba(0,0,0,0.35)",
+                        }}
+                    >
+                        <span>⚠ {trace.traceNotice}</span>
+                        <button
+                            onClick={() => trace.setTraceNotice(null)}
+                            style={{
+                                marginLeft: "auto",
+                                border: "1px solid #d97706",
+                                background: "transparent",
+                                color: "#fde68a",
+                                borderRadius: 6,
+                                padding: "2px 10px",
+                                fontSize: 12,
+                                cursor: "pointer",
+                            }}
+                        >
+                            关闭
+                        </button>
+                    </div>
+                )}
+
+                {onSave && (
+                    <button
+                        onClick={handleSaveGraph}
+                        disabled={saveState === "saving"}
+                        style={{
+                            position: "absolute",
+                            top: 12,
+                            right: 12,
+                            zIndex: 10,
+                            border: "1px solid #1f2a2f",
+                            borderRadius: 8,
+                            padding: "6px 14px",
+                            fontWeight: 600,
+                            fontSize: 12,
+                            cursor: saveState === "saving" ? "wait" : "pointer",
+                            background: saveState === "error" ? "#7f1d1d" : "#0f766e",
+                            color: "#e2e8f0",
+                        }}
+                    >
+                        {saveState === "saving"
+                            ? "保存中…"
+                            : saveState === "saved"
+                              ? "已保存 ✓"
+                              : saveState === "error"
+                                ? "保存失败，点击重试"
+                                : "保存到项目"}
+                    </button>
+                )}
+
                 {/* Panels & Overlays */}
                 {layout.showDiagnostics && trace.shapeResult && !trace.shapeResult.ok && (
                     <DiagnosticsPanel
@@ -302,20 +406,22 @@ function FlowContent() {
                 )}
             </div>
 
-            <CodePanel
-                showLiveCode={layout.showLiveCode}
-                codePanelWidth={layout.codePanelWidth}
-                dragCodePanel={layout.dragCodePanel}
-                setDragCodePanel={layout.setDragCodePanel}
-                setShowLiveCode={layout.setShowLiveCode}
-                generatedCode={generatedCode}
-                onDownloadCode={onDownloadCode}
-                generated={generated}
-                handleSelectionTargets={({ nodeIds, edgeIds }) => {
-                    setHighlightNodes(new Set(nodeIds));
-                    setHighlightEdges(new Set(edgeIds));
-                }}
-            />
+            {!isExternal && (
+                <CodePanel
+                    showLiveCode={layout.showLiveCode}
+                    codePanelWidth={layout.codePanelWidth}
+                    dragCodePanel={layout.dragCodePanel}
+                    setDragCodePanel={layout.setDragCodePanel}
+                    setShowLiveCode={layout.setShowLiveCode}
+                    generatedCode={generatedCode}
+                    onDownloadCode={onDownloadCode}
+                    generated={generated}
+                    handleSelectionTargets={({ nodeIds, edgeIds }) => {
+                        setHighlightNodes(new Set(nodeIds));
+                        setHighlightEdges(new Set(edgeIds));
+                    }}
+                />
+            )}
 
             {layout.showDiagram && (
                 <DiagramView
@@ -375,7 +481,7 @@ function FlowContent() {
                 />
             )}
 
-            {trace.showTrace && (
+            {!isExternal && trace.showTrace && (
                 <TraceView
                     trace={trace.traceData}
                     loading={trace.traceLoading}
@@ -394,10 +500,10 @@ function FlowContent() {
     );
 }
 
-export default function Flow() {
+export default function Flow({ initialGraph, onSave }: FlowEditorProps) {
     return (
         <ReactFlowProvider>
-            <FlowContent />
+            <FlowContent initialGraph={initialGraph} onSave={onSave} />
         </ReactFlowProvider>
     );
 }

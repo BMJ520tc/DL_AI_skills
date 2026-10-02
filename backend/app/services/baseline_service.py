@@ -15,6 +15,7 @@ from pathlib import Path
 
 from app.config import PROJECT_ROOT
 from app.contracts import normalize_metrics
+from app.services import proc_util
 from app.services import analysis_service, knowledge_service, project_manager, task_manager
 
 TASK_TYPE = "baseline"
@@ -103,14 +104,15 @@ def _fail(project_id: str, task_id: str, run_type: str, started: str, error: str
             {"status": "failed", "error": error, "started_at": started, "finished_at": _now()})
 
 
-def _run_entry(cmd: list[str], cwd: Path, timeout_s: int) -> dict:
+async def _run_entry(cmd: list[str], cwd: Path, timeout_s: int) -> dict:
+    """跑 eval 入口；走 proc_util（取消/超时即杀进程树，不再用 to_thread+subprocess.run）。"""
     try:
-        proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"运行超时（>{timeout_s}s）"}
-    ok = proc.returncode == 0
-    output = ((proc.stdout or "") + (proc.stderr or ""))[-2000:]
-    return {"ok": ok, "error": None if ok else (output or f"退出码 {proc.returncode}")}
+        rc, out = await proc_util.run_command(cmd, cwd=str(cwd), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        return {"ok": False, "error": f"运行超时（>{timeout_s}s，已终止进程树）"}
+    ok = rc == 0
+    output = out[-2000:]
+    return {"ok": ok, "error": None if ok else (output or f"退出码 {rc}")}
 
 
 async def run_eval(
@@ -147,7 +149,7 @@ async def run_eval(
     out_json.parent.mkdir(parents=True, exist_ok=True)
 
     cmd = [python, str(eval_entry), str(data_dir), model_dir or "", str(out_json)]
-    result = await asyncio.to_thread(_run_entry, cmd, source, BASELINE_TIMEOUT_S)
+    result = await _run_entry(cmd, source, BASELINE_TIMEOUT_S)
 
     record = {
         "command": " ".join(cmd),

@@ -28,6 +28,21 @@ _ALIASES = {
     "r2_score": "r2",
     "val_loss": "loss",
     "eval_loss": "loss",
+    # 常见写法补充（漏项会让同一指标在两份结果里异名，5.4 取交集为空 → 误报「不可比」）
+    "top-1": "top1",
+    "top-5": "top5",
+    "top_1": "top1",
+    "top_5": "top5",
+    "top1_acc": "top1",
+    "top5_acc": "top5",
+    "precision_score": "precision",
+    "recall_score": "recall",
+    "sensitivity": "recall",
+    "mean_absolute_percentage_error": "mape",
+    "average_precision": "ap",
+    "iou_score": "iou",
+    "dice_score": "dice",
+    "mean_average_precision": "map",
 }
 
 

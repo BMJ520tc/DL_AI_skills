@@ -1,4 +1,7 @@
 """项目管理 API（模块详细设计 2.2）。"""
+import json
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -44,3 +47,37 @@ def get_project(project_id: str) -> dict:
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     return project
+
+
+def _require_structured(project_id: str) -> dict:
+    try:
+        return project_manager.require_type(project_id, {"structured"})
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def _graph_path(project: dict) -> Path:
+    return Path(project["workspace_path"]) / "graph.json"
+
+
+@router.get("/{project_id}/graph")
+def get_graph(project_id: str) -> dict:
+    """结构化项目画布快照（GraphIR v2，模块四 6.5/7.1）。"""
+    project = _require_structured(project_id)
+    p = _graph_path(project)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="graph not found")
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+@router.put("/{project_id}/graph")
+def put_graph(project_id: str, body: dict) -> dict:
+    """画布保存（GraphIR v2 全量覆盖，模块四 7.1 最小闭环；版本树归阶段4）。"""
+    project = _require_structured(project_id)
+    if not isinstance(body.get("nodes"), list) or not isinstance(body.get("edges"), list):
+        raise HTTPException(status_code=400, detail="非法 GraphIR：需含 nodes/edges 数组")
+    _graph_path(project).write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+    project_manager.update_status(project_id, "ready")
+    return {"status": "saved"}

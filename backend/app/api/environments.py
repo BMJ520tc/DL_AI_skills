@@ -20,4 +20,7 @@ def create_env(project_id: str) -> dict:
 
 @router.get("")
 def get_env_status(project_id: str) -> dict:
-    return env_manager.get_env_status(project_id)
+    status = env_manager.get_env_status(project_id)
+    if status.get("status") is None and project_manager.get_project(project_id) is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return status

@@ -66,15 +66,15 @@ export type RequestFailure = {
 export type RequestOutcome<T> = { ok: true; data: T } | { ok: false; failure: RequestFailure };
 
 /**
- * 解析后端 base URL：
- *   - VITE_API_BASE_URL 未设置            -> http://127.0.0.1:8000（默认，直连后端）
- *   - VITE_API_BASE_URL 设为 "/" 或 ""    -> ""（同源相对路径 /api/...，走 Vite dev/preview 代理）
- *   - VITE_API_BASE_URL 设为绝对地址      -> 该地址（去掉结尾斜杠）
+ * 解析后端 base URL（环境变量优先 VITE_API_BASE_URL，其次 VITE_API_BASE）：
+ *   - 两者均未设置            -> http://127.0.0.1:8000（默认，直连后端）
+ *   - 设为 "/" 或 ""          -> ""（同源相对路径 /api/...，走 Vite dev/preview 代理）
+ *   - 设为绝对地址            -> 该地址（去掉结尾斜杠）
  * 以 "/" 开头的相对路径一律按同源处理，用于规避后端未开启 CORS 的场景。
  * 注意：此函数只在浏览器（Vite）环境调用。
  */
 export function resolveApiBaseUrl(): string {
-  const configured = import.meta.env.VITE_API_BASE_URL;
+  const configured = import.meta.env.VITE_API_BASE_URL ?? import.meta.env.VITE_API_BASE;
   if (typeof configured === "string") {
     const trimmed = configured.trim();
     // "" 或 "/xxx" => 同源（保留非根路径前缀）
@@ -91,16 +91,23 @@ export function describeApiBaseUrl(baseUrl: string): string {
 export type SearchParams = {
   q?: string;
   types?: readonly string[];
+  /** 需求六.1 三维度：任务类型 / 模型 / 数据集（对应后端 task_type / model / dataset）。 */
+  task_type?: string;
+  model?: string;
+  dataset?: string;
   limit?: number;
   offset?: number;
 };
 
-/** 构造 /api/knowledge/search 的完整 URL。 */
+/** 构造 /api/knowledge/search 的完整 URL（URLSearchParams 负责编码，中文/空格安全）。 */
 export function buildSearchUrl(baseUrl: string, params: SearchParams = {}): string {
   const base = baseUrl.replace(/\/+$/, "");
   const search = new URLSearchParams();
   if (params.types && params.types.length > 0) search.set("types", params.types.join(","));
   if (params.q) search.set("q", params.q);
+  if (params.task_type) search.set("task_type", params.task_type);
+  if (params.model) search.set("model", params.model);
+  if (params.dataset) search.set("dataset", params.dataset);
   search.set("limit", String(params.limit ?? 20));
   search.set("offset", String(params.offset ?? 0));
   return `${base}/api/knowledge/search?${search.toString()}`;

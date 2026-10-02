@@ -4,6 +4,7 @@
 职责边界: 任务表只存调度状态，运行结果/报错归 run_record（数据设计五.2）。
 """
 import asyncio
+import contextlib
 import json
 import uuid
 from datetime import datetime, timezone
@@ -34,6 +35,10 @@ TASK_TIMEOUTS: dict[str, float] = {
     "extract_items": 1800,
     "reproduce": 7200,
     "conclusion": 900,
+    "decompose": 3900,  # agent 重试总预算 3600s + 余量（不能与单次 agent 超时相等，否则任务先被取消）
+    "decompose_trace": 900,  # 脚本 600s + 余量
+    "decompose_verify": 2400,  # 脚本 1800s + 余量
+    "module_ingest": 600,
 }
 
 
@@ -47,13 +52,26 @@ def register_handler(task_type: str, handler: Handler) -> None:
 
 
 def create_task(task_type: str, project_id: Optional[str] = None, params: Optional[dict] = None) -> str:
-    task_id = uuid.uuid4().hex
+    """创建任务并入队。**相同任务（类型+项目+参数）已在排队或执行中则复用**，不重复入队。
+
+    重复入队的代价很高（同一项目跑两遍 agent 拆解 / 两遍 pip 安装），
+    而前端重复点击、脚本重跑都很容易触发；已结束（success/failed/cancelled）的不算重复。
+    """
+    params_json = json.dumps(params or {}, ensure_ascii=False, sort_keys=True)
     conn = get_connection()
     try:
+        existing = conn.execute(
+            "SELECT task_id FROM task WHERE task_type = ? AND IFNULL(project_id, '') = IFNULL(?, '') "
+            "AND params = ? AND status IN ('queued', 'running') ORDER BY created_at DESC LIMIT 1",
+            (task_type, project_id, params_json),
+        ).fetchone()
+        if existing is not None:
+            return existing["task_id"]
+        task_id = uuid.uuid4().hex
         conn.execute(
             "INSERT INTO task(task_id, task_type, project_id, params, status, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, 'queued', ?, ?)",
-            (task_id, task_type, project_id, json.dumps(params or {}, ensure_ascii=False), _now(), _now()),
+            (task_id, task_type, project_id, params_json, _now(), _now()),
         )
         conn.commit()
     finally:
@@ -218,10 +236,16 @@ async def _execute(task_id: str) -> None:
         except asyncio.TimeoutError:
             _set_status(task_id, "failed", error=f"timeout after {timeout}s")
             t.cancel()
+            # 必须等 handler 真正收尾（它在收尾时会杀掉子进程树、释放环境目录）再返回，
+            # 否则 worker 立刻处理 retry 入队的新任务，会与尚未退出的旧执行并发写同一环境。
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t
             return
         except asyncio.CancelledError:
-            # 被 cancel_task 取消（协作式），不重新抛出以免传播到 worker
+            # 被 cancel_task 取消（协作式）：同样等收尾后再返回（不重新抛出以免传播到 worker）
             _set_status(task_id, "cancelled")
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await t
             return
         finally:
             _running_tasks.pop(task_id, None)

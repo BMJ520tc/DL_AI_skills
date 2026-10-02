@@ -30,6 +30,8 @@ type Props = {
     onToggleComputePanel: () => void;
     /** 可选：传入后工具栏右侧出现「知识库」按钮，用于打开知识库检索面板。 */
     onOpenKnowledge?: () => void;
+    /** 可选：为 true 时隐藏「分析」（张量追踪/种子）入口（外部画布模式）。 */
+    hideTrace?: boolean;
     statusSlot?: ReactNode;
     selectionSummary?: ReactNode;
 };
@@ -63,6 +65,7 @@ export default function EditorHeader({
     onToggleDiagnostics,
     onToggleComputePanel,
     onOpenKnowledge,
+    hideTrace = false,
     statusSlot,
     selectionSummary,
 }: Props) {
@@ -122,6 +125,7 @@ export default function EditorHeader({
                     </div>
                 </div>
                 <div style={{ height: 26, width: 1, background: "#2a2a2a" }} />
+                {!hideTrace && (<>
                 <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                     <span style={{ color: "#6b7280", fontSize: 10, letterSpacing: "0.08em", textTransform: "uppercase" }}>
                         分析
@@ -195,6 +199,7 @@ export default function EditorHeader({
                     </div>
                 </div>
                 <div style={{ height: 26, width: 1, background: "#2a2a2a" }} />
+                </>)}
                 <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                     <span style={{ color: "#6b7280", fontSize: 10, letterSpacing: "0.08em", textTransform: "uppercase" }}>
                         模块

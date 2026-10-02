@@ -72,10 +72,10 @@ def create_compare(project_id: str) -> dict:
 
 
 @router.post("/visualize/{chart_type}")
-def visualize(project_id: str, chart_type: str) -> dict:
+async def visualize(project_id: str, chart_type: str) -> dict:
     """模块三 5.5 生成自包含 HTML 图表，返回文件路径。"""
     try:
-        return visualize_service.run(project_id, chart_type)
+        return await visualize_service.run(project_id, chart_type)
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except PermissionError as e:

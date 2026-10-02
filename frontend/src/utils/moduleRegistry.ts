@@ -27,6 +27,8 @@ export type SavedModule = {
     updatedAt: string;
     variableSchema?: Record<string, FieldSpec>;
     variableMap?: Record<string, Array<{ nodeId: string; paramName: string }>>;
+    /** 来源标记：本地 localStorage 为用户模块；backend 为后端标准化模块库（只读注入）。 */
+    origin?: "local" | "backend";
 };
 
 export const nextIncrementModuleVersion = (version: string) => {
@@ -96,12 +98,22 @@ function dedupeHandles(handles: string[]) {
     return Array.from(new Set(handles.filter(Boolean)));
 }
 
+// 后端标准化模块的「内存覆盖层」：只读、不写 localStorage（需求五.2 接缝）。
+// 由 useModuleSystem 拉取 /api/modules 后注入；同 id 时本地模块优先。
+let transientModules: SavedModule[] = [];
+
+export function setTransientModules(mods: SavedModule[]) {
+    transientModules = mods;
+}
+
 export function listModules(): SavedModule[] {
-    return loadAll();
+    const local = loadAll();
+    const localIds = new Set(local.map(m => m.id));
+    return [...local, ...transientModules.filter(m => !localIds.has(m.id))];
 }
 
 export function getModule(id: string): SavedModule | undefined {
-    return loadAll().find(m => m.id === id);
+    return listModules().find(m => m.id === id);
 }
 
 export function deleteModule(id: string) {

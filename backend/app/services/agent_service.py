@@ -6,7 +6,9 @@
 """
 import asyncio
 import json
+import os
 import re
+import shutil
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -14,6 +16,7 @@ from typing import Optional
 from claude_agent_sdk import ClaudeAgentOptions, PermissionResultAllow, PermissionResultDeny, ResultMessage, query
 
 from app.config import AGENT_TASKS_DIR, BACKEND_DIR, CLAUDE_CLI_PATH, DEFAULT_MODEL
+from app.ids import safe_id
 from app.services import task_manager
 
 AGENT_TASK_TYPE = "agent_task"
@@ -33,6 +36,9 @@ KNOWLEDGE_MCP_TOOL = "knowledge_search"
 KNOWLEDGE_MCP_TOOL_RULE = f"mcp__{KNOWLEDGE_MCP_SERVER}__{KNOWLEDGE_MCP_TOOL}"
 
 DEFAULT_TIMEOUT_S = 900
+# run_sync 的临时目录前缀与保留数：这些目录没有 task 记录可查，长期不清会让 data/agent_tasks 膨胀
+SYNC_DIR_PREFIX = "sync_"
+SYNC_KEEP_DIRS = int(os.getenv("AGENT_SYNC_KEEP_DIRS", "200"))
 
 
 def allowed_tools(attach_knowledge: bool = True, base: Optional[list[str]] = None) -> list[str]:
@@ -71,8 +77,29 @@ async def _can_use_tool(tool_name: str, tool_input: dict, context) -> Permission
     return PermissionResultAllow()
 
 
+def _prune_sync_dirs() -> None:
+    """清理 run_sync 自建的临时目录（sync_*），按 mtime 保留最近 SYNC_KEEP_DIRS 个。
+
+    只动 sync_* 前缀（无 task 记录、纯临时）；任务路径的 {task_id} 目录属可回溯产物，不在此列。
+    """
+    try:
+        dirs = sorted((p for p in AGENT_TASKS_DIR.glob(f"{SYNC_DIR_PREFIX}*") if p.is_dir()),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    for old in dirs[SYNC_KEEP_DIRS:]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def _sync_dir() -> Path:
+    d = AGENT_TASKS_DIR / f"{SYNC_DIR_PREFIX}{uuid.uuid4().hex}"
+    d.mkdir(parents=True, exist_ok=True)
+    _prune_sync_dirs()
+    return d
+
+
 def _task_dir(task_id: str) -> Path:
-    d = AGENT_TASKS_DIR / task_id
+    d = AGENT_TASKS_DIR / safe_id(task_id, "task_id")  # 防路径穿越（task_id 来自 API 路径参数）
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -141,11 +168,25 @@ def submit(
 
 
 def get_result(task_id: str) -> dict:
+    r"""取 agent 任务结果；**任务不存在时直接返回**（不建目录、不读文件）。
+
+    原先先 `_task_dir`（内含 mkdir）再判存在性：未知 id 会在 agent_tasks 下留空目录，
+    且 `..\` 之类 id 能越出目录建目录；结果文件非法 JSON 还会把 GET 打成 500。
+    """
     task = task_manager.get_task(task_id)
+    if task is None:
+        return {"task": None}
     result: dict = {"task": task}
-    result_path = _task_dir(task_id) / "result.json"
+    try:
+        result_path = _task_dir(task_id) / "result.json"
+    except ValueError as e:  # task_id 非法（路径穿越类）
+        result["error"] = str(e)
+        return result
     if result_path.exists():
-        result["result"] = json.loads(result_path.read_text(encoding="utf-8"))
+        try:
+            result["result"] = json.loads(result_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            result["error"] = f"结果文件不可解析: {e}"
     return result
 
 
@@ -202,7 +243,12 @@ async def _run(params: dict, task_id: str) -> None:
             )
         raise RuntimeError("agent 未产出符合 schema 的结构化输出")
 
-    result_path.write_text(json.dumps(structured or {}, ensure_ascii=False), encoding="utf-8")
+    # 无 schema 的任务也留下 agent 的文本回复，便于回溯（原来恒写 {}）
+    result_path.write_text(
+        json.dumps(structured if structured is not None else {"result": outcome.get("result")},
+                   ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 async def _collect(prompt: str, options: ClaudeAgentOptions, timeout_s: int, retries: int = 2) -> dict:
@@ -212,10 +258,13 @@ async def _collect(prompt: str, options: ClaudeAgentOptions, timeout_s: int, ret
 
     for attempt in range(retries + 1):
         try:
+            saw_result = False
 
             async def _iterate() -> None:
+                nonlocal saw_result
                 async for msg in query(prompt=prompt, options=options):
                     if isinstance(msg, ResultMessage):
+                        saw_result = True
                         outcome["structured_output"] = msg.structured_output
                         outcome["result"] = msg.result
                         outcome["num_turns"] = msg.num_turns
@@ -225,6 +274,9 @@ async def _collect(prompt: str, options: ClaudeAgentOptions, timeout_s: int, ret
                         return
 
             await asyncio.wait_for(_iterate(), timeout=timeout_s)
+            if not saw_result:
+                # 会话流结束却没有 ResultMessage：属异常终止，不能当成功返回空结果
+                raise RuntimeError("agent 会话未返回 ResultMessage（会话异常终止，无结果可用）")
             return outcome
         except asyncio.TimeoutError as e:
             last_error = e
@@ -257,8 +309,13 @@ async def run_sync(
     返回 {"structured_output": ..., "result": ...}；结构化输出在 DeepSeek 下走文件兜底。
     attach_knowledge=True 时挂载知识库 MCP 并把其工具加入白名单（默认不挂载，保持既有调用方行为）。
     """
-    d = _task_dir(uuid.uuid4().hex)
+    d = _sync_dir()
     result_path = d / "result.json"
+    (d / "input.json").write_text(
+        json.dumps({"prompt": prompt, "cwd": cwd, "max_turns": max_turns, "timeout_s": timeout_s},
+                   ensure_ascii=False),
+        encoding="utf-8",
+    )
 
     if output_schema:
         prompt = (
@@ -291,4 +348,7 @@ async def run_sync(
             structured = json.loads(result_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             structured = None
+    if structured is None and outcome.get("result") is None:
+        # 既无结构化输出、也无文本回复 → 不能静默返回空结果给调用方
+        raise RuntimeError("agent 未返回任何结果（structured_output 与 result 均为空）")
     return {"structured_output": structured, "result": outcome.get("result")}

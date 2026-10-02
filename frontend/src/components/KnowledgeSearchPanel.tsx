@@ -17,6 +17,7 @@ import {
   type KnowledgeDataType,
   type KnowledgeSearchHit,
   type RequestFailure,
+  type SearchParams,
 } from "../api/knowledgeClient";
 
 /**
@@ -72,6 +73,34 @@ const INPUT_STYLE: CSSProperties = {
   fontSize: 13,
   outline: "none",
 };
+
+/** 维度筛选（task_type/model/dataset）输入框，较关键词框窄。 */
+const FILTER_INPUT_STYLE: CSSProperties = {
+  flex: "0 1 190px",
+  minWidth: 160,
+  background: "#111827",
+  color: "#e6edf3",
+  border: "1px solid #374151",
+  borderRadius: 6,
+  padding: "6px 9px",
+  fontSize: 12,
+  outline: "none",
+};
+
+/** 三维度筛选值。 */
+type SearchFilters = { taskType: string; model: string; dataset: string };
+
+const EMPTY_FILTERS: SearchFilters = { taskType: "", model: "", dataset: "" };
+
+/** task_type 静态建议（下拉可选项，实际以检索结果回填为主）。 */
+const TASK_TYPE_SUGGESTIONS = [
+  "classification",
+  "detection",
+  "segmentation",
+  "generation",
+  "regression",
+  "other",
+];
 
 const BUTTON_BASE: CSSProperties = {
   padding: "7px 14px",
@@ -132,6 +161,10 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
   const [query, setQuery] = useState("");
   const [selectedTypes, setSelectedTypes] = useState<KnowledgeDataType[]>([...KNOWLEDGE_DATA_TYPES]);
   const [limit, setLimit] = useState(20);
+  // 需求六.1 三维度筛选
+  const [taskType, setTaskType] = useState("");
+  const [modelName, setModelName] = useState("");
+  const [datasetName, setDatasetName] = useState("");
 
   const [hits, setHits] = useState<KnowledgeSearchHit[]>([]);
   const [loading, setLoading] = useState(false);
@@ -147,16 +180,25 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
   const detailAbort = useRef<AbortController | null>(null);
 
   const runSearch = useCallback(
-    async (keyword: string, types: KnowledgeDataType[], size: number) => {
+    async (keyword: string, types: KnowledgeDataType[], size: number, filters: SearchFilters) => {
       searchAbort.current?.abort();
       const controller = new AbortController();
       searchAbort.current = controller;
 
+      const params: SearchParams = {
+        q: keyword,
+        types,
+        limit: size,
+        task_type: filters.taskType.trim() || undefined,
+        model: filters.model.trim() || undefined,
+        dataset: filters.dataset.trim() || undefined,
+      };
+
       setLoading(true);
       setFailure(null);
-      setLastUrl(buildSearchUrl(baseUrl, { q: keyword, types, limit: size }));
+      setLastUrl(buildSearchUrl(baseUrl, params));
 
-      const outcome = await searchKnowledge(baseUrl, { q: keyword, types, limit: size }, controller.signal);
+      const outcome = await searchKnowledge(baseUrl, params, controller.signal);
       if (controller.signal.aborted) return;
 
       setLoading(false);
@@ -173,12 +215,40 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
 
   // 打开面板即浏览一次（q 为空 => 后端返回最近条目）
   useEffect(() => {
-    void runSearch("", [...KNOWLEDGE_DATA_TYPES], 20);
+    void runSearch("", [...KNOWLEDGE_DATA_TYPES], 20, EMPTY_FILTERS);
     return () => {
       searchAbort.current?.abort();
       detailAbort.current?.abort();
     };
   }, [runSearch]);
+
+  // 以当前筛选条件发起检索
+  const doSearch = useCallback(() => {
+    void runSearch(query.trim(), selectedTypes, limit, { taskType, model: modelName, dataset: datasetName });
+  }, [runSearch, query, selectedTypes, limit, taskType, modelName, datasetName]);
+
+  // 维度下拉建议：静态 task_type + 已返回结果中出现过的取值
+  const taskTypeOptions = useMemo(() => {
+    const set = new Set<string>(TASK_TYPE_SUGGESTIONS);
+    hits.forEach(hit => {
+      if (hit.task_type) set.add(hit.task_type);
+    });
+    return Array.from(set).sort();
+  }, [hits]);
+  const modelOptions = useMemo(() => {
+    const set = new Set<string>();
+    hits.forEach(hit => {
+      if (hit.model_name) set.add(hit.model_name);
+    });
+    return Array.from(set).sort();
+  }, [hits]);
+  const datasetOptions = useMemo(() => {
+    const set = new Set<string>();
+    hits.forEach(hit => {
+      if (hit.dataset_name) set.add(hit.dataset_name);
+    });
+    return Array.from(set).sort();
+  }, [hits]);
 
   // Esc 关闭
   useEffect(() => {
@@ -288,13 +358,13 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
               value={query}
               onChange={event => setQuery(event.target.value)}
               onKeyDown={event => {
-                if (event.key === "Enter") void runSearch(query.trim(), selectedTypes, limit);
+                if (event.key === "Enter") doSearch();
               }}
               placeholder="输入关键词（留空则按类型浏览最近条目）"
               style={INPUT_STYLE}
             />
             <button
-              onClick={() => void runSearch(query.trim(), selectedTypes, limit)}
+              onClick={doSearch}
               disabled={loading}
               style={{
                 ...BUTTON_BASE,
@@ -348,6 +418,68 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
             </label>
           </div>
 
+          {/* 需求六.1 三维度：task_type / model / dataset（datalist 选项来自静态建议 + 已有结果） */}
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={SECTION_TITLE_STYLE}>维度</span>
+            <input
+              list="ks-task-types"
+              value={taskType}
+              onChange={event => setTaskType(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === "Enter") doSearch();
+              }}
+              placeholder="task_type（任务类型）"
+              style={FILTER_INPUT_STYLE}
+            />
+            <datalist id="ks-task-types">
+              {taskTypeOptions.map(value => (
+                <option key={value} value={value} />
+              ))}
+            </datalist>
+            <input
+              list="ks-models"
+              value={modelName}
+              onChange={event => setModelName(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === "Enter") doSearch();
+              }}
+              placeholder="model（模型名）"
+              style={FILTER_INPUT_STYLE}
+            />
+            <datalist id="ks-models">
+              {modelOptions.map(value => (
+                <option key={value} value={value} />
+              ))}
+            </datalist>
+            <input
+              list="ks-datasets"
+              value={datasetName}
+              onChange={event => setDatasetName(event.target.value)}
+              onKeyDown={event => {
+                if (event.key === "Enter") doSearch();
+              }}
+              placeholder="dataset（数据集名）"
+              style={FILTER_INPUT_STYLE}
+            />
+            <datalist id="ks-datasets">
+              {datasetOptions.map(value => (
+                <option key={value} value={value} />
+              ))}
+            </datalist>
+            {(taskType || modelName || datasetName) && (
+              <button
+                onClick={() => {
+                  setTaskType("");
+                  setModelName("");
+                  setDatasetName("");
+                }}
+                style={{ ...BUTTON_BASE, padding: "4px 10px", fontSize: 12, background: "#1f2937", color: "#cbd5e1" }}
+              >
+                清空维度
+              </button>
+            )}
+          </div>
+
           {selectedTypes.length === 0 ? (
             <div style={{ color: "#fbbf24" }}>⚠ 未勾选任何类型：后端会按「不限类型」返回结果。</div>
           ) : null}
@@ -377,7 +509,7 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
 
             {failure ? (
               <div style={{ padding: 12 }}>
-                <FailureBox failure={failure} onRetry={() => void runSearch(query.trim(), selectedTypes, limit)} />
+                <FailureBox failure={failure} onRetry={doSearch} />
               </div>
             ) : null}
 
@@ -443,6 +575,17 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
                   <div style={{ color: "#8b949e", marginTop: 4, lineHeight: 1.5 }}>
                     {summary || "（无摘要）"}
                   </div>
+                  {[hit.task_type, hit.model_name, hit.dataset_name].some(Boolean) ? (
+                    <div style={{ color: "#7dd3fc", fontSize: 11, marginTop: 4 }}>
+                      {[
+                        hit.task_type ? `task=${hit.task_type}` : null,
+                        hit.model_name ? `model=${hit.model_name}` : null,
+                        hit.dataset_name ? `dataset=${hit.dataset_name}` : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </div>
+                  ) : null}
                   <div style={{ color: "#4b5563", fontSize: 11, marginTop: 4, wordBreak: "break-all" }}>
                     {dataType}/{refId}
                   </div>

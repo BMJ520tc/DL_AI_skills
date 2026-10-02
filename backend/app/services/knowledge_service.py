@@ -4,6 +4,7 @@
 unified_index 的 FTS 同步由 schema.sql 触发器自动维护。
 """
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -31,6 +32,48 @@ def _now() -> str:
 def _fts_query(q: str) -> str:
     """把用户输入转成 FTS5 短语查询，避免查询语法注入。"""
     return '"' + q.replace('"', '""') + '"'
+
+
+# 三维索引取值的约定键（数据设计三.1）：调用方上下文字典里出现即取，缺省保持 None。
+_DIMENSION_KEYS = {
+    "task_type": ("task_type",),
+    "model_name": ("model_name", "model"),
+    "dataset_name": ("dataset_name", "dataset", "dataset_id"),
+}
+
+
+def _as_dict(value) -> dict:
+    """把调用方传入的 params/scope 统一成 dict：dict 原样、JSON 文本解析、其余为空。"""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _pick_dimension(sources: tuple, keys: tuple) -> Optional[str]:
+    """按约定键在多个上下文字典里顺序取首个非空字符串值。"""
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for key in keys:
+            val = src.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return None
+
+
+def _derive_dimensions(*sources) -> dict:
+    """从调用方上下文字典抽取 task_type/model_name/dataset_name 三维索引取值。
+
+    仅在调用方明确给出约定键（task_type、model/model_name、dataset/dataset_name/dataset_id）
+    时取值；缺省保持 None——不凭空臆造，保证向后兼容（无值的条目不会命中三维检索）。
+    """
+    return {name: _pick_dimension(sources, keys) for name, keys in _DIMENSION_KEYS.items()}
 
 
 def index_entry(
@@ -126,6 +169,7 @@ def record_run(run: dict) -> str:
             source_project_id=run.get("project_id"),
             tags=[run.get("run_type")] if run.get("run_type") else None,
             keywords=run.get("run_type"),
+            **_derive_dimensions(run, _as_dict(run.get("params"))),
         )
         conn.commit()
     finally:
@@ -169,6 +213,7 @@ def record_paper(paper: dict) -> str:
             summary=paper.get("abstract"),
             tags=[paper.get("source")] if paper.get("source") else None,
             keywords=paper.get("title"),
+            **_derive_dimensions(paper, _as_dict(paper.get("scope"))),
         )
         conn.commit()
     finally:
@@ -201,6 +246,17 @@ def update_paper(paper_id: str, **fields) -> bool:
     conn = get_connection()
     try:
         cur = conn.execute(f"UPDATE paper SET {', '.join(sets)} WHERE paper_id = ?", args)
+        if cur.rowcount:
+            # 主表改了就必须同步统一索引，否则检索到的是旧标题/摘要
+            row = conn.execute("SELECT * FROM paper WHERE paper_id = ?", (paper_id,)).fetchone()
+            if row is not None:
+                index_entry(
+                    conn, "paper", paper_id,
+                    title=row["title"],
+                    summary=row["abstract"],
+                    tags=[row["source"]] if row["source"] else None,
+                    keywords=row["title"],
+                )
         conn.commit()
         return cur.rowcount > 0
     finally:
@@ -216,7 +272,8 @@ def record_experiment_items(paper_id: str, items: list[dict]) -> list[str]:
     now = _now()
     conn = get_connection()
     try:
-        conn.execute("DELETE FROM experiment_item WHERE paper_id = ?", (paper_id,))
+        # 重抽取即旧的条目失效：条目本身与其派生的复现结果/可信度结论一并清掉（同 delete_item 级联）
+        _delete_paper_children(conn, paper_id)
         item_ids = []
         for it in items:
             item_id = it.get("item_id") or uuid.uuid4().hex
@@ -478,6 +535,8 @@ def register_dataset(ds: dict) -> str:
             summary=ds.get("source"),
             task_type=ds.get("task_type"),
             dataset_name=ds.get("name"),
+            # 数据集条目已有 name/task_type；模型维度仅在调用方明确给出时才填（不臆造）
+            model_name=_pick_dimension((ds,), _DIMENSION_KEYS["model_name"]),
             tags=[ds.get("source")] if ds.get("source") else None,
             keywords=ds.get("name"),
         )
@@ -578,7 +637,18 @@ def search(
     return [dict(r) for r in rows]
 
 
+def get_module_by_ref(ref: str) -> Optional[dict]:
+    """按统一索引的 module ref 取模块：`{module_id}:{module_version}`，或裸 module_id（取最新版）。
+
+    module 表是复合主键 (module_id, module_version)，通用 get_item 的单主键假设不适用（3.5）。
+    """
+    module_id, _, version = ref.partition(":")
+    return get_module(module_id, version or None)
+
+
 def get_item(data_type: str, ref_id: str) -> Optional[dict]:
+    if data_type == "module":  # 复合主键特判（3.5）
+        return get_module_by_ref(ref_id)
     table_pk = _TABLE_PK.get(data_type)
     if table_pk is None:
         raise ValueError(f"unknown data_type: {data_type}")
@@ -616,8 +686,10 @@ def find_datasets(
     sql = "SELECT * FROM dataset_registry WHERE 1=1"
     args: list = []
     if local_path_prefix:
-        sql += " AND local_path LIKE ?"
-        args.append(local_path_prefix.replace("%", "") + "%")
+        # LIKE 通配符转义：`_` 会匹配任意单字符（曾有 projA 命中 proj_X 前缀的误配）
+        escaped = local_path_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        sql += " AND local_path LIKE ? ESCAPE '\\'"
+        args.append(escaped + "%")
     if task_type:
         sql += " AND task_type = ?"
         args.append(task_type)
@@ -666,6 +738,121 @@ def get_latest_run(project_id: str, run_type: str, status: str = "success") -> O
     return dict(row) if row else None
 
 
+def next_module_version(module_id: str) -> str:
+    """标准化模块版本号：同 module_id 递增 v1,v2,…（模块表复合主键 (module_id, module_version)）。"""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT module_version FROM module WHERE module_id = ?", (module_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+    nums = [
+        int(m.group(1)) for r in rows
+        for m in (re.match(r"v(\d+)", r["module_version"] or ""),) if m
+    ]
+    return f"v{max(nums) + 1 if nums else 1}"
+
+
+def delete_module(module_id: str, module_version: str) -> None:
+    """删除模块行与其统一索引条目（入库链路的失败回滚：包未落盘时不留孤儿记录）。"""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "DELETE FROM module WHERE module_id = ? AND module_version = ?", (module_id, module_version)
+        )
+        conn.execute("DELETE FROM unified_index WHERE id = ?", (f"module:{module_id}:{module_version}",))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def record_module(module: dict) -> dict:
+    """写入标准化模块并同步统一索引（数据设计七.1，模块四 6.5）。
+
+    复合主键 (module_id, module_version) 由调用方经 next_module_version 预取后显式传入；
+    unified_index ref_id = "{module_id}:{module_version}"（get_item/list_items 的单主键
+    假设不适用 module，检索走下方专用 list_modules/get_module）。
+    index_summary / index_keywords 可由调用方指定（3.5 字段表口径）；不写 model_name，
+    避免模块把「模型过滤」维度污染成与模块同名的取值。
+    """
+    module_id, version = module["module_id"], module["module_version"]
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO module(module_id, module_version, name, description, source_project_id,
+                source_paper_id, task_type, input_spec, output_spec, params_schema, tags,
+                verification, saved_module_compat, path, created_at, updated_at, schema_version)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '1.0')
+            """,
+            (
+                module_id,
+                version,
+                module.get("name"),
+                module.get("description"),
+                module.get("source_project_id"),
+                module.get("source_paper_id"),
+                module.get("task_type"),
+                json.dumps(module.get("input_spec"), ensure_ascii=False) if module.get("input_spec") else None,
+                json.dumps(module.get("output_spec"), ensure_ascii=False) if module.get("output_spec") else None,
+                json.dumps(module.get("params_schema"), ensure_ascii=False) if module.get("params_schema") else None,
+                json.dumps(module.get("tags"), ensure_ascii=False) if module.get("tags") else None,
+                json.dumps(module.get("verification"), ensure_ascii=False) if module.get("verification") else None,
+                json.dumps(module.get("saved_module_compat"), ensure_ascii=False)
+                if module.get("saved_module_compat") else None,
+                module.get("path"),
+                _now(),
+                _now(),
+            ),
+        )
+        index_entry(
+            conn,
+            "module",
+            f"{module_id}:{version}",
+            title=module.get("name"),
+            summary=module.get("index_summary") or module.get("description"),
+            source_project_id=module.get("source_project_id"),
+            task_type=module.get("task_type"),
+            tags=module.get("tags"),
+            keywords=module.get("index_keywords") or module.get("name"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"module_id": module_id, "module_version": version}
+
+
+def list_modules(limit: int = 100, offset: int = 0) -> list[dict]:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM module ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_module(module_id: str, module_version: Optional[str] = None) -> Optional[dict]:
+    """按 module_id 取最新版本；指定 module_version 取具体版本。"""
+    conn = get_connection()
+    try:
+        if module_version:
+            row = conn.execute(
+                "SELECT * FROM module WHERE module_id = ? AND module_version = ?",
+                (module_id, module_version),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM module WHERE module_id = ? ORDER BY created_at DESC LIMIT 1",
+                (module_id,),
+            ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
 def record_knowledge(k: dict) -> str:
     """写入蒸馏知识并同步统一索引（数据设计六.2）。"""
     knowledge_id = k.get("knowledge_id") or uuid.uuid4().hex
@@ -699,6 +886,8 @@ def record_knowledge(k: dict) -> str:
             summary=k.get("content"),
             tags=[k.get("type")] if k.get("type") else None,
             keywords=k.get("type"),
+            # scope 通常带 task_type/model/dataset（对比建议等），按约定键抽取三维取值
+            **_derive_dimensions(k, _as_dict(k.get("scope"))),
         )
         conn.commit()
     finally:
@@ -720,8 +909,36 @@ def confirm_knowledge(knowledge_id: str) -> bool:
         conn.close()
 
 
+def _delete_paper_children(conn, paper_id: str) -> None:
+    """清掉论文的从属数据：条目 → 条目派生的复现结果（**reproduction_result 没有 paper_id**，
+    经 item_id 关联）→ 可信度结论（有 paper_id），并同步清理它们的索引条目。
+
+    不这样做会在重抽取/删论文后留下 join 不可见的孤儿行（真实库里已出现过）。
+    """
+    item_ids = [r[0] for r in conn.execute(
+        "SELECT item_id FROM experiment_item WHERE paper_id = ?", (paper_id,)).fetchall()]
+    result_ids = []
+    for iid in item_ids:
+        result_ids += [r[0] for r in conn.execute(
+            "SELECT result_id FROM reproduction_result WHERE item_id = ?", (iid,)).fetchall()]
+        conn.execute("DELETE FROM reproduction_result WHERE item_id = ?", (iid,))
+    conn.execute("DELETE FROM experiment_item WHERE paper_id = ?", (paper_id,))
+    conclusion_ids = [r[0] for r in conn.execute(
+        "SELECT conclusion_id FROM credibility_conclusion WHERE paper_id = ?", (paper_id,)).fetchall()]
+    conn.execute("DELETE FROM credibility_conclusion WHERE paper_id = ?", (paper_id,))
+    for dtype, ids in (("experiment_item", item_ids),
+                       ("reproduction_result", result_ids),
+                       ("credibility_conclusion", conclusion_ids)):
+        for did in ids:
+            conn.execute("DELETE FROM unified_index WHERE data_type = ? AND ref_id = ?", (dtype, did))
+
+
 def delete_item(data_type: str, ref_id: str) -> bool:
-    """删除条目，受引用约束（数据设计九.2）：被引用的数据禁止删除。"""
+    """删除条目，受引用约束（数据设计九.2）：被引用的数据禁止删除。
+
+    带级联：删论文时同时清掉其条目/复现结果/可信度结论（原先只删 paper + 索引，
+    子表留下孤儿行，重建同 id 时会「复活」旧子表数据）。
+    """
     table_pk = _TABLE_PK.get(data_type)
     if table_pk is None:
         raise ValueError(f"unknown data_type: {data_type}")
@@ -735,6 +952,8 @@ def delete_item(data_type: str, ref_id: str) -> bool:
         if ref is not None:
             raise ReferenceError(f"{data_type}:{ref_id} 被其他条目引用，禁止删除")
         conn.execute("DELETE FROM unified_index WHERE data_type = ? AND ref_id = ?", (data_type, ref_id))
+        if data_type == "paper":
+            _delete_paper_children(conn, ref_id)
         cur = conn.execute(f"DELETE FROM {table} WHERE {pk} = ?", (ref_id,))
         conn.commit()
         return cur.rowcount > 0
