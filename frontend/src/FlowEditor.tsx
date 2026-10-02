@@ -29,6 +29,8 @@ import { useCodeGeneration } from "./features/editor/hooks/useCodeGeneration";
 import { useExportSystem } from "./features/editor/hooks/useExportSystem";
 import { LAYER_REGISTRY } from "./types/nodeTypes";
 import { estimateGraphCost } from "./utils/computeEstimator";
+import NetworkRunPanel from "./features/network/NetworkRunPanel";
+import { exportNetwork } from "./api/client";
 
 const TRACE_SEED_PRESETS = [42, 1337, 1234, 2020, 2021];
 
@@ -37,9 +39,11 @@ export type FlowEditorProps = {
     initialGraph?: GraphIR | null;
     /** 保存回调（结构化项目画布 → PUT /api/projects/{id}/graph）。 */
     onSave?: (graph: GraphIR) => Promise<void>;
+    /** 结构化项目 id：画布网络的「导出代码 / 运行训练」入口（阶段4 4c，模块详细设计 7.5）。 */
+    projectId?: string;
 };
 
-function FlowContent({ initialGraph, onSave }: FlowEditorProps) {
+function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
     // 1. Core Graph State
     const {
         nodes, setNodes,
@@ -172,6 +176,34 @@ function FlowContent({ initialGraph, onSave }: FlowEditorProps) {
             setSaveState("error");
         }
     };
+
+    // 画布网络导出（阶段4 4c）：先落盘当前画布（导出即所存即所训），
+    // 再从后端同一引擎取再生成代码下载（前端 codeCompile 对后端模块节点不可用）。
+    const [exportState, setExportState] = useState<"idle" | "busy" | "error">("idle");
+    const handleExportCode = async () => {
+        if (!projectId || exportState === "busy") return;
+        setExportState("busy");
+        try {
+            if (onSave) await onSave(buildGraphIR(nodes, edges));
+            const { code } = await exportNetwork(projectId);
+            const blob = new Blob([code], { type: "text/x-python" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "model.py";
+            a.click();
+            URL.revokeObjectURL(url);
+        } catch (err) {
+            console.error("导出代码失败", err);
+            setExportState("error");
+            alert(err instanceof Error ? err.message : String(err));
+        } finally {
+            setExportState("idle");
+        }
+    };
+
+    // 运行面板开关（阶段4 4c：训练任务发起、轮询与指标展示）
+    const [showRunPanel, setShowRunPanel] = useState(false);
 
     // File Upload (ref needed)
     const uploadInputRef = useRef<HTMLInputElement>(null);
@@ -350,32 +382,88 @@ function FlowContent({ initialGraph, onSave }: FlowEditorProps) {
                 )}
 
                 {onSave && (
-                    <button
-                        onClick={handleSaveGraph}
-                        disabled={saveState === "saving"}
+                    <div
                         style={{
                             position: "absolute",
                             top: 12,
                             right: 12,
                             zIndex: 10,
-                            border: "1px solid #1f2a2f",
-                            borderRadius: 8,
-                            padding: "6px 14px",
-                            fontWeight: 600,
-                            fontSize: 12,
-                            cursor: saveState === "saving" ? "wait" : "pointer",
-                            background: saveState === "error" ? "#7f1d1d" : "#0f766e",
-                            color: "#e2e8f0",
+                            display: "flex",
+                            gap: 8,
                         }}
                     >
-                        {saveState === "saving"
-                            ? "保存中…"
-                            : saveState === "saved"
-                              ? "已保存 ✓"
-                              : saveState === "error"
-                                ? "保存失败，点击重试"
-                                : "保存到项目"}
-                    </button>
+                        {projectId && (
+                            <>
+                                <button
+                                    onClick={() => void handleExportCode()}
+                                    disabled={exportState === "busy"}
+                                    style={{
+                                        border: "1px solid #1f2a2f",
+                                        borderRadius: 8,
+                                        padding: "6px 14px",
+                                        fontWeight: 600,
+                                        fontSize: 12,
+                                        cursor: exportState === "busy" ? "wait" : "pointer",
+                                        background: exportState === "error" ? "#7f1d1d" : "#1e293b",
+                                        color: "#e2e8f0",
+                                    }}
+                                >
+                                    {exportState === "busy"
+                                        ? "导出中…"
+                                        : exportState === "error"
+                                          ? "导出失败，点击重试"
+                                          : "导出代码"}
+                                </button>
+                                <button
+                                    onClick={() => setShowRunPanel(v => !v)}
+                                    style={{
+                                        border: "1px solid #1f2a2f",
+                                        borderRadius: 8,
+                                        padding: "6px 14px",
+                                        fontWeight: 600,
+                                        fontSize: 12,
+                                        cursor: "pointer",
+                                        background: showRunPanel ? "#6d28d9" : "#7c3aed",
+                                        color: "#e2e8f0",
+                                    }}
+                                >
+                                    运行训练
+                                </button>
+                            </>
+                        )}
+                        <button
+                            onClick={handleSaveGraph}
+                            disabled={saveState === "saving"}
+                            style={{
+                                border: "1px solid #1f2a2f",
+                                borderRadius: 8,
+                                padding: "6px 14px",
+                                fontWeight: 600,
+                                fontSize: 12,
+                                cursor: saveState === "saving" ? "wait" : "pointer",
+                                background: saveState === "error" ? "#7f1d1d" : "#0f766e",
+                                color: "#e2e8f0",
+                            }}
+                        >
+                            {saveState === "saving"
+                                ? "保存中…"
+                                : saveState === "saved"
+                                  ? "已保存 ✓"
+                                  : saveState === "error"
+                                    ? "保存失败，点击重试"
+                                    : "保存到项目"}
+                        </button>
+                    </div>
+                )}
+
+                {projectId && onSave && showRunPanel && (
+                    <NetworkRunPanel
+                        projectId={projectId}
+                        saveGraph={async () => {
+                            if (onSave) await onSave(buildGraphIR(nodes, edges));
+                        }}
+                        onClose={() => setShowRunPanel(false)}
+                    />
                 )}
 
                 {/* Panels & Overlays */}
@@ -507,10 +595,10 @@ function FlowContent({ initialGraph, onSave }: FlowEditorProps) {
     );
 }
 
-export default function Flow({ initialGraph, onSave }: FlowEditorProps) {
+export default function Flow({ initialGraph, onSave, projectId }: FlowEditorProps) {
     return (
         <ReactFlowProvider>
-            <FlowContent initialGraph={initialGraph} onSave={onSave} />
+            <FlowContent initialGraph={initialGraph} onSave={onSave} projectId={projectId} />
         </ReactFlowProvider>
     );
 }

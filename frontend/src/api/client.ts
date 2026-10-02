@@ -332,3 +332,58 @@ export const postVisualize = (projectId: string, chart: string) =>
 
 /** 图表文件在新标签页打开的地址（经后端图表文件服务端点转发）。 */
 export const figureUrl = (projectId: string, chart: string) => `${API_BASE}/api/projects/${projectId}/figures/${chart}`;
+
+// ---------------------------------------------------------------------------
+// 画布网络（阶段4 4c，模块详细设计 7.5）
+// ---------------------------------------------------------------------------
+
+export interface NetworkRunOptions {
+    parent_project_id: string | null;
+    parent_name: string | null;
+    environments: Array<{ project_id: string; name: string; python: string }>;
+    datasets: Array<{ dataset_id: string; name: string | null; task_type: string | null; local_path: string | null }>;
+}
+
+export interface NetworkRunRecord {
+    run_id: string;
+    project_id: string;
+    task_id: string | null;
+    run_type: string;
+    environment: string | null;
+    params: string | null;
+    command: string | null;
+    status: string;
+    metrics: string | null;
+    error: string | null;
+    artifact_path: string | null;
+    log_path: string | null;
+    started_at: string;
+    finished_at: string | null;
+    duration_s: number | null;
+    schema_version: string;
+}
+
+/** 画布再生成代码（与训练共用后端引擎，导出即所训）。 */
+export const exportNetwork = (projectId: string) =>
+    request<{ code: string }>(`/api/networks/${projectId}/export`);
+
+export const getNetworkRunOptions = (projectId: string) =>
+    request<NetworkRunOptions>(`/api/networks/${projectId}/run-options`);
+
+export const listNetworkRuns = (projectId: string) =>
+    request<NetworkRunRecord[]>(`/api/networks/${projectId}/runs`);
+
+export const postNetworkRun = (
+    projectId: string,
+    body: {
+        dataset_id: string;
+        environment_project_id?: string | null;
+        epochs: number;
+        batch_size: number;
+        learning_rate: number;
+    },
+) =>
+    request<{ task_id: string; status: string }>(`/api/networks/${projectId}/run`, {
+        method: "POST",
+        body: JSON.stringify(body),
+    });

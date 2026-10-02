@@ -100,11 +100,11 @@ export default function CanvasProjectView({ projectId, onBack }: CanvasProjectVi
                     <span style={{ color: "#64748b", fontFamily: "monospace", fontWeight: 400, marginLeft: 8 }}>{projectId}</span>
                 </span>
                 <span style={{ color: "#94a3b8", fontSize: 11 }}>
-                    节点参数可直接编辑，改动点右上「保存到项目」落盘（GraphIR 全量快照；版本树归阶段4）
+                    节点参数可直接编辑，改动点右上「保存到项目」落盘；「导出代码 / 运行训练」用后端同一引擎（导出即所训）
                 </span>
             </div>
             <div style={{ flex: 1, minHeight: 0, position: "relative" }}>
-                <FlowEditor key={projectId} initialGraph={graph} onSave={handleSave} />
+                <FlowEditor key={projectId} initialGraph={graph} onSave={handleSave} projectId={projectId} />
             </div>
         </div>
     );
