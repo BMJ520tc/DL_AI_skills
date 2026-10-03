@@ -28,3 +28,7 @@ dist/
 
 # 误建在仓库根的 numba JIT 缓存（shell 传入 NUMBA_CACHE_DIR 时反斜杠被吞，正确位置是 data/numba_cache）
 vs_wordDL-AI-skillsdatanumba_cache/
+
+# 数据交接包（scripts/export_data.py 的产物，不入库）
+data_export/
+data_export.zip
