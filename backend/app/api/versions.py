@@ -5,7 +5,7 @@
                                     参数差异表（节点参数逐项比对、增删节点/连线）
 - POST /api/versions/{id}/rollback  回退到目标版本（回退动作本身记为新提交）
 
-network_id 即结构化项目 project_id；守卫与 networks 路由同口径（403/404）。
+network_id 即结构化项目 project_id；守卫与 networks 路由同口径（400/404）。
 git 内部失败（RuntimeError）默认 500 并透出 detail——不静默。
 """
 from fastapi import APIRouter, HTTPException
@@ -21,9 +21,10 @@ class RollbackBody(BaseModel):
 
 
 def _error(e: Exception) -> HTTPException:
-    """项目查不到/版本不存在 404、类型不对 403、参数语义问题 400，统一映射。"""
+    """项目查不到/版本不存在 404、类型不对 400、参数语义问题 400，统一映射
+    （7.7-1：网络入口权限口径与 2.2 一致 = 400）。"""
     if isinstance(e, PermissionError):
-        return HTTPException(status_code=403, detail=str(e))
+        return HTTPException(status_code=400, detail=str(e))
     if isinstance(e, LookupError):
         return HTTPException(status_code=404, detail=str(e))
     return HTTPException(status_code=400, detail=str(e))

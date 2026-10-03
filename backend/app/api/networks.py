@@ -24,9 +24,9 @@ class RunBody(BaseModel):
 
 
 def _project_error(e: Exception) -> HTTPException:
-    """项目查不到 404 / 类型不对 403，统一映射。"""
+    """项目查不到 404 / 类型不对 400，统一映射（7.7-1：网络入口权限口径与 2.2 一致 = 400）。"""
     if isinstance(e, PermissionError):
-        return HTTPException(status_code=403, detail=str(e))
+        return HTTPException(status_code=400, detail=str(e))
     return HTTPException(status_code=404, detail=str(e))
 
 

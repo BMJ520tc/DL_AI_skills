@@ -2,7 +2,7 @@
 import { type Edge, type Node } from "@xyflow/react";
 import { type LayerDefinition, type LayerRegistry } from "../node_gen/BaseClass";
 import { createLayerComponent } from "../node_gen/CreateNodeComponent";
-import { sanitizeIdent, toPythonLiteral } from "../utils/codeCompile";
+import { moduleClassNameFor, sanitizeIdent, toPythonLiteral, toPythonString } from "../utils/codeCompile";
 import { getModule } from "../utils/moduleRegistry";
 //import type { LayerData, LayerDefinition } from "../node_gen/BaseClass";  //LayerData was unused
 import type { ModuleHandles } from "../utils/moduleRegistry";
@@ -203,7 +203,8 @@ export const ModuleRefNode: LayerDefinition<ModuleRefData> = {
         const module = getModule(data.moduleId);
         if (!module) return `# module ${name} (not found)`;
 
-        const moduleName = sanitizeIdent(module.name);
+        // 类名以代码生成器预扫描的解析表为准（重名模块带模块 id 后缀），保证与类定义一致
+        const moduleName = moduleClassNameFor(data.moduleId) ?? sanitizeIdent(module.name);
         const variableSchema = module.variableSchema || {};
 
         // Build parameter list for module instantiation
@@ -219,7 +220,7 @@ export const ModuleRefNode: LayerDefinition<ModuleRefData> = {
                 // Use the literal value from node data
                 // FieldSpec 的 text/select 取值是字符串，必须加引号（'string' 为历史写法，保留兼容）
                 if (type === 'string' || type === 'text' || type === 'select') {
-                    params.push(`${varName}="${value}"`);
+                    params.push(`${varName}=${toPythonString(value)}`);
                 } else if (type === 'boolean') {
                     params.push(`${varName}=${value ? "True" : "False"}`);
                 } else if (type === 'array' || type === 'dict') {

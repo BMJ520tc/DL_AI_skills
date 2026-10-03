@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 import pytest
 
@@ -238,11 +239,127 @@ def test_export_module_ref_and_edited_params_rejected(tmp_networks):
     assert "已固化" in r.json()["detail"]
 
 
+def test_export_binds_multi_input_by_handle(tmp_networks):
+    """不对称算子按 targetHandle 绑定输入，不随边数组顺序颠倒（复核 D1）。
+
+    边数组顺序与句柄顺序相反时，sub 的 forward 仍必须是 «in-0 的值 - in-1 的值»。
+    """
+    client, _ = tmp_networks
+    project_id = _create_structured(client, None)
+    body = {
+        "nodes": [
+            {"id": "a", "type": "linear_layer", "data": {"in_features": 4, "out_features": 4}},
+            {"id": "b", "type": "linear_layer", "data": {"in_features": 4, "out_features": 4}},
+            {"id": "s", "type": "sub_layer", "data": {}},
+        ],
+        # in-1 的边排在 in-0 之前——按数组序绑定会算成 out_b - out_a
+        "edges": [
+            {"id": "eb", "source": "b", "target": "s", "targetHandle": "in-1",
+             "data": {"label": "out_b"}},
+            {"id": "ea", "source": "a", "target": "s", "targetHandle": "in-0",
+             "data": {"label": "out_a"}},
+        ],
+    }
+    assert client.put(f"/api/projects/{project_id}/graph", json=body).status_code == 200
+    code = client.get(f"/api/networks/{project_id}/export").json()["code"]
+    assert "out_a - out_b" in code, code
+    assert "out_b - out_a" not in code
+
+
+def test_export_no_undefined_vars_for_handleless_edges(tmp_networks):
+    """边缺 sourceHandle（旧图/导入图）时，生产者与消费者取名必须一致（复核 D3）。
+
+    有声明源句柄的节点若凭空造名（`out_<id>_<handle>`），消费侧却按 label/边 id 取名，
+    导出的 forward 会引用未定义变量——两端逐字节一致也照样跑不起来。
+    """
+    client, _ = tmp_networks
+    project_id = _create_structured(client, None)
+    body = {
+        "nodes": [
+            {"id": "a", "type": "input_layer", "data": {}},
+            {"id": "u", "type": "upsample_layer", "data": {"mode": "bilinear", "scale": 2}},
+        ],
+        # 无 sourceHandle 的边（历史/导入图口径）
+        "edges": [
+            {"id": "e1", "source": "a", "target": "u", "targetHandle": "in-0",
+             "data": {"label": "out_a"}},
+        ],
+    }
+    assert client.put(f"/api/projects/{project_id}/graph", json=body).status_code == 200
+    code = client.get(f"/api/networks/{project_id}/export").json()["code"]
+
+    assigned = {
+        line.strip().split("=")[0].strip()
+        for line in code.splitlines()
+        if "=" in line and not line.strip().startswith(("#", "def "))
+        and " " not in line.strip().split("=")[0].strip()
+    }
+    used = set(re.findall(r"\bout_[A-Za-z0-9_]+\b", code))
+    assert used - assigned == set(), f"未定义引用：{used - assigned}\n{code}"
+
+
+def test_export_isolates_duplicate_module_class_names(tmp_networks):
+    """两个模块内联出同名类时给第二个加模块键后缀，避免遮蔽（复核 D2）。
+
+    模块四按 `Decomp_<根节点 id>` 命名，不同模块根 id 相同时会撞名；撞名会让两个引用
+    实例化同一个类（模型错）。
+    """
+    client, tmp_path = tmp_networks
+    project_id = _create_structured(client, None)
+    _record_module_ref(tmp_path)  # mod_ref_0001:v1，根类 ModRef
+
+    # 第二个模块：不同 id、**同样的类名**
+    from app.services import knowledge_service as ks
+
+    pkg = tmp_path / "mod_ref_0002"
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / "module.py").write_text(
+        "import torch.nn as nn\n"
+        "class ModRef(nn.Module):\n"
+        "    def __init__(self):\n"
+        "        super().__init__()\n"
+        "        self.fc = nn.Linear(8, 2)\n"
+        "    def forward(self, x):\n"
+        "        return self.fc(x)\n",
+        encoding="utf-8",
+    )
+    ks.record_module({
+        "module_id": "mod_ref_0002", "module_version": "v1", "name": "ModRef",
+        "description": None, "source_project_id": None, "source_paper_id": None,
+        "task_type": None, "input_spec": None, "output_spec": None,
+        "params_schema": None, "tags": None, "verification": None,
+        "saved_module_compat": json.dumps({
+            "id": "mod_ref_0002:v1", "name": "ModRef", "version": "v1",
+            "handles": {"inputs": ["in"], "outputs": ["out"]},
+            "graph": {"nodes": [], "edges": []},
+        }),
+        "path": str(pkg),
+    })
+
+    body = {
+        "nodes": [
+            {"id": "m1", "type": "module_ref", "data": {
+                "moduleId": "mod_ref_0001:v1", "handles": {"inputs": ["in"], "outputs": ["out"]}}},
+            {"id": "m2", "type": "module_ref", "data": {
+                "moduleId": "mod_ref_0002:v1", "handles": {"inputs": ["in"], "outputs": ["out"]}}},
+        ],
+        "edges": [],
+    }
+    assert client.put(f"/api/projects/{project_id}/graph", json=body).status_code == 200
+    code = client.get(f"/api/networks/{project_id}/export").json()["code"]
+
+    # 第一个保持原名；第二个带模块键后缀，两处实例化引用的类名不相同
+    assert code.count("class ModRef(nn.Module):") == 1
+    assert "class ModRef_mod_ref_0002_v1(nn.Module):" in code, code
+    assert "self.m1_layer = ModRef()" in code
+    assert "self.m2_layer = ModRef_mod_ref_0002_v1()" in code
+
+
 def test_export_rejects_non_network_projects(tmp_networks):
-    """画布网络接口只接受结构化项目：original 403、不存在 404。"""
+    """画布网络接口只接受结构化项目：original 400（7.7-1 与 2.2 同口径）、不存在 404。"""
     client, _ = tmp_networks
     original_id = _create_original(client)
-    assert client.get(f"/api/networks/{original_id}/export").status_code == 403
+    assert client.get(f"/api/networks/{original_id}/export").status_code == 400
     assert client.get("/api/networks/not-exist/export").status_code == 404
 
 
@@ -314,6 +431,19 @@ def test_run_options_lists_envs_and_datasets(tmp_networks):
     assert opts["parent_project_id"] == original_id
     assert [e["project_id"] for e in opts["environments"]] == [original_id]
     assert [d["dataset_id"] for d in opts["datasets"]] == [dataset_id]
+
+    # 只有本地文件、没有 preprocessed.csv 的数据集不进面板（7.5「有预处理产物的注册条目」）
+    from app.services import knowledge_service as ks
+
+    bare = tmp_path / "ds_bare"
+    bare.mkdir(exist_ok=True)
+    (bare / "raw.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    ks.register_dataset({
+        "dataset_id": "ds_bare", "name": "bare", "task_type": "tabular",
+        "local_path": str(bare / "raw.csv"),
+    })
+    opts2 = client.get(f"/api/networks/{project_id}/run-options").json()
+    assert [d["dataset_id"] for d in opts2["datasets"]] == [dataset_id]
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +517,8 @@ def test_train_orchestration_writes_run_record(tmp_networks, monkeypatch):
 
 
 def test_train_task_endpoint_and_failure_path(tmp_networks, monkeypatch):
-    """POST run 建任务入队；训练脚本失败 → 任务 failed、不写成功 run_record。"""
+    """POST run 建任务入队；训练脚本失败 → 任务 failed、不写成功 run_record，
+    但**落一条 failed 记录可检索**（《知识库与数据设计》五.2「报错只写 run_record」）。"""
     client, tmp_path = tmp_networks
     original_id = _create_original(client)
     project_id = _create_structured(client, original_id)
@@ -429,4 +560,12 @@ def test_train_task_endpoint_and_failure_path(tmp_networks, monkeypatch):
     }
     with pytest.raises(RuntimeError, match="退出码 1"):
         asyncio.run(network_service._run_train(params, task_id))
+    # 成功记录不产生（/runs 只列 success）；失败记录可检索（五.2）。
+    # 注：POST run 入队后后台 worker 可能也执行了一次同一任务，故按「至少一条且都属于本任务」断言。
     assert client.get(f"/api/networks/{project_id}/runs").json() == []
+    from app.services import knowledge_service as ks
+
+    failed = ks.list_runs(project_id, "train", status="failed")
+    assert failed, "训练失败应落一条可检索的 run_record"
+    assert all(r["task_id"] == task_id for r in failed), failed
+    assert all("退出码 1" in (r["error"] or "") for r in failed), failed

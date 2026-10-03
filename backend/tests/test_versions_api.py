@@ -397,7 +397,7 @@ def test_rollback_restores_graph_and_creates_new_commit(tmp_versions):
 
 
 # ---------------------------------------------------------------------------
-# 4d-2 守卫：版本 API 只服务结构化项目（403/404，与 networks 同口径）
+# 4d-2 守卫：版本 API 只服务结构化项目（400/404，与 networks 同口径、与 2.2 一致）
 # ---------------------------------------------------------------------------
 
 def test_version_api_guards(tmp_versions):
@@ -409,7 +409,7 @@ def test_version_api_guards(tmp_versions):
         ("post", f"/api/versions/{original_id}/rollback", {"json": {"target_version": "a"}}),
     ]:
         r = getattr(client, method)(url, **kwargs)
-        assert r.status_code == 403, r.text
+        assert r.status_code == 400, r.text
 
     r = client.get("/api/versions/nonexistent-project/tree")
     assert r.status_code == 404

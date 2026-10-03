@@ -41,6 +41,12 @@ function getInitialNodeData(type: string, targetModuleId?: string): Record<strin
                     case "select":
                         initialData[key] = spec.options?.[0] || "";
                         break;
+                    case "array":
+                        initialData[key] = [];
+                        break;
+                    case "dict":
+                        initialData[key] = {};
+                        break;
                 }
             }
         });
@@ -69,6 +75,12 @@ function getInitialNodeData(type: string, targetModuleId?: string): Record<strin
                                 break;
                             case "text":
                                 initialData[key] = "";
+                                break;
+                            case "array":
+                                initialData[key] = [];
+                                break;
+                            case "dict":
+                                initialData[key] = {};
                                 break;
                             default:
                                 initialData[key] = 0;

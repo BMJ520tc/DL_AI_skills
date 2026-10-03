@@ -23,19 +23,38 @@ export function sanitizeIdent(name: string): string {
     return safe;
 }
 
+/** Python 字符串字面量：JSON 转义是合法 Python 字符串字面量的子集，
+ *  正确处理引号 / 反斜杠 / 换行（直接拼 `"${value}"` 会生成非法代码）。 */
+export function toPythonString(value: unknown): string {
+    return JSON.stringify(String(value));
+}
+
 /** 值 → Python 字面量（嵌套 list/dict 递归；阶段4 4b 的 list/dict 参数导出用）。 */
 export function toPythonLiteral(value: unknown): string {
     if (value === null || value === undefined) return "None";
     if (typeof value === "boolean") return value ? "True" : "False";
-    if (typeof value === "string") return `"${value}"`;
+    if (typeof value === "string") return toPythonString(value);
     if (typeof value === "number") return Number.isFinite(value) ? `${value}` : "None";
     if (Array.isArray(value)) return `[${value.map(toPythonLiteral).join(", ")}]`;
     if (typeof value === "object") {
         return `{${Object.entries(value as Record<string, unknown>)
-            .map(([k, v]) => `"${k}": ${toPythonLiteral(v)}`)
+            .map(([k, v]) => `${toPythonString(k)}: ${toPythonLiteral(v)}`)
             .join(", ")}}`;
     }
     return "None";
+}
+
+/** 内联模块的类名解析表：`recursiveCodeGenerator` 预扫描后填入（模块重名时加模块 id 后缀）。
+ *  `ModuleRefNode.getInitCode` 用它取实际类名，保证类定义与实例化两处一致、不被同名类遮蔽。 */
+const moduleClassNames = new Map<string, string>();
+
+export function setModuleClassNames(names: Map<string, string>): void {
+    moduleClassNames.clear();
+    for (const [id, name] of names) moduleClassNames.set(id, name);
+}
+
+export function moduleClassNameFor(moduleId: string): string | undefined {
+    return moduleClassNames.get(moduleId);
 }
 
 export function getRootGraph(nodes: Node[], edges: Edge[]) {
@@ -103,6 +122,20 @@ export function recursiveCodeGenerator(nodes: Node[], edges: Edge[]): CodeGenRes
     let moduleName: string;
     let lineOffset: number = lines.length;
 
+    // 预扫描：给每个被引用的模块定一个不冲突的类名（模块重名 → 加模块 id 后缀）。
+    // 不做这一步时，两个同名模块会内联出两个同名类，后者遮蔽前者（两个引用实例化同一模型）。
+    const classNames = new Map<string, string>();
+    const usedNames = new Set<string>();
+    order.forEach(moduleId => {
+        if (moduleId === "0") return;
+        const saved = getModule(moduleId);
+        let name = saved ? sanitizeIdent(saved.name) : "unknownModule";
+        if (usedNames.has(name)) name = sanitizeIdent(`${name}_${sanitizeIdent(moduleId)}`);
+        usedNames.add(name);
+        classNames.set(moduleId, name);
+    });
+    setModuleClassNames(classNames);
+
     order.forEach(moduleId => {
         let savedModule: SavedModule | null = null;
         if (moduleId === "0") {
@@ -115,12 +148,12 @@ export function recursiveCodeGenerator(nodes: Node[], edges: Edge[]): CodeGenRes
             if (savedModule) {
                 moduleNodes = savedModule?.internalNodes || [];
                 moduleEdges = savedModule?.internalEdges || [];
-                moduleName = sanitizeIdent(savedModule.name);
+                moduleName = classNames.get(moduleId) ?? sanitizeIdent(savedModule.name);
             } else {
                 console.warn(`Module with ID ${moduleId} not found or contract missing.`);
                 moduleNodes = [];
                 moduleEdges = [];
-                moduleName = "unknownModule";
+                moduleName = classNames.get(moduleId) ?? "unknownModule";
             }
         }
         generatedCode.code += "\n\n\n";
@@ -206,6 +239,25 @@ export function compileGraphToScript(
         return sanitizeIdent(`${variablePrefix}${stable}`);
     };
 
+    /** 按 targetHandle 序号排序输入边（in-0 / in-1 / …），与后端 `_ordered_in_edges` 同口径。
+     *  不对称算子按位置消费输入，若沿用边数组顺序，句柄顺序与数组顺序不一致时操作数会颠倒。 */
+    const orderedInEdges = (edges: Edge[]): Edge[] => {
+        const seqOf = (handle: unknown): number | null => {
+            if (typeof handle !== "string") return null;
+            const matched = /(\d+)\s*$/.exec(handle);
+            return matched ? Number(matched[1]) : null;
+        };
+        return edges
+            .map((edge, idx) => ({ edge, idx, seq: seqOf(edge.targetHandle) }))
+            .sort((a, b) => {
+                if (a.seq !== null && b.seq !== null) return a.seq - b.seq || a.idx - b.idx;
+                if (a.seq !== null) return -1;
+                if (b.seq !== null) return 1;
+                return a.idx - b.idx;
+            })
+            .map(entry => entry.edge);
+    };
+
     const seedLines: { text: string; span?: Omit<CodeSpan, "line"> }[] = [];
     nodes
         .filter(n => (incomingEdges[n.id] ?? []).length === 0)
@@ -240,8 +292,13 @@ export function compileGraphToScript(
                     const targets = variableMap[varName];
                     for (const target of targets) {
                         if (target.nodeId === node.id) {
-                            // Replace the parameter with the variable name
-                            const paramRegex = new RegExp(`\\b${target.paramName}\\s*=\\s*[^,)]+`, 'g');
+                            // Replace the parameter value with the variable name.
+                            // 取值可能含逗号（数组/字典/带逗号的字符串），故不能简单用 [^,)]+：
+                            // 按「普通字符 | 引号串 | [...] | {...}」一轮一轮吃掉整个取值。
+                            const esc = target.paramName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                            const paramRegex = new RegExp(
+                                `\\b${esc}\\s*=\\s*(?:[^,()\\[\\]{}"']+|"[^"]*"|'[^']*'|\\[[^\\[\\]]*\\]|\\{[^{}]*\\})+`,
+                                'g');
                             line = line.replace(paramRegex, `${target.paramName}=${varName}`);
                         }
                     }
@@ -252,7 +309,7 @@ export function compileGraphToScript(
         }
         const shouldGenerateForward = !parentNode;
         if (shouldGenerateForward) {
-            const inEdges = incomingEdges[node.id];
+            const inEdges = orderedInEdges(incomingEdges[node.id]);
             const inputNames =
                 inEdges.length === 0 ? ["x"] : inEdges.map(e => edgeVarName(e));
 
@@ -260,10 +317,19 @@ export function compileGraphToScript(
             const handlesSpec =
                 typeof ClassRef.handles === "function" ? ClassRef.handles(node.data) : ClassRef.handles;
             const sourceHandles = handlesSpec?.sources && handlesSpec.sources.length ? handlesSpec.sources : [];
-            const outputNames = (sourceHandles || []).length
+            // 有声明源句柄的节点：先按 sourceHandle 认领出边；旧图/历史图的边可能没有
+            // sourceHandle，此时按顺序认领一条——否则会凭空造名，与消费侧（按 label/边 id
+            // 取名）对不上，导出的 forward 引用未定义变量（与后端 _forward_line 同口径）。
+            const pending = [...outEdges];
+            const outputNames = sourceHandles.length
                 ? sourceHandles.map((handleId, idx) => {
-                      const matching = outEdges.find(e => e.sourceHandle === handleId);
-                      return matching ? edgeVarName(matching) : sanitizeIdent(`out_${node.id}_${handleId ?? idx}`);
+                      let matchIdx = pending.findIndex(e => e.sourceHandle === handleId);
+                      if (matchIdx < 0 && pending.length) matchIdx = 0;
+                      if (matchIdx >= 0) {
+                          const [claimed] = pending.splice(matchIdx, 1);
+                          return edgeVarName(claimed);
+                      }
+                      return sanitizeIdent(`out_${node.id}_${handleId ?? idx}`);
                   })
                 : outEdges.length === 0
                   ? [sanitizeIdent(`out_${node.id}`)]
@@ -318,7 +384,7 @@ export function generateMainCode(
         if (value === undefined || value === null) return "None";
         const t = spec?.type;
         // text/select 与历史 string 同为字符串取值，一律加引号（4b-1 口径）
-        if (t === "string" || t === "text" || t === "select") return `"${value}"`;
+        if (t === "string" || t === "text" || t === "select") return toPythonString(value);
         if (t === "boolean") return value ? "True" : "False";
         if (t === "array" || t === "dict") return toPythonLiteral(value);
         return `${value}`;

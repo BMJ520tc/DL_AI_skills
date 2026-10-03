@@ -997,6 +997,16 @@ def _module_class_names(module_py: str) -> list[str]:
     return re.findall(r"^class\s+(\w+)\s*\(", module_py, flags=re.MULTILINE)
 
 
+def _rename_classes(module_py: str, mapping: dict[str, str]) -> str:
+    """按映射整体替换内联模块里的类名（词边界匹配，一次扫描，避免新旧名互相误伤）。"""
+    if not mapping:
+        return module_py
+    # 长名优先，避免 Decomp_a 抢掉 Decomp_ab 的匹配
+    names = sorted(mapping, key=len, reverse=True)
+    pattern = re.compile(r"\b(?:" + "|".join(re.escape(c) for c in names) + r")\b")
+    return pattern.sub(lambda m: mapping[m.group(0)], module_py)
+
+
 def _module_ref_block(ref: str, node_id: str, data: dict) -> tuple[str, str, str]:
     """解析模块引用 → (内联代码块, 实例化类名, 排重键)。
 
@@ -1035,12 +1045,18 @@ def _module_ref_block(ref: str, node_id: str, data: dict) -> tuple[str, str, str
     return module_py, classes[-1], f"{module_id}:{version}"
 
 
-def _module_ref_init(node_id: str, data: dict) -> str:
-    """module_ref 的 __init__ 行：实例化内联模块的根类（无参——参数已固化在模块内）。"""
+def _module_ref_init(node_id: str, data: dict,
+                     renames_by_key: dict[str, dict[str, str]] | None = None) -> str:
+    """module_ref 的 __init__ 行：实例化内联模块的根类（无参——参数已固化在模块内）。
+
+    类名冲突时 `generate()` 会给内联类加模块键后缀，这里按同一个映射取实际类名。
+    """
     ref = data.get("moduleId")
     if not ref:
         raise ExportError(f"模块节点 {node_id} 缺少 moduleId")
-    _, root_class, _ = _module_ref_block(str(ref), node_id, data)
+    _, root_class, key = _module_ref_block(str(ref), node_id, data)
+    if renames_by_key:
+        root_class = renames_by_key.get(key, {}).get(root_class, root_class)
     return f"self.{sanitize_ident(node_id)}_layer = {root_class}()"
 
 
@@ -1069,6 +1085,23 @@ def _handles_of(node_type: str, data: dict) -> dict:
     return spec["handles"] if spec else {"targets": ["in"], "sources": ["out"]}
 
 
+def _ordered_in_edges(in_edges: list[dict]) -> list[dict]:
+    """按 `targetHandle` 的序号排序输入边（in-0 / in-1 / …）。
+
+    不对称算子（sub/div/matmul/cross_entropy/accuracy/multihead）按**位置**消费输入；
+    若按边数组顺序绑定，用户接线的句柄顺序与数组顺序不一致时操作数会颠倒。
+    缺 `targetHandle` 的边（老图/无句柄）排在带序号的之后，彼此保持相对顺序。
+    """
+
+    def key(item: tuple[int, dict]) -> tuple[int, int, int]:
+        idx, edge = item
+        handle = edge.get("targetHandle")
+        matched = re.search(r"(\d+)\s*$", handle) if isinstance(handle, str) else None
+        return (0, int(matched.group(1)), idx) if matched else (1, idx, 0)
+
+    return [edge for _, edge in sorted(enumerate(in_edges), key=key)]
+
+
 def _forward_line(
     node_type: str,
     data: dict,
@@ -1079,20 +1112,26 @@ def _forward_line(
     node_output_map: dict[str, list[str]],
 ) -> str:
     """单个节点的 forward 行（含多句柄节点的输出变量命名，与前端一致）。"""
-    in_edges = incoming[nid]
+    in_edges = _ordered_in_edges(incoming[nid])
     input_names = [_edge_var_name(e) for e in in_edges] if in_edges else ["x"]
 
     out_edges = outgoing[nid]
     handles = _handles_of(node_type, data)
     source_handles = handles.get("sources") or []
     if source_handles:
+        # 先按 sourceHandle 认领出边；旧图/历史图的边可能没有 sourceHandle，此时按顺序
+        # 认领一条——否则会凭空造名，与消费侧（按 label/边 id 取名）对不上，导出的 forward
+        # 会引用未定义变量（与前端 compileGraphToScript 同口径）。
+        pending = list(out_edges)
         output_names = []
         for idx, hid in enumerate(source_handles):
-            matching = next((e for e in out_edges if e.get("sourceHandle") == hid), None)
-            output_names.append(
-                _edge_var_name(matching)
-                if matching else sanitize_ident(f"out_{nid}_{hid if hid is not None else idx}")
-            )
+            match_idx = next((i for i, e in enumerate(pending) if e.get("sourceHandle") == hid), -1)
+            if match_idx < 0 and pending:
+                match_idx = 0
+            if match_idx >= 0:
+                output_names.append(_edge_var_name(pending.pop(match_idx)))
+            else:
+                output_names.append(sanitize_ident(f"out_{nid}_{hid if hid is not None else idx}"))
     elif not out_edges:
         output_names = [sanitize_ident(f"out_{nid}")]
     else:
@@ -1106,9 +1145,13 @@ def _forward_line(
 
 
 def compile_graph(
-    nodes: list[dict], edges: list[dict]
+    nodes: list[dict], edges: list[dict],
+    class_renames: dict[str, dict[str, str]] | None = None,
 ) -> tuple[list[str], list[str], str]:
-    """把一张图画布编译为 (init 行, forward 行, 返回变量)。"""
+    """把一张图画布编译为 (init 行, forward 行, 返回变量)。
+
+    `class_renames`：模块键 → {原类名: 重命名后的类名}，用于内联类同名冲突时的实例化对齐。
+    """
     if not nodes:
         return [], [], "x"
 
@@ -1169,7 +1212,7 @@ def compile_graph(
             )
 
         if node_type == "module_ref":
-            init_lines.append(f"        {_module_ref_init(nid, data)}")
+            init_lines.append(f"        {_module_ref_init(nid, data, class_renames)}")
             forward_lines.append(
                 _forward_line(node_type, data, nid, layer_name, incoming, outgoing, node_output_map)
             )
@@ -1213,9 +1256,13 @@ def generate(graph: dict) -> str:
     if not isinstance(nodes, list) or not isinstance(edges, list):
         raise ExportError("非法 GraphIR：需含 nodes/edges 数组")
 
-    # 先收集模块内联块（排重、保持引用顺序），失败即整体拒绝
+    # 先收集模块内联块（排重、保持引用顺序），失败即整体拒绝。
+    # 不同模块的内联类可能同名（模块四按 `Decomp_<节点 id>` 命名，根节点 id 常相同）——
+    # 同名类会后者遮蔽前者、两个引用实例化同一个模型，故冲突时给该类名加模块键后缀。
     module_blocks: list[str] = []
     seen: set[str] = set()
+    used_classes: set[str] = set()
+    class_renames: dict[str, dict[str, str]] = {}
     for n in nodes:
         if n.get("type") != "module_ref":
             continue
@@ -1224,11 +1271,19 @@ def generate(graph: dict) -> str:
         if not ref:
             raise ExportError(f"模块节点 {n.get('id')} 缺少 moduleId")
         block, _, key = _module_ref_block(str(ref), n.get("id", "?"), data)
-        if key not in seen:
-            seen.add(key)
-            module_blocks.append(block)
+        if key in seen:
+            continue
+        seen.add(key)
+        classes = _module_class_names(block)
+        if any(c in used_classes for c in classes):
+            mapping = {c: sanitize_ident(f"{c}_{sanitize_ident(key)}") for c in classes}
+            block = _rename_classes(block, mapping)
+            classes = [mapping[c] for c in classes]
+            class_renames[key] = mapping
+        used_classes.update(classes)
+        module_blocks.append(block)
 
-    init_lines, forward_lines, return_var = compile_graph(nodes, edges)
+    init_lines, forward_lines, return_var = compile_graph(nodes, edges, class_renames)
 
     main_lines = [
         f"class {MAIN_CLASS}(nn.Module):",

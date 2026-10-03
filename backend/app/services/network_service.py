@@ -91,7 +91,9 @@ def run_options(project_id: str) -> dict:
     datasets: list[dict] = []
     for ds in knowledge_service.find_datasets(limit=200):
         local = ds.get("local_path")
-        if local and Path(local).exists():
+        # 只列「可训练」的条目：与 start_run 同口径（7.5「有预处理产物的注册条目」），
+        # 否则面板会列出跑不了的数据集、点了才 400
+        if local and (Path(local).parent / "preprocessed.csv").exists():
             datasets.append({
                 "dataset_id": ds.get("dataset_id"),
                 "name": ds.get("name"),
@@ -158,6 +160,41 @@ def start_run(project_id: str, body: dict) -> str:
 
 
 async def _run_train(params: dict, task_id: str) -> None:
+    """network_train 任务入口：失败也落一条 run_record(status=failed)。
+
+    《知识库与数据设计》五.2：每次实际执行都落一条运行记录，**结果与报错只写 run_record**——
+    故训练失败必须可检索（与模块四验证任务同口径）。记录后原样抛出，任务状态由 task_manager 置 failed。
+    """
+    ctx: dict = {}
+    try:
+        await _do_train(params, task_id, ctx)
+    except Exception as exc:  # noqa: BLE001 —— 记失败记录后再抛出，不改变任务结果
+        try:
+            knowledge_service.record_run({
+                "project_id": params.get("project_id"),
+                "task_id": task_id,
+                "run_type": "train",
+                "environment": ctx.get("environment"),
+                "params": {
+                    "dataset_id": params.get("dataset_id"),
+                    "epochs": params.get("epochs"),
+                    "batch_size": params.get("batch_size"),
+                    "learning_rate": params.get("learning_rate"),
+                },
+                "command": ctx.get("command"),
+                "status": "failed",
+                "error": str(exc)[-2000:],
+                "log_path": ctx.get("log_path"),
+                "started_at": ctx.get("started_at") or _now(),
+                "finished_at": _now(),
+            })
+        except Exception:  # noqa: BLE001 —— 失败记录的写入失败不得掩盖原异常
+            logger.exception("训练失败记录落库失败 project_id=%s task_id=%s",
+                             params.get("project_id"), task_id)
+        raise
+
+
+async def _do_train(params: dict, task_id: str, ctx: dict) -> None:
     """network_train 任务：导出 → 落盘 → 项目环境执行 → 指标与运行记录落库。"""
     project_id = params["project_id"]
     project = project_manager.get_project(project_id)
@@ -165,6 +202,7 @@ async def _run_train(params: dict, task_id: str) -> None:
         raise RuntimeError(f"network {project_id} not found")
     ws = _ws(project)
     started = _now()
+    ctx["started_at"] = started
 
     task_manager.update_progress(task_id, {"stage": "导出代码"})
     code = network_export.generate(_graph(project))
@@ -202,6 +240,9 @@ async def _run_train(params: dict, task_id: str) -> None:
         f"{params['learning_rate']:g}", str(out_json),
     ]
     task_manager.update_progress(task_id, {"stage": "训练中", "command": " ".join(cmd)})
+    ctx["command"] = " ".join(cmd)
+    ctx["log_path"] = str(log_path)
+    ctx["environment"] = {"python": python, "environment_project_id": env_project_id}
     rc, output = await proc_util.run_command(cmd, cwd=str(run_dir), timeout=TRAIN_TIMEOUT_S)
     log_path.write_text(output, encoding="utf-8", errors="replace")
     if rc != 0:

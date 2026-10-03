@@ -15,6 +15,7 @@ Flatten / Softmax / 位置编码 / Linear），比单测里的 Linear→ReLU→L
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -78,7 +79,26 @@ def _backend_code(graph: dict) -> bytes:
     return network_export.generate(graph).encode("utf-8")
 
 
+def _undefined_node_refs(code: str) -> list[str]:
+    """代码里引用到、但没有被赋值过的节点输出变量（`out_*`）。
+
+    逐字节一致只保证两端相同，**不保证代码可运行**——曾出现「有声明源句柄的节点遇到
+    无 sourceHandle 的旧边时凭空造名」的缺陷：两端一字不差，却引用未定义变量。
+    """
+    assigned: set[str] = set()
+    for line in code.splitlines():
+        stripped = line.strip()
+        if "=" not in stripped or stripped.startswith("#") or stripped.startswith("def "):
+            continue
+        lhs = stripped.split("=")[0].strip()
+        if " " not in lhs and lhs:
+            assigned.add(lhs)
+    used = set(re.findall(r"\bout_[A-Za-z0-9_]+\b", code))
+    return sorted(v for v in used - assigned if not v.startswith(("out_features", "out_channels")))
+
+
 def main() -> int:
+
     argv = sys.argv[1:]
     graph_path = None
     if "--graph" in argv:
@@ -91,6 +111,11 @@ def main() -> int:
 
     if front == back:
         print(f"[PASS] 导出两端逐字节一致（{len(back)} 字节，节点数 {len(graph['nodes'])}）")
+        undef = _undefined_node_refs(back.decode("utf-8", "replace"))
+        if undef:
+            print(f"[FAIL] 导出的代码引用了未定义的节点输出变量：{undef}")
+            return 1
+        print("[PASS] 导出代码无未定义节点输出变量")
         return 0
 
     print(f"[FAIL] 导出两端不一致：前端 {len(front)} 字节 / 后端 {len(back)} 字节")
