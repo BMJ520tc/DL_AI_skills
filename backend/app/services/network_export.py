@@ -5,7 +5,7 @@
 - 标准节点：语义忠实移植前端 `codeCompile.ts` 的 `compileGraphToScript` +
   `generateMainCode`（同一套连线变量命名、拓扑序、init/forward 行格式），
   节点代码模板见 `NODE_TABLE`（与前端各节点 getInitCode/getForwardCode 对应）。
-- module_ref 节点：内联模块包的 `module.py`（模块四再生成代码，构造参数已固化），
+- module_ref 节点：内联模块包的代码文件（`module.py`；v4 之前的历史包为 `model.py`，两者都探测），
   实例化无参调用；画布上改过固化的参数则拒绝导出（不静默丢弃用户修改）。
 - 前端画布导出与训练运行共用本引擎——导出即所训，两端一致。
 
@@ -1021,14 +1021,23 @@ def _module_ref_block(ref: str, node_id: str, data: dict) -> tuple[str, str, str
     row = knowledge_service.get_module(module_id, version)
     if row is None:
         raise ExportError(f"模块节点 {node_id} 引用的模块 {ref} 在模块库中不存在（可能已删除）")
-    pkg = Path(row["path"]) if row.get("path") else None
-    module_py_path = pkg / "module.py" if pkg else None
-    if module_py_path is None or not module_py_path.exists():
-        raise ExportError(f"模块 {ref} 的代码文件 module.py 缺失（{row.get('path')}）")
-    module_py = module_py_path.read_text(encoding="utf-8").strip()
+    # 兼容历史包：早期记录把 path 记成了 module.json 的**文件**路径（R11 修复前的产物），
+    # 代码文件名也曾在 v4 才由 model.py 改名为 module.py——两者都按包目录探测，不因版本老而拒绝。
+    raw_path = row.get("path")
+    pkg = Path(raw_path) if raw_path else None
+    if pkg is not None and pkg.is_file():
+        pkg = pkg.parent
+    code_path = next(
+        (pkg / name for name in ("module.py", "model.py") if pkg and (pkg / name).exists()),
+        None,
+    )
+    if code_path is None:
+        raise ExportError(
+            f"模块 {ref} 的代码文件缺失（包目录下既没有 module.py 也没有 model.py，path={raw_path}）")
+    module_py = code_path.read_text(encoding="utf-8").strip()
     classes = _module_class_names(module_py)
     if not classes:
-        raise ExportError(f"模块 {ref} 的 module.py 中没有类定义，无法内联")
+        raise ExportError(f"模块 {ref} 的 {code_path.name} 中没有类定义，无法内联")
 
     # 画布上若改过固化参数：不静默丢弃修改，拒绝导出并说明原因
     schema = json.loads(row.get("params_schema") or "{}")

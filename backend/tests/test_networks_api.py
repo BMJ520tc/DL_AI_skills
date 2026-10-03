@@ -355,6 +355,56 @@ def test_export_isolates_duplicate_module_class_names(tmp_networks):
     assert "self.m2_layer = ModRef_mod_ref_0002_v1()" in code
 
 
+def test_export_accepts_legacy_module_package(tmp_networks):
+    """历史模块包（v4 前）也能内联：代码文件名是 `model.py`，且 `path` 记成了 module.json 的**文件**路径。
+
+    画布上引用这类老版本不能让导出直接 400（阶段3 早期产物 ↔ 阶段4 消费的兼容）。
+    """
+    client, tmp_path = tmp_networks
+    project_id = _create_structured(client, None)
+
+    from app.services import knowledge_service as ks
+
+    pkg = tmp_path / "mod_legacy_0001"
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / "model.py").write_text(
+        "import torch.nn as nn\n"
+        "class LegacyNet(nn.Module):\n"
+        "    def __init__(self):\n"
+        "        super().__init__()\n"
+        "        self.fc = nn.Linear(4, 2)\n"
+        "    def forward(self, x):\n"
+        "        return self.fc(x)\n",
+        encoding="utf-8",
+    )
+    (pkg / "module.json").write_text(
+        json.dumps({"module_id": "mod_legacy_0001"}), encoding="utf-8")
+    ks.record_module({
+        "module_id": "mod_legacy_0001", "module_version": "v1", "name": "LegacyNet",
+        "description": None, "source_project_id": None, "source_paper_id": None,
+        "task_type": None, "input_spec": None, "output_spec": None,
+        "params_schema": None, "tags": None, "verification": None,
+        "saved_module_compat": json.dumps({
+            "id": "mod_legacy_0001:v1", "name": "LegacyNet", "version": "v1",
+            "handles": {"inputs": ["in"], "outputs": ["out"]},
+            "graph": {"nodes": [], "edges": []},
+        }),
+        "path": str(pkg / "module.json"),  # 旧记录口径：文件路径而非包目录
+    })
+
+    body = {
+        "nodes": [{"id": "m1", "type": "module_ref", "data": {
+            "moduleId": "mod_legacy_0001:v1", "handles": {"inputs": ["in"], "outputs": ["out"]}}}],
+        "edges": [],
+    }
+    assert client.put(f"/api/projects/{project_id}/graph", json=body).status_code == 200
+    r = client.get(f"/api/networks/{project_id}/export")
+    assert r.status_code == 200, r.text
+    code = r.json()["code"]
+    assert "class LegacyNet(nn.Module):" in code
+    assert "self.m1_layer = LegacyNet()" in code
+
+
 def test_export_rejects_non_network_projects(tmp_networks):
     """画布网络接口只接受结构化项目：original 400（7.7-1 与 2.2 同口径）、不存在 404。"""
     client, _ = tmp_networks

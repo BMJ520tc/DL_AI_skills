@@ -10,7 +10,7 @@
 #      画布变 3 节点 → 保存 → 树上出现新版本（共 5 个，回退本身也是新版本）。
 #
 # 用法（需已执行 `npm run build`）：
-#   backend/.venv/Scripts/python.exe scripts/ui_check_4d2.py
+#   D:\python.exe scripts/ui_check_4d2.py
 
 from __future__ import annotations
 

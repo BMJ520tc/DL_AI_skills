@@ -14,8 +14,8 @@
 #      - 「先使用」面板：数据集下拉含种子数据集、四个操作按钮齐备；
 #      - 全程收集浏览器 console 错误，非 favicon 类错误即判失败。
 #
-# 用法（需已执行 `npm run build` 且有 backend/.venv）：
-#   backend/.venv/Scripts/python.exe scripts/ui_check_4a.py
+# 用法（需已执行 `npm run build`）：
+#   D:\python.exe scripts/ui_check_4a.py
 
 from __future__ import annotations
 

@@ -10,8 +10,8 @@
 #      仍在、后端模块不出现、控制台无应用异常。
 #   C. 后端完全停机：项目列表显示「后端连接失败」横幅（可见降级、不崩溃）。
 #
-# 用法（需已执行 `npm run build` 且有 backend/.venv）：
-#   backend/.venv/Scripts/python.exe scripts/ui_check_4b.py
+# 用法（需已执行 `npm run build`）：
+#   D:\python.exe scripts/ui_check_4b.py
 
 from __future__ import annotations
 

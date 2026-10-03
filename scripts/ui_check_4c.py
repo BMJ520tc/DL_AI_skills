@@ -8,8 +8,8 @@
 #   经目录联接挂为原始项目独立环境）→ 后台任务成功 → 面板显示指标 →
 #   run_record 新增 run_type=train 成功记录；控制台 0 应用错误。
 #
-# 用法（需已执行 `npm run build`、backend/.venv、且已建好 venv_smoke）：
-#   backend/.venv/Scripts/python.exe scripts/ui_check_4c.py
+# 用法（需已执行 `npm run build`、且已建好 venv_smoke）：
+#   D:\python.exe scripts/ui_check_4c.py
 
 from __future__ import annotations
 

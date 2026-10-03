@@ -169,6 +169,10 @@ async def _run_train(params: dict, task_id: str) -> None:
     try:
         await _do_train(params, task_id, ctx)
     except Exception as exc:  # noqa: BLE001 —— 记失败记录后再抛出，不改变任务结果
+        if ctx.get("recorded") == "success":
+            # 训练已成功并落库，之后的收尾步骤再抛错不该再写一条 failed（同一任务两条互相矛盾）
+            logger.exception("训练成功后收尾失败 project_id=%s task_id=%s", params.get("project_id"), task_id)
+            raise
         try:
             knowledge_service.record_run({
                 "project_id": params.get("project_id"),
@@ -274,6 +278,7 @@ async def _do_train(params: dict, task_id: str, ctx: dict) -> None:
         "started_at": started,
         "finished_at": _now(),
     })
+    ctx["recorded"] = "success"  # 成功后若再抛错，不再写一条自相矛盾的 failed 记录
     # 4d-1 运行即提交：指标摘要入 network_version.json；失败不连坐训练结果
     try:
         await asyncio.to_thread(version_service.commit_run, project_id, task_id, metrics)
