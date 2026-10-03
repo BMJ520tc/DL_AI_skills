@@ -71,6 +71,7 @@ D:\python.exe scripts/ui_check_4c.py
 D:\python.exe scripts/ui_check_4d2.py
 #   4c 会真实跑一次 CPU 训练（smoke 环境 data/_acceptance/venv_smoke，目录联接挂进临时项目），约 4 分钟；
 #   4d2 覆盖 M5 三条（版本树/对比/回退），无训练链路、不需要 venv_smoke
+#   venv_smoke 可自建（venv + 装 torch），也可 `mklink /J` 指向任一带 torch 的项目独立环境
 #   加 --headful 用**可见** Edge 窗口跑（人眼核），并把截图落到 data/_acceptance/shots/
 
 # M4/M5 脚本化验收（19/19 通过；严口径——用真实入库模块 + env_manager 真建环境，首跑含装 torch
