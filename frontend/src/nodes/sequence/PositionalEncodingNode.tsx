@@ -44,7 +44,7 @@ export class PositionalEncodingNode {
             "pe[0, :, 0::2] = torch.sin(position * div_term)",
             "pe[0, :, 1::2] = torch.cos(position * div_term)",
             out + " = " + x + " + pe"
-        ].join("\\n        ");
+        ].join("\n        ");
     }
 
     static Component = createLayerComponent<PosEncData>(PositionalEncodingNode.label, PositionalEncodingNode.paramSchema);

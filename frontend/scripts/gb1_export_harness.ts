@@ -10,6 +10,7 @@
  *       --outfile=<临时目录>/harness.cjs --log-level=warning
  *   node <临时目录>/harness.cjs --out exported_model.py              # 应用等价图（边带 label + sourceHandle）
  *   node <临时目录>/harness.cjs --out no_label.py --no-labels       # 健壮性图（无 label，模拟导入/历史图）
+ *   node <临时目录>/harness.cjs --out custom.py --graph <g.json>    # 吃一份存好的 GraphIR（导出两端比对用）
  */
 import fs from "node:fs";
 
@@ -22,29 +23,36 @@ const argv = process.argv.slice(2);
 const withLabels = !argv.includes("--no-labels");
 const outIndex = argv.indexOf("--out");
 const outPath = outIndex >= 0 ? argv[outIndex + 1] : null;
+const graphIndex = argv.indexOf("--graph");
+const graphPath = graphIndex >= 0 ? argv[graphIndex + 1] : null;
 
 // 固定图：Input → Linear(8→16) → ReLU → Linear(16→3)
-const rawNodes: Node[] = [
+const builtinNodes: Node[] = [
     { id: "in1", type: "input_layer", position: { x: 0, y: 0 }, data: {} },
     { id: "fc1", type: "linear_layer", position: { x: 200, y: 0 }, data: { in_features: 8, out_features: 16, bias: true } },
     { id: "act", type: "relu_layer", position: { x: 400, y: 0 }, data: {} },
     { id: "fc2", type: "linear_layer", position: { x: 600, y: 0 }, data: { in_features: 16, out_features: 3, bias: true } },
 ];
 
-const wires = [
+const builtinWires = [
     { id: "e1", source: "in1", target: "fc1" },
     { id: "e2", source: "fc1", target: "act" },
     { id: "e3", source: "act", target: "fc2" },
 ];
 
 // 与真实画布一致：连边带 sourceHandle，且 onConnect 会写 label = `out_<source>[_<sourceHandle>]`
-const edges: Edge[] = wires.map(w => ({
+const builtinEdges: Edge[] = builtinWires.map(w => ({
     ...w,
     type: "custom",
     sourceHandle: "out-0",
     targetHandle: "in-0",
     ...(withLabels ? { data: { label: `out_${w.source}` } } : {}),
 }));
+
+// --graph <file>：直接吃一份存好的 GraphIR（{nodes, edges}），供「导出两端逐字节比对」复用
+const loaded = graphPath ? JSON.parse(fs.readFileSync(graphPath, "utf8")) : null;
+const rawNodes: Node[] = loaded ? loaded.nodes : builtinNodes;
+const edges: Edge[] = loaded ? loaded.edges : builtinEdges;
 
 const result = recursiveCodeGenerator(rawNodes, edges);
 const code = result.code + "\n";

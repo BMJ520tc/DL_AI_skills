@@ -178,9 +178,10 @@ def version_tree(project_id: str) -> dict:
     with _lock_for(ws):
         if not (ws / ".git").exists():
             return {"current": None, "versions": []}
-        head = _run_git(ws, "rev-parse", "--short", "HEAD", check=False)
+        head = _run_git(ws, "rev-parse", "HEAD", check=False)
         if head.returncode != 0:
             return {"current": None, "versions": []}
+        current = head.stdout.strip()[:7]  # 与 versions[].short 同口径（--short 歧义时会加长）
         log = _run_git(ws, "log", "--format=%H%x09%P%x09%ct%x09%s").stdout.strip()
         versions = []
         for line in log.splitlines():
@@ -205,7 +206,7 @@ def version_tree(project_id: str) -> dict:
                     "rollback_to": version.get("rollback_to"),
                 },
             })
-        return {"current": head.stdout.strip(), "versions": versions}
+        return {"current": current, "versions": versions}
 
 
 # 参数差异只比 data 里的参数键：剔除展示/布局元数据与 __ 前缀的形状追踪元数据

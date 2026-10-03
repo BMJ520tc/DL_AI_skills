@@ -54,7 +54,11 @@ def create_project(body: ProjectCreate) -> dict:
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=f"加载失败: {e}")
 
-    response: dict = {"project_id": project_id, "status": "loading"}
+    # 结构化项目无异步加载流程，创建即就绪（4a）；original 项目由加载流程推进状态
+    response: dict = {
+        "project_id": project_id,
+        "status": "ready" if body.project_type == "structured" else "loading",
+    }
     if body.project_type == "structured":
         response.update({"version": version, "version_error": version_error})
     return response
@@ -86,6 +90,22 @@ def _graph_path(project: dict) -> Path:
     return Path(project["workspace_path"]) / "graph.json"
 
 
+def _validate_graph(body: dict) -> None:
+    """GraphIR 形态校验（7.7-8 守卫口径）：非法图拒绝在入口，避免落盘后在
+    导出/训练/对比时才抛 KeyError → 500。"""
+    nodes, edges = body.get("nodes"), body.get("edges")
+    if not isinstance(nodes, list) or not isinstance(edges, list):
+        raise HTTPException(status_code=400, detail="非法 GraphIR：需含 nodes/edges 数组")
+    for n in nodes:
+        if not isinstance(n, dict) or not isinstance(n.get("id"), str) \
+                or not isinstance(n.get("type"), str):
+            raise HTTPException(status_code=400, detail="非法 GraphIR：每个节点需为含 id/type 字符串的对象")
+    for e in edges:
+        if not isinstance(e, dict) or not isinstance(e.get("source"), str) \
+                or not isinstance(e.get("target"), str):
+            raise HTTPException(status_code=400, detail="非法 GraphIR：每条边需为含 source/target 字符串的对象")
+
+
 @router.get("/{project_id}/graph")
 def get_graph(project_id: str) -> dict:
     """结构化项目画布快照（GraphIR v2，模块四 6.5/7.1）。"""
@@ -105,8 +125,7 @@ def put_graph(project_id: str, body: dict) -> dict:
     错误透出在响应的 version_error 字段。
     """
     project = _require_structured(project_id)
-    if not isinstance(body.get("nodes"), list) or not isinstance(body.get("edges"), list):
-        raise HTTPException(status_code=400, detail="非法 GraphIR：需含 nodes/edges 数组")
+    _validate_graph(body)
     _graph_path(project).write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
     project_manager.update_status(project_id, "ready")
     try:

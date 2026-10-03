@@ -135,12 +135,74 @@ def test_export_standard_chain(tmp_networks):
     r = client.get(f"/api/networks/{project_id}/export")
     assert r.status_code == 200, r.text
     code = r.json()["code"]
-    assert "import torch" in code
-    assert "class GeneratedModel(nn.Module):" in code
-    assert "nn.Linear(in_features=4, out_features=8)" in code
-    assert "nn.ReLU()" in code
-    assert "out_n2_out_0 = self.n2_layer(out_n1)" in code
-    assert "return out_n3" in code
+    # 金标准整串比对（阶段4 4c「导出即所存即所训」；与前端生成器逐字节一致由
+    # scripts/export_parity.py 复核，见《模块详细设计》7.4）
+    assert code == (
+        "import torch\n"
+        "import torch.nn as nn\n"
+        "\n"
+        "\n"
+        "class GeneratedModel(nn.Module):\n"
+        "    def __init__(self):\n"
+        "        super().__init__()\n"
+        "        self.n1_layer = nn.Linear(in_features=4, out_features=8)\n"
+        "        self.n2_layer = nn.ReLU()\n"
+        "        self.n3_layer = nn.Linear(in_features=8, out_features=2, bias=False)\n"
+        "\n"
+        "    def forward(self, x):\n"
+        "        out_n1 = self.n1_layer(x)\n"
+        "        out_n2_out_0 = self.n2_layer(out_n1)\n"
+        "        out_n3 = self.n3_layer(out_n2_out_0)\n"
+        "        return out_n3\n"
+    )
+
+
+def test_export_positional_encoding_is_executable(tmp_networks):
+    """含位置编码层的导出代码必须可编译（阶段4：join 写死字面 '\\n' 会 SyntaxError）。"""
+    import py_compile
+
+    client, tmp_path = tmp_networks
+    project_id = _create_structured(client, None)
+    body = {
+        "nodes": [
+            {"id": "a", "type": "input_layer", "data": {}},
+            {"id": "b", "type": "positional_encoding_layer", "data": {"dim": 64}},
+        ],
+        "edges": [{"id": "e1", "source": "a", "target": "b", "targetHandle": "in-0",
+                   "data": {"label": "out_a"}}],
+    }
+    assert client.put(f"/api/projects/{project_id}/graph", json=body).status_code == 200
+    code = client.get(f"/api/networks/{project_id}/export").json()["code"]
+    p = tmp_path / "exported_model.py"
+    p.write_text(code, encoding="utf-8")
+    py_compile.compile(str(p), doraise=True)
+
+
+def test_put_graph_rejects_malformed_graph(tmp_networks):
+    """非法 GraphIR 在入口即 400（节点/边元素形态校验），不落盘、不留后续 500。"""
+    client, _ = tmp_networks
+    project_id = _create_structured(client, None)
+    cases = [
+        {"nodes": ["x"], "edges": []},                       # 节点非对象
+        {"nodes": [{"type": "relu_layer"}], "edges": []},     # 节点缺 id
+        {"nodes": [{"id": "a"}], "edges": []},                # 节点缺 type
+        {"nodes": [], "edges": [{"source": "a"}]},            # 边缺 target
+    ]
+    for body in cases:
+        r = client.put(f"/api/projects/{project_id}/graph", json=body)
+        assert r.status_code == 400, f"{body} -> {r.status_code}"
+    # 未落盘：仍是创建时的空图
+    assert client.get(f"/api/projects/{project_id}/graph").json() == {"nodes": [], "edges": []}
+
+
+def test_create_structured_project_is_ready(tmp_networks):
+    """画布新建结构化项目：创建即 ready（4a），响应与库内一致。"""
+    client, _ = tmp_networks
+    r = client.post("/api/projects", json={"project_type": "structured", "name": "新模型"})
+    assert r.status_code == 200, r.text
+    project_id = r.json()["project_id"]
+    assert r.json()["status"] == "ready"
+    assert client.get(f"/api/projects/{project_id}").json()["status"] == "ready"
 
 
 def test_export_module_ref_and_edited_params_rejected(tmp_networks):

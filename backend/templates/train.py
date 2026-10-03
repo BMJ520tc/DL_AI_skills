@@ -208,7 +208,9 @@ def main() -> None:
         last_loss = total / max(count, 1)
         print(f"[epoch {epoch}/{epochs}] loss={last_loss:.6f}")
 
-    metrics = eval_metrics(mode, model, x, y, batch_size, last_loss, num_classes)
+    xe = [x[i] for i in eval_idx]
+    ye = y[eval_idx]
+    metrics = eval_metrics(mode, model, xe, ye, batch_size, last_loss, num_classes)
     result = {
         "mode": mode,
         "classes": classes,

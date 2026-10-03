@@ -1,0 +1,111 @@
+"""导出两端逐字节比对（阶段4 4c「导出即所存即所训」的机器化复核）。
+
+《模块详细设计》7.4 声明「导出统一走后端再生成引擎……实测与前端 codeCompile 输出逐字节
+一致」；7.7-2 定「后端为唯一导出源」。本脚本把该声明变成**可复跑**的比对：用同一张存好的
+GraphIR，前端走真实生成器（`frontend/scripts/gb1_export_harness.ts`，esbuild 打包 + node），
+后端走 `app.services.network_export.generate`，再逐字节比较。
+
+内置图是一条覆盖多种标准节点的链（Linear / 激活 / Dropout / BatchNorm / Conv / Pool /
+Flatten / Softmax / 位置编码 / Linear），比单测里的 Linear→ReLU→Linear 覆盖更广。
+
+前置：node / npx 可用、frontend/node_modules 已安装。
+用法：D:\\python.exe scripts/export_parity.py            # 用内置图
+      D:\\python.exe scripts/export_parity.py --graph g.json   # 用指定 GraphIR（{nodes, edges}）
+"""
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+FRONTEND = REPO_ROOT / "frontend"
+HARNESS = FRONTEND / "scripts" / "gb1_export_harness.ts"
+
+
+def _builtin_graph() -> dict:
+    """覆盖多种标准节点的链；Linear 是唯一参数必填的节点，其余吃默认值。"""
+    chain = [
+        ("n1", "input_layer", {}),
+        ("n2", "linear_layer", {"in_features": 8, "out_features": 16, "bias": True}),
+        ("n3", "relu_layer", {}),
+        ("n4", "dropout_layer", {}),
+        ("n5", "batchnorm2d_layer", {}),
+        ("n6", "conv2d_layer", {}),
+        ("n7", "maxpool2d_layer", {}),
+        ("n8", "flatten_layer", {}),
+        ("n9", "sigmoid_layer", {}),
+        ("n10", "softmax_layer", {}),
+        ("n11", "positional_encoding_layer", {}),
+        ("n12", "linear_layer", {"in_features": 16, "out_features": 3, "bias": False}),
+    ]
+    nodes = [{"id": nid, "type": typ, "data": data} for nid, typ, data in chain]
+    edges = [
+        {"id": f"e{i}", "source": chain[i - 1][0], "target": chain[i][0],
+         "targetHandle": "in-0", "data": {"label": f"out_{chain[i - 1][0]}"}}
+        for i in range(1, len(chain))
+    ]
+    return {"nodes": nodes, "edges": edges}
+
+
+def _frontend_code(graph: dict, work: Path) -> bytes:
+    if shutil.which("npx") is None or shutil.which("node") is None:
+        raise SystemExit("跳过：本机缺 node/npx，无法跑前端生成器")
+    graph_path = work / "graph.json"
+    graph_path.write_text(json.dumps(graph, ensure_ascii=False), encoding="utf-8")
+    bundle = work / "harness.cjs"
+    out = work / "front.py"
+    # Windows 下 npx 是 .cmd，须经 shell 解析（无用户输入，路径均由本脚本生成）
+    subprocess.run(
+        ["npx", "esbuild", str(HARNESS), "--bundle", "--platform=node", "--format=cjs",
+         f"--outfile={bundle}", "--log-level=warning"],
+        cwd=str(FRONTEND), check=True, shell=True,
+    )
+    subprocess.run(
+        ["node", str(bundle), "--out", str(out), "--graph", str(graph_path)],
+        cwd=str(FRONTEND), check=True, shell=True,
+    )
+    return out.read_bytes()
+
+
+def _backend_code(graph: dict) -> bytes:
+    sys.path.insert(0, str(REPO_ROOT / "backend"))
+    from app.services import network_export
+
+    return network_export.generate(graph).encode("utf-8")
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    graph_path = None
+    if "--graph" in argv:
+        graph_path = Path(argv[argv.index("--graph") + 1])
+    graph = json.loads(graph_path.read_text(encoding="utf-8")) if graph_path else _builtin_graph()
+
+    with tempfile.TemporaryDirectory() as td:
+        front = _frontend_code(graph, Path(td))
+    back = _backend_code(graph)
+
+    if front == back:
+        print(f"[PASS] 导出两端逐字节一致（{len(back)} 字节，节点数 {len(graph['nodes'])}）")
+        return 0
+
+    print(f"[FAIL] 导出两端不一致：前端 {len(front)} 字节 / 后端 {len(back)} 字节")
+    fl = front.decode("utf-8", "replace").split("\n")
+    bl = back.decode("utf-8", "replace").split("\n")
+    for i in range(max(len(fl), len(bl))):
+        f = fl[i] if i < len(fl) else "<缺行>"
+        b = bl[i] if i < len(bl) else "<缺行>"
+        if f != b:
+            print(f"  首个差异 行{i + 1}:")
+            print(f"    前端: {f!r}")
+            print(f"    后端: {b!r}")
+            break
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

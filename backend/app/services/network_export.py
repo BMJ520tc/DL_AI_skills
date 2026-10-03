@@ -728,7 +728,7 @@ def _pos_enc_forward(data: dict, name: str, inputs: list[str], outputs: list[str
         "pe[0, :, 1::2] = torch.cos(position * div_term)",
         f"{out} = {x} + pe",
     ]
-    return "\\n        ".join(lines)
+    return "\n        ".join(lines)
 
 
 # ---- losses ----
@@ -1169,7 +1169,7 @@ def compile_graph(
             )
 
         if node_type == "module_ref":
-            init_lines.append(f"        self.{layer_name} = {_module_ref_init(nid, data)}")
+            init_lines.append(f"        {_module_ref_init(nid, data)}")
             forward_lines.append(
                 _forward_line(node_type, data, nid, layer_name, incoming, outgoing, node_output_map)
             )
