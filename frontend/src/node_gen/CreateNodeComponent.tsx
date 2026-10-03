@@ -57,11 +57,22 @@ export function createLayerComponent<D extends LayerData = LayerData>(
 
         const onChange = (key: string, type: FieldType) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
             const raw = e.target.value;
-            let newValue: string | number | boolean | undefined = raw;
+            let newValue: unknown = raw;
             if (type === "number") {
                 newValue = raw === "" ? undefined : parseFloat(raw);
             } else if (type === "boolean") {
                 newValue = (e.target as HTMLInputElement).checked;
+            } else if (type === "array" || type === "dict") {
+                // 控件只在 JSON 合法时提交（非法草稿留在控件本地态，不污染节点数据）
+                let parsed: unknown;
+                try {
+                    parsed = JSON.parse(raw);
+                } catch {
+                    return;
+                }
+                if (type === "array" && !Array.isArray(parsed)) return;
+                if (type === "dict" && (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))) return;
+                newValue = parsed;
             }
             setNodes(nodes =>
                 nodes.map(n => {

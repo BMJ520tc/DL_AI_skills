@@ -31,9 +31,8 @@ function toModuleSaveInput(
 }
 
 /** 后端 params_schema（{参数名: {type, default}}）→ 基底 FieldSpec 参数面板描述。
- *  可映射类型：bool→boolean、int→number(step 1)、float→number、str→text；
- *  list/dict/null 等没有对应的基底输入控件，不进参数面板——构造参数走模块
- *  再生成代码里的默认值（已知边界，见《模块详细设计》7.3 版本引用边界）。 */
+ *  可映射类型：bool→boolean、int→number(step 1)、float→number、str→text、
+ *  list→array、dict→dict（JSON 控件，阶段4 4b 补齐 list/dict）；null/未知类型不进面板。 */
 function paramsSchemaToVariableSchema(
     raw: string | null | undefined,
 ): Record<string, FieldSpec> | undefined {
@@ -80,7 +79,22 @@ function paramsSchemaToVariableSchema(
                     defaultValue: typeof defaultValue === "string" ? defaultValue : "",
                 };
                 break;
-            // list/dict/null/未知类型：跳过（见函数说明）。
+            case "list":
+                schema[name] = {
+                    type: "array",
+                    required: false,
+                    defaultValue: Array.isArray(defaultValue) ? defaultValue : [],
+                };
+                break;
+            case "dict":
+                schema[name] = {
+                    type: "dict",
+                    required: false,
+                    defaultValue: defaultValue && typeof defaultValue === "object"
+                        && !Array.isArray(defaultValue) ? defaultValue : {},
+                };
+                break;
+            // null/未知类型：跳过（见函数说明）。
         }
     }
     return Object.keys(schema).length ? schema : undefined;

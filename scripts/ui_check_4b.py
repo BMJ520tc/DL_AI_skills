@@ -4,7 +4,7 @@
 #   A. 后端有模块：模块库注入 → 侧边栏可见、与本地同名模块并存且后端条目带
 #      「后端模块库」徽标；损坏 saved_module_compat 的行静默跳过；真实拖拽后端
 #      模块进画布 → 参数面板由 params_schema 生成（bool/int/float/str 四类控件
-#      与默认值、list 不进面板、可选参数默认收起），改参数回写节点；localStorage
+#      与默认值、list 显示为 JSON 控件、可选参数默认收起），改参数回写节点；localStorage
 #      不被后端模块污染。
 #   B. 模块接口 500（其余接口正常，桩服务模拟）：重载后画布照常打开、本地模块
 #      仍在、后端模块不出现、控制台无应用异常。
@@ -513,8 +513,8 @@ def main() -> int:
             hidden = cdp.evaluate(
                 f"""(() => {{ const n = [...document.querySelectorAll('.react-flow__node')]
                     .find(x => x.innerText.includes({json.dumps(MODULE_NAME)}));
-                    return !!n && n.innerText.includes('+ 4 options'); }})()""")
-            check("参数面板默认收起（+ 4 options）", bool(hidden))
+                    return !!n && n.innerText.includes('+ 5 options'); }})()""")
+            check("参数面板默认收起（+ 5 options）", bool(hidden))
 
             # 点击节点头部展开
             nrect = cdp.evaluate(
@@ -556,14 +556,15 @@ def main() -> int:
                             dropout: get('dropout'),
                             use_bias: get('use_bias'),
                             act: get('act'),
-                            norm: node.innerText.includes('norm'),
+                            norm: get('norm'),
                         }};
                     }})())"""))
-                check("四类参数控件与默认值回填正确",
+                check("五类参数控件与默认值回填正确",
                       vals == {"hidden_size": "128", "dropout": "0.5",
-                               "use_bias": True, "act": "relu", "norm": False},
+                               "use_bias": True, "act": "relu", "norm": "[3,0.5,1,2]"},
                       json.dumps(vals, ensure_ascii=False))
-                check("list 类型参数不进面板（norm 不显示）", vals is not None and not vals["norm"])
+                check("list 类型参数显示为 JSON 控件（阶段4 4b 补齐）",
+                      vals is not None and vals.get("norm") == "[3,0.5,1,2]")
 
                 # 修改 hidden_size → 256，验证面板联动回写节点数据
                 edited = cdp.evaluate(

@@ -2,7 +2,7 @@
 import { type Edge, type Node } from "@xyflow/react";
 import { type LayerDefinition, type LayerRegistry } from "../node_gen/BaseClass";
 import { createLayerComponent } from "../node_gen/CreateNodeComponent";
-import { sanitizeIdent } from "../utils/codeCompile";
+import { sanitizeIdent, toPythonLiteral } from "../utils/codeCompile";
 import { getModule } from "../utils/moduleRegistry";
 //import type { LayerData, LayerDefinition } from "../node_gen/BaseClass";  //LayerData was unused
 import type { ModuleHandles } from "../utils/moduleRegistry";
@@ -222,6 +222,9 @@ export const ModuleRefNode: LayerDefinition<ModuleRefData> = {
                     params.push(`${varName}="${value}"`);
                 } else if (type === 'boolean') {
                     params.push(`${varName}=${value ? "True" : "False"}`);
+                } else if (type === 'array' || type === 'dict') {
+                    // list/dict 参数转 Python 字面量（阶段4 4b）
+                    params.push(`${varName}=${toPythonLiteral(value)}`);
                 } else {
                     params.push(`${varName}=${value}`);
                 }

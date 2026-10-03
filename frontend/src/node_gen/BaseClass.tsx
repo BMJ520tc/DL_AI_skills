@@ -1,7 +1,7 @@
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import { type ComponentType } from "react";
 
-export type FieldType = 'number' | 'text' | 'boolean' | 'select' // This describes how user can input a param's value
+export type FieldType = 'number' | 'text' | 'boolean' | 'select' | 'array' | 'dict' // This describes how user can input a param's value
 export interface FieldSpec {
     // This defines all the essential requirements of a parameter that a schema should follow
     type: FieldType;

@@ -23,6 +23,21 @@ export function sanitizeIdent(name: string): string {
     return safe;
 }
 
+/** 值 → Python 字面量（嵌套 list/dict 递归；阶段4 4b 的 list/dict 参数导出用）。 */
+export function toPythonLiteral(value: unknown): string {
+    if (value === null || value === undefined) return "None";
+    if (typeof value === "boolean") return value ? "True" : "False";
+    if (typeof value === "string") return `"${value}"`;
+    if (typeof value === "number") return Number.isFinite(value) ? `${value}` : "None";
+    if (Array.isArray(value)) return `[${value.map(toPythonLiteral).join(", ")}]`;
+    if (typeof value === "object") {
+        return `{${Object.entries(value as Record<string, unknown>)
+            .map(([k, v]) => `"${k}": ${toPythonLiteral(v)}`)
+            .join(", ")}}`;
+    }
+    return "None";
+}
+
 export function getRootGraph(nodes: Node[], edges: Edge[]) {
     // For now, we assume the provided nodes and edges ARE the root graph.
     // In a more complex setup where 'nodes' might contain everything including nested subgraphs (not how ReactFlow works usually),
@@ -301,8 +316,11 @@ export function generateMainCode(
     // 因此按 unknown 比较，保持原有判定结果。
     const pyLiteral = (spec: { type?: unknown } | undefined, value: unknown): string => {
         if (value === undefined || value === null) return "None";
-        if (spec?.type === "string") return `"${value}"`;
-        if (spec?.type === "boolean") return value ? "True" : "False";
+        const t = spec?.type;
+        // text/select 与历史 string 同为字符串取值，一律加引号（4b-1 口径）
+        if (t === "string" || t === "text" || t === "select") return `"${value}"`;
+        if (t === "boolean") return value ? "True" : "False";
+        if (t === "array" || t === "dict") return toPythonLiteral(value);
         return `${value}`;
     };
 
