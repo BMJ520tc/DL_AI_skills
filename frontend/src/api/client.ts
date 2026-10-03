@@ -333,6 +333,13 @@ export const postVisualize = (projectId: string, chart: string) =>
 /** 图表文件在新标签页打开的地址（经后端图表文件服务端点转发）。 */
 export const figureUrl = (projectId: string, chart: string) => `${API_BASE}/api/projects/${projectId}/figures/${chart}`;
 
+/** 原始项目的独立环境：建环境（异步任务）与状态查询（模块一 2.3；阶段4 4c-3）。 */
+export const createProjectEnv = (projectId: string) =>
+    request<{ task_id: string; status: string }>(`/api/projects/${projectId}/env`, { method: "POST" });
+
+export const getProjectEnvStatus = (projectId: string) =>
+    request<{ project_id: string; status: string | null }>(`/api/projects/${projectId}/env`);
+
 // ---------------------------------------------------------------------------
 // 画布网络（阶段4 4c，模块详细设计 7.5）
 // ---------------------------------------------------------------------------

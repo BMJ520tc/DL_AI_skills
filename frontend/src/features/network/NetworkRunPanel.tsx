@@ -6,7 +6,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-    getNetworkRunOptions, listNetworkRuns, postNetworkRun,
+    createProjectEnv, getNetworkRunOptions, getProjectEnvStatus, listNetworkRuns, postNetworkRun,
     type NetworkRunOptions, type NetworkRunRecord, type Task,
 } from "../../api/client";
 import { useTaskPolling } from "../../hooks/useTaskPolling";
@@ -56,6 +56,16 @@ const labelStyle: React.CSSProperties = {
     marginBottom: 4,
 };
 
+const smallButtonStyle: React.CSSProperties = {
+    border: "1px solid #1f2a2f",
+    borderRadius: 6,
+    padding: "2px 8px",
+    fontSize: 11,
+    background: "#134e4a",
+    color: "#e2e8f0",
+    whiteSpace: "nowrap",
+};
+
 export default function NetworkRunPanel({ projectId, saveGraph, onClose }: NetworkRunPanelProps) {
     const [options, setOptions] = useState<NetworkRunOptions | null>(null);
     const [optionsError, setOptionsError] = useState<string | null>(null);
@@ -72,6 +82,11 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
     const [startState, setStartState] = useState<"idle" | "starting" | "error">("idle");
     const [startError, setStartError] = useState<string | null>(null);
 
+    // 4c-3：父项目环境状态与「建环境」（复用模块一 2.3 的既有 env 接口）
+    const [envTaskId, setEnvTaskId] = useState<string | null>(null);
+    const [envStatus, setEnvStatus] = useState<string | null>(null);
+    const [envError, setEnvError] = useState<string | null>(null);
+
     const loadRuns = useCallback(async () => {
         try {
             setRuns(await listNetworkRuns(projectId));
@@ -80,23 +95,35 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
         }
     }, [projectId]);
 
+    /** 拉运行面板初始化数据（建环境完成后复用刷新）。 */
+    const refreshOptions = useCallback(async () => {
+        try {
+            const opts = await getNetworkRunOptions(projectId);
+            setOptions(opts);
+            setOptionsError(null);
+            setEnvironmentProjectId(prev => prev || opts.parent_project_id || opts.environments[0]?.project_id || "");
+            if (opts.parent_project_id) {
+                try {
+                    setEnvStatus((await getProjectEnvStatus(opts.parent_project_id)).status);
+                } catch {
+                    setEnvStatus(null);
+                }
+            }
+        } catch (e) {
+            setOptionsError(e instanceof Error ? e.message : String(e));
+        }
+    }, [projectId]);
+
     useEffect(() => {
         void (async () => {
-            try {
-                const opts = await getNetworkRunOptions(projectId);
-                setOptions(opts);
-                setOptionsError(null);
-                setEnvironmentProjectId(opts.parent_project_id ?? opts.environments[0]?.project_id ?? "");
-            } catch (e) {
-                setOptionsError(e instanceof Error ? e.message : String(e));
-            }
+            await refreshOptions();
             try {
                 setRuns(await listNetworkRuns(projectId));
             } catch {
                 // 运行记录加载失败不阻塞面板（训练结束后会再次刷新）
             }
         })();
-    }, [projectId]);
+    }, [projectId, refreshOptions]);
 
     const handleStart = useCallback(async () => {
         if (startState === "starting") return;
@@ -132,6 +159,34 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
             setStartError(e instanceof Error ? e.message : String(e));
         }
     }, [projectId, datasetId, environmentProjectId, epochs, batchSize, learningRate, saveGraph, startState]);
+
+    // 4c-3「可选新建环境」：为父原始项目发起建环境（既有接口），任务轮询到终态后刷新面板
+    const envTarget = options?.parent_project_id ?? null;
+    const parentEnvReady = !!envTarget && !!options?.environments.some(e => e.project_id === envTarget);
+
+    const handleCreateEnv = useCallback(async () => {
+        if (!envTarget || envTaskId) return;
+        setEnvError(null);
+        setEnvStatus(null);
+        try {
+            const res = await createProjectEnv(envTarget);
+            setEnvTaskId(res.task_id);
+        } catch (e) {
+            setEnvError(e instanceof Error ? e.message : String(e));
+        }
+    }, [envTarget, envTaskId]);
+
+    useTaskPolling({
+        taskId: envTaskId,
+        onDone: async () => {
+            setEnvTaskId(null);
+            await refreshOptions();
+        },
+        onError: message => {
+            setEnvTaskId(null);
+            setEnvError(message);
+        },
+    });
 
     useTaskPolling({
         taskId,
@@ -228,6 +283,25 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
                     </option>
                 ))}
             </select>
+
+            {envTarget && (
+                <div style={{ marginTop: 6, fontSize: 11, color: "#94a3b8",
+                              display: "flex", alignItems: "center", gap: 8 }}>
+                    <span>
+                        父项目环境：{envTaskId ? "创建中…" : parentEnvReady ? "已就绪" : (envStatus ?? "未就绪")}
+                    </span>
+                    <button
+                        onClick={() => void handleCreateEnv()}
+                        disabled={!!envTaskId || running}
+                        style={{ ...smallButtonStyle, cursor: envTaskId || running ? "wait" : "pointer" }}
+                    >
+                        {envTaskId ? "创建中…" : parentEnvReady ? "重建环境" : "建环境"}
+                    </button>
+                </div>
+            )}
+            {envError && (
+                <div style={{ color: "#f87171", marginTop: 4, fontSize: 11 }}>{envError}</div>
+            )}
 
             <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
                 <div style={{ flex: 1 }}>
