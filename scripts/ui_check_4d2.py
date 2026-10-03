@@ -36,6 +36,23 @@ CDP_PORT = 9222
 APP_URL = f"http://127.0.0.1:{PREVIEW_PORT}/"
 BACKEND_URL = f"http://127.0.0.1:{BACKEND_PORT}"
 
+# --headful：用可见的 Edge 窗口跑（人眼核 + 截图）；默认无头。截图一律落 data/_acceptance/shots/
+HEADFUL = "--headful" in sys.argv
+SHOTS = ROOT / "data" / "_acceptance" / "shots"
+
+
+def shot(cdp, name: str) -> None:
+    """存一张页面截图（人眼核用）。"""
+    import base64
+    try:
+        r = cdp.call("Page.captureScreenshot", {"format": "png"})
+        SHOTS.mkdir(parents=True, exist_ok=True)
+        path = SHOTS / f"{name}.png"
+        path.write_bytes(base64.b64decode(r["data"]))
+        print(f"  截图：{path}", flush=True)
+    except Exception as e:  # noqa: BLE001 —— 截图失败不影响自检结论
+        print(f"  截图失败（{name}）：{e}", flush=True)
+
 NETWORK_NAME = "UI4D2 样例网络"
 
 CHECKS: list[tuple[str, bool, str]] = []
@@ -280,12 +297,15 @@ def main() -> int:
             raise RuntimeError("vite preview 未在 20s 内就绪")
         check("vite preview 服务构建产物", True, APP_URL)
 
-        edge = subprocess.Popen([
-            EDGE, "--headless=new", f"--remote-debugging-port={CDP_PORT}",
+        edge_args = [
+            EDGE, f"--remote-debugging-port={CDP_PORT}",
             f"--user-data-dir={tmp_dir / 'edge-profile'}", "--no-first-run",
             "--no-default-browser-check", "--disable-gpu", "--disable-extensions",
             "--remote-allow-origins=*", "--window-size=1280,900", "about:blank",
-        ])
+        ]
+        if not HEADFUL:
+            edge_args.insert(1, "--headless=new")
+        edge = subprocess.Popen(edge_args)
         ws_url = None
         for _ in range(80):
             try:
@@ -338,21 +358,42 @@ def main() -> int:
             return 1
         check("版本面板列出 3 个版本", True)
 
-        evolution = cdp.evaluate(
+        evolution = wait_for(cdp,
             f"""(() => {{
                 const row = (s) => document.querySelector('[data-version=' + JSON.stringify(s) + ']');
                 const r2 = row({json.dumps(v2_short)}), r1 = row({json.dumps(v1_short)});
                 const r0 = [...document.querySelectorAll('[data-version]')][2];
                 const gutter = (r) => r && r.previousElementSibling;
-                return r2 && r1 && r0
+                return !!(r2 && r1 && r0
                     && r2.textContent.includes('当前')          // 最新版本有标注
                     && gutter(r2).textContent.includes('●─')    // 链上提交：●─ 接竖线
                     && gutter(r1).textContent.includes('●─')
                     && gutter(r0).textContent.includes('●')     // 根版本：● 终点
-                    && getComputedStyle(gutter(r2)).borderLeftWidth === '1px'
-                    && getComputedStyle(gutter(r0)).borderLeftWidth === '0px';
-            }})()""")
+                    && parseFloat(getComputedStyle(gutter(r2)).borderLeftWidth) > 0
+                    && parseFloat(getComputedStyle(gutter(r0)).borderLeftWidth) === 0);
+            }})()""", True, "版本树演化关系（竖线链 + ● + 当前标注）")
+        if not evolution:
+            print("[diag] 演化关系子条件：" + str(cdp.evaluate(
+                f"""(() => {{
+                    const rows = [...document.querySelectorAll('[data-version]')];
+                    const row = (s) => rows.find(x => x.getAttribute('data-version') === s);
+                    const r2 = row({json.dumps(v2_short)}), r1 = row({json.dumps(v1_short)});
+                    const r0 = rows[2];
+                    const gutter = (r) => r && r.previousElementSibling;
+                    return JSON.stringify({{
+                        rows: rows.length,
+                        has2: !!r2, has1: !!r1, has0: !!r0,
+                        cur2: r2 ? r2.textContent.includes('当前') : null,
+                        g2: gutter(r2) ? gutter(r2).textContent : null,
+                        g1: gutter(r1) ? gutter(r1).textContent : null,
+                        g0: gutter(r0) ? gutter(r0).textContent : null,
+                        bl2: gutter(r2) ? getComputedStyle(gutter(r2)).borderLeftWidth : null,
+                        bl0: gutter(r0) ? getComputedStyle(gutter(r0)).borderLeftWidth : null,
+                        zoom: getComputedStyle(document.body).zoom || document.body.style.zoom || null,
+                    }});
+                }})()""")))
         check("版本树展示演化关系（竖线链 + ● 节点 + 当前标注，新→旧）", bool(evolution))
+        shot(cdp, "4d2-version-tree")
 
         # ================= 阶段 C：两版本对比（M5 判据 2） =================
         click_version_row(cdp, v1_short, "")
@@ -388,6 +429,7 @@ def main() -> int:
                           "document.querySelectorAll('.react-flow__node').length === 3",
                           True, "回退后画布变为目标版本（3 节点）", timeout=30)
         check("回退后画布内容变为目标版本", rolled)
+        shot(cdp, "4d2-after-rollback")
         if not wait_for(cdp,
                         "document.querySelectorAll('[data-version]').length === 4"
                         " && document.querySelector('[data-version]').textContent.includes('回退到')",

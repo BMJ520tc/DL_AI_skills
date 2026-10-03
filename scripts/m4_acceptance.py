@@ -1,21 +1,25 @@
 # scripts/m4_acceptance.py — M4/M5 验收驱动脚本（阶段4，模块五；仅标准库 + 项目内 venv）。
 #
-# 前置：frontend 已 `npm run build`（本脚本不启动浏览器——界面验收已由
-# ui_check_4a/4b/4c/4d2 完成）、data/_acceptance/venv_smoke 已建好（torch CPU）。
+# 严口径（2026-10-03 复核后收紧）：
+#   - **真实模块**：用模块库里真实入库的标准化模块（默认 mod_f03f6c28d99bcec5「MLP」，
+#     可 --module 指定），不再是脚本自造的样例模块；
+#   - **真环境**：目标环境由 env_manager 真建——原始项目带 source/requirements.txt，
+#     经既有 POST /api/projects/{id}/env 建 venv 并装依赖（不再预建 venv_smoke 目录联接）。
 #
 # 自动走完 M4/M5 端到端主链路（阶段4实施方案 七）并逐项断言：
-#   M4：画布新建结构化项目（git 初始化）→ 混拼图保存（保存即提交）→ 参数调改
-#      （再保存再提交）→ 导出代码（后端引擎，导出即所存即所训）→ 选数据集与环境
+#   M4：画布新建结构化项目（git 初始化）→ 真建环境 → 混拼图保存（保存即提交）→
+#      参数调改（再保存再提交）→ 导出代码（后端引擎，导出即所存即所训）→ 选数据集与环境
 #      → 真实 CPU 训练 → 指标 + run_record（run_type=train）→ 运行即提交；
 #   M5：版本树（演化关系 + 元数据摘要）→ 任意两版本对比（代码 + 参数差异）→
 #      回退（画布内容变目标版本、回退记为新版本）→ 继续编辑保存（树上新节点）。
 #
 # 自带临时库后端（端口 8021，不碰真实 index.db）；产物落在 data/_acceptance/
 # m4_acceptance/（方案九：验收产物与真实数据隔离；库为一次性临时库，工作区保留
-# 供复核——版本仓库 git log 即 M5 证据）。
+# 供复核——版本仓库 git log 即 M5 证据）。真实模块包只读复制进工作区，不动真实库。
 #
 # 用法:
-#     backend/.venv/Scripts/python.exe scripts/m4_acceptance.py
+#     D:\python.exe scripts/m4_acceptance.py
+#     D:\python.exe scripts/m4_acceptance.py --module mod_611e10504a9b0e61:v14   # 换真实模块
 
 from __future__ import annotations
 
@@ -35,19 +39,27 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BACKEND = REPO_ROOT / "backend"
-VENV_SMOKE = REPO_ROOT / "data" / "_acceptance" / "venv_smoke"
 ACCEPT_DIR = REPO_ROOT / "data" / "_acceptance"
+REAL_MODULES_DIR = REPO_ROOT / "data" / "modules"
 
 BACKEND_PORT = 8021
 BACKEND_URL = f"http://127.0.0.1:{BACKEND_PORT}"
 
-MODULE_ID = "mod_m4ac0001"
-MODULE_COMPAT_ID = f"{MODULE_ID}:v1"
-MODULE_NAME = "M4 验收样例模块"
+# 真实入库模块（默认 MLP，可用 --module 覆盖）；模块包只读复制进验收工作区
+DEFAULT_MODULE = "mod_f03f6c28d99bcec5:v1"
+MODULE_REF = DEFAULT_MODULE
+MODULE_ID, _, MODULE_VERSION = MODULE_REF.partition(":")
+MODULE_COMPAT_ID = f"{MODULE_ID}:{MODULE_VERSION}"
+MODULE_NAME = "MLP"
+ROOT_CLASS = "Decomp_mlp"    # 该模块 module.py 的根类（内联代码里出现的类名）
+MODULE_INPUT_DIM = 64        # 该模块 input_spec.shape = [1, 64]
+MODULE_OUTPUT_DIM = 10       # 该模块 output_spec.shape = [1, 10]
+
 DATASET_ID = "ds_m4ac0001"
 DATASET_NAME = "M4 验收数值数据集"
 ORIGINAL_NAME = "M4 验收原始项目"
 NETWORK_NAME = "M4 验收样例网络"
+ENV_DEPS = "torch\n"         # 真建环境时装进项目独立环境的依赖（CPU 充足）
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -116,8 +128,9 @@ def seed_dataset_csv(data_dir: Path) -> None:
     rng = random.Random(42)
     rows = []
     for i in range(40):
-        feats = [round(rng.uniform(-1, 1), 4) for _ in range(4)]
-        label = 1 if feats[0] + feats[1] > 0 else 0
+        # 维度对齐真实模块的 input_spec（MLP 为 64 维），否则模块前向不接受
+        feats = [round(rng.uniform(-1, 1), 4) for _ in range(MODULE_INPUT_DIM)]
+        label = 1 if sum(feats) > 0 else 0
         rows.append((i + 1, "train" if i < 32 else "test", label, json.dumps(feats)))
     with (data_dir / "preprocessed.csv").open("w", encoding="utf-8", newline="") as fh:
         writer = csv.writer(fh)
@@ -136,44 +149,32 @@ def start_backend(ws: Path):
     project_manager.PROJECTS_DIR = ws / "projects"
     Path(project_manager.PROJECTS_DIR).mkdir(parents=True, exist_ok=True)
 
-    # 模块包：真实 module.py（torch Linear 包装类，根类在最后；与 ui_check_4c 同款）
-    pkg = ws / "modules" / MODULE_ID / "v1"
-    pkg.mkdir(parents=True, exist_ok=True)
-    (pkg / "module.py").write_text(
-        "import torch.nn as nn\n"
-        "class _Inner(nn.Module):\n"
-        "    def __init__(self):\n"
-        "        super().__init__()\n"
-        "        self.fc = nn.Linear(4, 8)\n"
-        "    def forward(self, x):\n"
-        "        return self.fc(x)\n"
-        "class M4acLinear(nn.Module):\n"
-        "    def __init__(self):\n"
-        "        super().__init__()\n"
-        "        self.inner = _Inner()\n"
-        "    def forward(self, x):\n"
-        "        return self.inner(x)\n",
-        encoding="utf-8",
-    )
+    # 模块包：**真实入库模块**（只读复制真实库的模块包，不写真实库）
+    src_pkg = REAL_MODULES_DIR / MODULE_ID / MODULE_VERSION
+    if not (src_pkg / "module.py").exists():
+        raise RuntimeError(f"真实模块包不存在：{src_pkg}（用 --module 指定库里已有的模块）")
+    pkg = ws / "modules" / MODULE_ID / MODULE_VERSION
+    shutil.copytree(src_pkg, pkg)
+    meta = json.loads((src_pkg / "module.json").read_text(encoding="utf-8"))
     now = datetime.now().isoformat()
     knowledge_service.record_module({
         "module_id": MODULE_ID,
-        "module_version": "v1",
-        "name": MODULE_NAME,
-        "description": "M4 验收模块（Linear 4→8）",
-        "source_project_id": None,
-        "source_paper_id": None,
-        "task_type": "tabular",
-        "input_spec": None,
-        "output_spec": None,
-        "params_schema": {},
-        "tags": ["m4-acceptance"],
-        "verification": {"overall": "passed"},
+        "module_version": MODULE_VERSION,
+        "name": meta.get("name") or MODULE_NAME,
+        "description": meta.get("description") or "",
+        "source_project_id": meta.get("source_project_id"),
+        "source_paper_id": meta.get("source_paper_id"),
+        "task_type": meta.get("task_type"),
+        "input_spec": meta.get("input_spec"),
+        "output_spec": meta.get("output_spec"),
+        "params_schema": meta.get("params_schema") or {},
+        "tags": meta.get("tags") or ["m4-acceptance"],
+        "verification": meta.get("verification") or {"overall": "passed"},
         "saved_module_compat": {
             "id": MODULE_COMPAT_ID,
-            "name": MODULE_NAME,
-            "version": "v1",
-            "description": "M4 验收模块",
+            "name": meta.get("name") or MODULE_NAME,
+            "version": MODULE_VERSION,
+            "description": meta.get("description") or "",
             "handles": {"inputs": ["in"], "outputs": ["out"]},
             "graph": {"nodes": [], "edges": []},
             "createdAt": now,
@@ -209,25 +210,36 @@ def start_backend(ws: Path):
 
 
 def seed_projects(ws: Path) -> tuple[str, str, Path]:
-    """原始项目（环境 = venv_smoke 目录联接）+ 结构化网络（父项目）。"""
+    """原始项目（**env_manager 真建独立环境**）+ 结构化网络（父项目）。"""
     original = http("POST", "/api/projects", {
         "project_type": "original", "source": "m4-acceptance", "name": ORIGINAL_NAME})
     original_id = original["project_id"]
-    env_link = ws / "projects" / original_id / "env"
-    subprocess.run(["cmd", "/c", "rmdir", str(env_link)], capture_output=True)
-    r = subprocess.run(["cmd", "/c", "mklink", "/J", str(env_link), str(VENV_SMOKE)],
-                       capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"目录联接失败：{r.stderr or r.stdout}")
+    proj_ws = ws / "projects" / original_id
+    source = proj_ws / "source"
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "requirements.txt").write_text(ENV_DEPS, encoding="utf-8")
+
+    # 真建环境：走既有模块一接口（env_manager 建 venv → 装依赖 → 失败时修正循环）
+    task_id = http("POST", f"/api/projects/{original_id}/env")["task_id"]
+    deadline = time.monotonic() + 1800
+    status, error = None, None
+    while time.monotonic() < deadline:
+        task = http_json(f"/api/tasks/{task_id}")
+        status, error = task["status"], task.get("error")
+        if status in ("success", "failed", "cancelled"):
+            break
+        time.sleep(3)
+    if status != "success":
+        raise RuntimeError(f"真建环境失败：{status} {error}")
 
     network = http("POST", "/api/projects", {
         "project_type": "structured", "name": NETWORK_NAME,
         "parent_project_id": original_id})
-    return original_id, network["project_id"], env_link
+    return original_id, network["project_id"], proj_ws / "env"
 
 
 def graph_v1() -> dict:
-    """后端模块 + 标准节点混拼小模型：module_ref(Linear 4→8) → ReLU → Linear(8→2)。"""
+    """真实模块 + 标准节点混拼：module_ref(MLP 64→10) → ReLU → Linear(10→2)。"""
     return {
         "nodes": [
             {"id": "m1", "type": "module_ref", "data": {
@@ -236,7 +248,7 @@ def graph_v1() -> dict:
             }},
             {"id": "n2", "type": "relu_layer", "data": {}},
             {"id": "n3", "type": "linear_layer", "data": {
-                "in_features": 8, "out_features": 2, "bias": True}},
+                "in_features": MODULE_OUTPUT_DIM, "out_features": 2, "bias": True}},
         ],
         "edges": [
             {"id": "e1", "source": "m1", "sourceHandle": "out", "target": "n2",
@@ -265,16 +277,38 @@ def graph_v2() -> dict:
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    smoke_python = VENV_SMOKE / "Scripts" / "python.exe"
-    if not smoke_python.exists():
-        print(f"FATAL: smoke 环境不存在：{smoke_python}（先建 venv_smoke 并装 torch）")
+    global MODULE_REF, MODULE_ID, MODULE_VERSION, MODULE_COMPAT_ID, MODULE_NAME
+    global ROOT_CLASS, MODULE_INPUT_DIM, MODULE_OUTPUT_DIM
+
+    argv = sys.argv[1:]
+    if "--module" in argv:
+        MODULE_REF = argv[argv.index("--module") + 1]
+        MODULE_ID, _, MODULE_VERSION = MODULE_REF.partition(":")
+        MODULE_COMPAT_ID = f"{MODULE_ID}:{MODULE_VERSION}"
+    # 大 wheel（torch）走国内镜像更稳；不覆盖用户已有配置
+    os.environ.setdefault("PIP_INDEX_URL", "https://mirrors.cloud.tencent.com/pypi/simple")
+
+    src_pkg = REAL_MODULES_DIR / MODULE_ID / MODULE_VERSION
+    if not (src_pkg / "module.py").exists():
+        print(f"FATAL: 真实模块包不存在：{src_pkg}（用 --module 指定库里已有的模块）")
         return 2
-    r = subprocess.run([str(smoke_python), "-c", "import torch; print(torch.__version__)"],
-                       capture_output=True, text=True, timeout=180)
-    if r.returncode != 0:
-        print(f"FATAL: smoke 环境 torch 不可用：{r.stderr[-500:]}")
+    meta = json.loads((src_pkg / "module.json").read_text(encoding="utf-8"))
+    MODULE_NAME = meta.get("name") or MODULE_NAME
+    sys.path.insert(0, str(BACKEND))
+    from app.services import network_export  # noqa: PLC0415
+    classes = network_export._module_class_names((src_pkg / "module.py").read_text(encoding="utf-8"))
+    if not classes:
+        print("FATAL: 真实模块 module.py 中没有类定义")
         return 2
-    check("smoke 环境 torch 可用", True, r.stdout.strip())
+    ROOT_CLASS = classes[-1]
+    ins = (meta.get("input_spec") or {}).get("shape")
+    outs = (meta.get("output_spec") or {}).get("shape")
+    if isinstance(ins, list) and ins:
+        MODULE_INPUT_DIM = int(ins[-1])
+    if isinstance(outs, list) and outs:
+        MODULE_OUTPUT_DIM = int(outs[-1])
+    check("真实模块包就绪（模块库只读复制）", True,
+          f"{MODULE_REF} 根类={ROOT_CLASS} 形状 {MODULE_INPUT_DIM}→{MODULE_OUTPUT_DIM}")
 
     ws = ACCEPT_DIR / "m4_acceptance"
     if ws.exists():
@@ -287,8 +321,13 @@ def main() -> int:
     try:
         server = start_backend(ws)
         check("临时库后端启动（模块/数据集种子，不碰真实库）", True, BACKEND_URL)
-        original_id, network_id, env_link = seed_projects(ws)
-        check("种子就绪：原始项目（smoke 环境联接）+ 画布网络", True,
+        original_id, network_id, env_dir = seed_projects(ws)
+        env_python = env_dir / "Scripts" / "python.exe"
+        probe = subprocess.run([str(env_python), "-c", "import torch; print(torch.__version__)"],
+                               capture_output=True, text=True, timeout=300)
+        check("真建环境就绪（env_manager 建 venv + 装依赖）", probe.returncode == 0,
+              (probe.stdout or probe.stderr).strip()[-120:])
+        check("种子就绪：原始项目（真建环境）+ 画布网络", True,
               f"net={network_id} parent={original_id}")
         ws_dir = ws / "projects" / network_id
 
@@ -314,7 +353,7 @@ def main() -> int:
 
         code = http_json(f"/api/networks/{network_id}/export")["code"]
         export_ok = ("class GeneratedModel(nn.Module):" in code
-                     and "class M4acLinear(nn.Module):" in code
+                     and f"class {ROOT_CLASS}(nn.Module):" in code
                      and "nn.ReLU()" in code and "return out_n4" in code)
         check("M4-4 导出代码走后端引擎（导出即所存即所训，V2 四节点）",
               export_ok, f"{len(code)} 字符" + ("" if export_ok else f"，代码尾：{code[-160:]!r}"))
@@ -338,7 +377,7 @@ def main() -> int:
             if status in ("success", "failed", "cancelled"):
                 break
             time.sleep(2)
-        check("M4-6 真实 CPU 训练成功（smoke 环境，2 epochs）", status == "success",
+        check("M4-6 真实 CPU 训练成功（真建环境，2 epochs）", status == "success",
               f"task={task_id} status={status}" + (f" error={error[-300:]}" if error else ""))
 
         runs = http_json(f"/api/networks/{network_id}/runs")
@@ -366,6 +405,12 @@ def main() -> int:
         check("M4-9 运行产物齐备（model.py/train.log/train_metrics.json）",
               (run_dir / "model.py").exists() and (run_dir / "train.log").exists()
               and (run_dir / "train_metrics.json").exists(), str(run_dir))
+
+        # 训练按 split 划分（train 32 / test 8）：评估指标取自 eval 子集，不是全量
+        tm = json.loads((run_dir / "train_metrics.json").read_text(encoding="utf-8"))
+        check("M4-10 训练按 split 划分（train=32 / eval=8）",
+              tm.get("train_samples") == 32 and tm.get("eval_samples") == 8,
+              f"train={tm.get('train_samples')} eval={tm.get('eval_samples')}")
 
         # ================= M5：版本管理（方案七） =================
 
@@ -429,9 +474,7 @@ def main() -> int:
     finally:
         if server:
             server.should_exit = True
-        if env_link and env_link.exists():
-            # 先移除目录联接（防 rmtree 穿透删到 venv_smoke）；工作区本体保留供复核
-            subprocess.run(["cmd", "/c", "rmdir", str(env_link)], capture_output=True)
+        # 工作区（含真建环境与版本仓库）保留供复核；不碰真实数据
 
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     print(f"\nM4/M5 脚本化验收：{passed}/{len(RESULTS)} 项通过")

@@ -39,6 +39,24 @@ CDP_PORT = 9222
 APP_URL = f"http://127.0.0.1:{PREVIEW_PORT}/"
 BACKEND_URL = f"http://127.0.0.1:{BACKEND_PORT}"
 
+# --headful：用可见的 Edge 窗口跑（人眼核 + 截图）；默认无头。截图一律落 data/_acceptance/shots/
+HEADFUL = "--headful" in sys.argv
+SHOTS = ROOT / "data" / "_acceptance" / "shots"
+
+
+def shot(cdp, name: str) -> None:
+    """存一张页面截图（人眼核用）。"""
+    import base64
+    try:
+        r = cdp.call("Page.captureScreenshot", {"format": "png"})
+        SHOTS.mkdir(parents=True, exist_ok=True)
+        path = SHOTS / f"{name}.png"
+        path.write_bytes(base64.b64decode(r["data"]))
+        print(f"  截图：{path}", flush=True)
+    except Exception as e:  # noqa: BLE001 —— 截图失败不影响自检结论
+        print(f"  截图失败（{name}）：{e}", flush=True)
+
+
 MODULE_ID = "mod_ui4b0001"
 MODULE_COMPAT_ID = f"{MODULE_ID}:v1"
 MODULE_NAME = "UI4B 样例模块"
@@ -436,12 +454,15 @@ def main() -> int:
             raise RuntimeError("vite preview 未在 20s 内就绪")
         check("vite preview 服务构建产物", True, APP_URL)
 
-        edge = subprocess.Popen([
-            EDGE, "--headless=new", f"--remote-debugging-port={CDP_PORT}",
+        edge_args = [
+            EDGE, f"--remote-debugging-port={CDP_PORT}",
             f"--user-data-dir={tmp_dir / 'edge-profile'}", "--no-first-run",
             "--no-default-browser-check", "--disable-gpu", "--disable-extensions",
             "--remote-allow-origins=*", "--window-size=1280,900", "about:blank",
-        ])
+        ]
+        if not HEADFUL:
+            edge_args.insert(1, "--headless=new")
+        edge = subprocess.Popen(edge_args)
         ws_url = None
         for _ in range(80):
             try:
@@ -536,6 +557,7 @@ def main() -> int:
             expanded = poll(cdp,
                             "document.body.innerText.includes('hidden_size')", True)
             check("展开后参数面板显示 params_schema 字段", expanded)
+            shot(cdp, "4b-params-panel")
             if expanded:
                 vals = json.loads(cdp.evaluate(
                     f"""JSON.stringify((() => {{
