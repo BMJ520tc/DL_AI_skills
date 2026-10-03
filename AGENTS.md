@@ -27,7 +27,7 @@ Python 的 FastAPI）。`agents/prompts/` 里是交给大模型的任务提示�
 | 各功能模块的详细设计与实现约定 | [模块详细设计](docs/模块详细设计.md)（第二～八章，各章末尾有「实施约定」） |
 | 数据存哪、表结构、怎么检索 | [知识库与数据设计](docs/知识库与数据设计.md) |
 | 架构上的取舍与还没定的事 | [系统架构设计](docs/系统架构设计.md)（附录 A 是已定决策，附录 B 是开放项） |
-| 某个阶段的任务拆分与实测记录 | [阶段1实施方案](docs/阶段1实施方案.md)、[阶段3实施方案](docs/阶段3实施方案.md)（后者含第 1～27 号修正清单） |
+| 某个阶段的任务拆分与实测记录 | [阶段1实施方案](docs/阶段1实施方案.md)、[阶段3实施方案](docs/阶段3实施方案.md)（后者含第 1～28 号修正清单） |
 | 已经验收通过的结论、还欠着什么 | [阶段验收记录](docs/阶段验收记录.md)、[阶段收口任务清单](docs/阶段收口任务清单.md)（后者含第 1～13 号缺陷登记） |
 | 哪些需求还没实现 | [开发计划](docs/开发计划.md) 的「需求对齐核查与已知缺口」一节 |
 
@@ -93,7 +93,7 @@ D:\python.exe scripts/decompose_e2e_check.py --project-id dc21142917844c05b196fa
 D:\python.exe scripts/m3_acceptance.py --mode all --source examples/m3_sample_repo
 
 # 启动后端（改完代码记得重启；下载依赖建议走国内镜像源）
-cd backend; $env:PIP_INDEX_URL="https://mirrors.cloud.tencent.com/pypi/simple"; .\.venv\Scripts\python.exe -m uvicorn app.main:app --port 8000
+cd backend; $env:PIP_INDEX_URL="https://mirrors.cloud.tencent.com/pypi/simple"; D:\python.exe -m uvicorn app.main:app --port 8000
 ```
 
 ## 五、现在到哪一步了
