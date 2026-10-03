@@ -57,7 +57,7 @@ Python 的 FastAPI）。`agents/prompts/` 里是交给大模型的任务提示�
 ```powershell
 # 解释器：本仓库当前用 D:\python.exe（Python 3.13，后端依赖 + torch/uvicorn/websockets 齐全）；
 # 若换到带项目内虚拟环境的机器，把下文的 D:\python.exe 换成该环境里的解释器。
-#   后端自动化用例（当前 107 个，全部通过）
+#   后端自动化用例（当前 110 个，全部通过）
 D:\python.exe scripts/run_tests.py
 
 # 前端：代码规范检查（当前 0 问题）与构建
@@ -71,7 +71,9 @@ D:\python.exe scripts/ui_check_4c.py
 D:\python.exe scripts/ui_check_4d2.py
 #   4c 会真实跑一次 CPU 训练（smoke 环境 data/_acceptance/venv_smoke，目录联接挂进临时项目），约 4 分钟；
 #   4d2 覆盖 M5 三条（版本树/对比/回退），无训练链路、不需要 venv_smoke
-#   venv_smoke 可自建（venv + 装 torch），也可 `mklink /J` 指向任一带 torch 的项目独立环境
+#   venv_smoke 可自建（venv + 装 torch），也可 `mklink /J` 指向任一带 torch 的项目独立环境；
+#   注意：`m4_acceptance.py` 每次会**清空自己的工作区**，若 venv_smoke 是指向该工作区里环境的
+#   目录联接，跑完 m4 就会失效（4c 会明确报 FATAL）——重跑 4c 前把联接重建一次即可
 #   加 --headful 用**可见** Edge 窗口跑（人眼核），并把截图落到 data/_acceptance/shots/
 
 # M4/M5 脚本化验收（19/19 通过；严口径——用真实入库模块 + env_manager 真建环境，首跑含装 torch
@@ -111,6 +113,15 @@ cd backend; $env:PIP_INDEX_URL="https://mirrors.cloud.tencent.com/pypi/simple"; 
 问题 + build 通过。另登记两处文档未记载的边界（后端再生成引擎不支持控制流/容器/嵌套子节点、
 基底 `repeat_layer` 键冲突）——**只登记不改代码**。
 《模块详细设计》七章因此升 **v1.18**（v1.17 为实施同步，v1.18 为复核后修复的同步）。
+
+**2026-10-03 完备性复核第二轮**：两端全量重审 + 排查上轮改动的传播面，又发现 8 处并全部修复——
+A 类（B2 传播缺口：字符串字面量不转义、提升为变量时的替换正则在逗号处截断、`array`/`dict` 的默认值
+分支缺失）、B 类（run-options 未按「有预处理产物」过滤数据集、训练失败不落 `run_record`）、
+C 类（守卫状态码按 7.7-1 统一 **400**）、D 类（多输入算子改按 `targetHandle` 绑定输入、内联模块类名
+冲突时加模块键后缀、生产者与消费者取名一致——均**两端**改动）、E 类（文档里 2 处陈旧引用更正）。
+复验：后端 **110/110**、`export_parity.py` PASS（逐字节一致 **且** 无未定义节点输出变量）、
+ui_check 22/22+23/23+17/17+14/14、`m4_acceptance` **19/19**。《模块详细设计》
+七章再升 **v1.19**（新增 7.7-11）。
 
 下一步：**阶段5（模块六：四类数据入库检索 / 带入蒸馏 / 综合分析）**——先按《开发计划》十节出
 阶段5实施方案（照阶段3/阶段4 模式：任务拆分 + 实施顺序 + 验收方式），评审通过后开工。
