@@ -7,7 +7,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
     bringKnowledge, createProjectEnv, getNetworkRunOptions, getProjectEnvStatus, listNetworkRuns, listProjects,
-    postNetworkRun, type KnowledgeBringResult, type NetworkRunOptions, type NetworkRunRecord, type Project, type Task,
+    postNetworkAutotune, postNetworkRun, type KnowledgeBringResult, type NetworkRunOptions, type NetworkRunRecord,
+    type Project, type Task,
 } from "../../api/client";
 import { useTaskPolling } from "../../hooks/useTaskPolling";
 
@@ -99,6 +100,9 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
     const [task, setTask] = useState<Task | null>(null);
     const [startState, setStartState] = useState<"idle" | "starting" | "error">("idle");
     const [startError, setStartError] = useState<string | null>(null);
+    // 自动调参（B，扩范围）：独立任务与进度（候选/winner）
+    const [autotuneTaskId, setAutotuneTaskId] = useState<string | null>(null);
+    const [autotuneInfo, setAutotuneInfo] = useState<{ stage?: string; winner?: Record<string, number>; primary_metric?: string; primary_value?: number } | null>(null);
 
     // 4c-3：环境（复用模块一 2.3 的既有 env 接口）。
     // 画布新建的结构化项目没有父项目，此时允许从全部 original 项目里选一个作为环境来源并就地建环境。
@@ -235,6 +239,52 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
         }
     }, [projectId, datasetId, environmentProjectId, epochs, batchSize, learningRate, saveGraph, startState]);
 
+    /** 自动调参（B）：先落盘当前画布，再发起调参任务（候选超参逐个训练 → 选优 → 蒸馏回写）。 */
+    const handleAutotune = useCallback(async () => {
+        if (autotuneTaskId) return;
+        setStartError(null);
+        if (!datasetId) {
+            setStartState("error"); setStartError("请先选择训练数据集");
+            return;
+        }
+        if (!environmentProjectId) {
+            setStartState("error"); setStartError("没有可用的运行环境：请先走模块一建环境");
+            return;
+        }
+        try {
+            await saveGraph();
+            const res = await postNetworkAutotune(projectId, {
+                dataset_id: datasetId, environment_project_id: environmentProjectId || null,
+                epochs, batch_size: batchSize, learning_rate: learningRate,
+            });
+            setAutotuneTaskId(res.task_id);
+            setAutotuneInfo(null);
+        } catch (e) {
+            setStartState("error");
+            setStartError(e instanceof Error ? e.message : String(e));
+        }
+    }, [autotuneTaskId, datasetId, environmentProjectId, epochs, batchSize, learningRate, projectId, saveGraph]);
+
+    useTaskPolling({
+        taskId: autotuneTaskId,
+        onProgress: t => {
+            if (!t.progress) return;
+            try {
+                setAutotuneInfo(JSON.parse(t.progress));
+            } catch {
+                /* 进度非 JSON 时忽略 */
+            }
+        },
+        onDone: async () => {
+            await loadRuns();
+            setAutotuneTaskId(null);
+        },
+        onError: message => {
+            setStartError(message);
+            setAutotuneTaskId(null);
+        },
+    });
+
     // 4c-3「可选新建环境」：为所选原始项目发起建环境（既有接口），任务轮询到终态后刷新面板
     const envReady = !!envTarget && !!options?.environments.some(e => e.project_id === envTarget);
 
@@ -287,10 +337,9 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
         onProgress: t => setTask(t),
     });
 
-    const latestRun = runs[0] ?? null;
-    const latestMetrics = useMemo(() => (latestRun ? parseMetrics(latestRun) : {}), [latestRun]);
-
     const running = taskId !== null;
+    const autotuning = autotuneTaskId !== null;
+    const busy = running || autotuning;
     const stage = stageOf(task);
 
     return (
@@ -484,55 +533,86 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
                 </div>
             </div>
 
-            <button
-                onClick={() => void handleStart()}
-                disabled={running || startState === "starting" || !options}
-                style={{
-                    marginTop: 12,
-                    width: "100%",
-                    border: "1px solid #1f2a2f",
-                    borderRadius: 8,
-                    padding: "7px 14px",
-                    fontWeight: 600,
-                    fontSize: 12,
-                    cursor: running || startState === "starting" || !options ? "wait" : "pointer",
-                    background: "#0f766e",
-                    color: "#e2e8f0",
-                }}
-            >
-                {running ? `训练中… ${stage}` : "启动训练"}
-            </button>
+            <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                <button
+                    onClick={() => void handleStart()}
+                    disabled={busy || startState === "starting" || !options}
+                    style={{
+                        flex: 1,
+                        border: "1px solid #1f2a2f",
+                        borderRadius: 8,
+                        padding: "7px 14px",
+                        fontWeight: 600,
+                        fontSize: 12,
+                        cursor: busy || !options ? "wait" : "pointer",
+                        background: "#0f766e",
+                        color: "#e2e8f0",
+                    }}
+                >
+                    {running ? `训练中… ${stage}` : "启动训练"}
+                </button>
+                <button
+                    onClick={() => void handleAutotune()}
+                    disabled={busy || !options}
+                    title="自动调参：带入知识 → 候选超参逐个训练 → 按主指标选优 → 蒸馏回写（结果落运行记录）"
+                    style={{
+                        flex: 1,
+                        border: "1px solid #1f2a2f",
+                        borderRadius: 8,
+                        padding: "7px 14px",
+                        fontWeight: 600,
+                        fontSize: 12,
+                        cursor: busy || !options ? "wait" : "pointer",
+                        background: "#7c3aed",
+                        color: "#e2e8f0",
+                    }}
+                >
+                    {autotuning ? `调参中… ${autotuneInfo?.stage ?? ""}` : "自动调参"}
+                </button>
+            </div>
+
+            {autotuneInfo?.winner && (
+                <div style={{ marginTop: 8, padding: "6px 8px", border: "1px solid #4c1d95", background: "#1e1b4b",
+                              borderRadius: 6, color: "#e9d5ff", fontSize: 11, lineHeight: 1.5 }}>
+                    自动调参最优：epochs={autotuneInfo.winner.epochs} · batch={autotuneInfo.winner.batch_size} ·
+                    lr={autotuneInfo.winner.learning_rate} → {autotuneInfo.primary_metric}={autotuneInfo.primary_value}
+                    （已蒸馏为草稿，可在「知识库 → 草稿」确认；并在下方运行记录中留档）
+                </div>
+            )}
 
             {startError && (
                 <div style={{ color: "#f87171", marginTop: 8, whiteSpace: "pre-wrap" }}>{startError}</div>
             )}
-            {!startError && !running && startState === "error" && (
+            {!startError && !busy && startState === "error" && (
                 <div style={{ color: "#f87171", marginTop: 8 }}>启动失败，请检查上方配置</div>
             )}
 
-            {latestRun && (
+            {runs.length > 0 && (
                 <div style={{ marginTop: 14, borderTop: "1px solid #1f2a2f", paddingTop: 10 }}>
-                    <div style={{ fontWeight: 700, marginBottom: 6 }}>
-                        最近一次训练（{latestRun.started_at.slice(0, 16).replace("T", " ")}）
+                    <div style={{ fontWeight: 700, marginBottom: 6 }}>运行记录（最近 {Math.min(runs.length, 6)} 条）</div>
+                    <div style={{ display: "grid", gap: 4 }}>
+                        {runs.slice(0, 6).map(r => {
+                            const metrics = parseMetrics(r);
+                            const isAuto = r.run_type === "autotune";
+                            const summary = Object.entries(metrics)
+                                .map(([k, v]) => `${k}=${typeof v === "number" ? v.toFixed(3) : String(v)}`)
+                                .join(" ");
+                            return (
+                                <div key={r.run_id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11 }}>
+                                    <span style={{ color: "#fff", background: isAuto ? "#7c3aed" : "#0f766e",
+                                                   borderRadius: 4, padding: "0 5px", flexShrink: 0 }}>
+                                        {isAuto ? "自动调参" : "训练"}
+                                    </span>
+                                    <span style={{ color: "#94a3b8" }}>{r.started_at.slice(0, 16).replace("T", " ")}</span>
+                                    <span style={{ marginLeft: "auto", fontFamily: "monospace", color: "#cbd5e1" }}>
+                                        {summary || "—"}
+                                    </span>
+                                </div>
+                            );
+                        })}
                     </div>
-                    {Object.keys(latestMetrics).length > 0 ? (
-                        <table style={{ width: "100%", fontSize: 11, borderCollapse: "collapse" }}>
-                            <tbody>
-                                {Object.entries(latestMetrics).map(([k, v]) => (
-                                    <tr key={k}>
-                                        <td style={{ color: "#94a3b8", padding: "2px 0" }}>{k}</td>
-                                        <td style={{ textAlign: "right", fontFamily: "monospace" }}>
-                                            {typeof v === "number" ? v.toFixed(4) : String(v)}
-                                        </td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
-                    ) : (
-                        <div style={{ color: "#64748b" }}>本次训练未产出指标</div>
-                    )}
                     <div style={{ color: "#64748b", fontSize: 10, marginTop: 4 }}>
-                        {runs.length} 条成功训练记录（run_type=train）
+                        共 {runs.length} 条成功运行记录（train + autotune）
                     </div>
                 </div>
             )}

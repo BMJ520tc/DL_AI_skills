@@ -1056,6 +1056,10 @@ def test_autotune_selects_best_and_distills(tmp_networks, monkeypatch):
               "base": {"epochs": 3, "batch_size": 8, "learning_rate": 0.01}, "candidates": None}
     asyncio.run(network_service._run_autotune(params, "task-at-001"))
 
+    # 运行记录接口要能列出 autotune（否则调参结果在界面上永远不可见）
+    listed = client.get(f"/api/networks/{project_id}/runs").json()
+    assert any(r["run_type"] == "autotune" for r in listed)
+
     # run_record(run_type=autotune)：winner 是 lr=0.1，指标为最优
     rows = ks.list_runs(project_id, "autotune")
     assert len(rows) == 1 and rows[0]["status"] == "success"

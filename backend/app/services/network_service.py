@@ -76,9 +76,15 @@ def export_network(project_id: str) -> str:
 
 
 def list_runs(project_id: str) -> list[dict]:
-    """该网络的训练运行记录（成功记录，指标面板数据源）。"""
+    """该网络的运行记录（**训练 + 自动调参**，成功记录；指标/运行面板数据源）。
+
+    自动调参此前不进列表 → 调参结果（含 winner）在界面上永远不可见；一并纳入并按 started_at 倒序。
+    """
     _require_network(project_id)
-    return knowledge_service.list_runs(project_id, "train")
+    runs = (knowledge_service.list_runs(project_id, "train")
+            + knowledge_service.list_runs(project_id, "autotune"))
+    runs.sort(key=lambda r: r.get("started_at") or "", reverse=True)
+    return runs
 
 
 def run_options(project_id: str) -> dict:

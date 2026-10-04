@@ -702,6 +702,23 @@ export const postNetworkRun = (
         body: JSON.stringify(body),
     });
 
+/** 自动调参（B，扩范围）：带入知识 → 候选超参逐个训练 → 按主指标选优 → 蒸馏回写。 */
+export const postNetworkAutotune = (
+    projectId: string,
+    body: {
+        dataset_id: string;
+        environment_project_id?: string | null;
+        epochs?: number;
+        batch_size?: number;
+        learning_rate?: number;
+        candidates?: Array<{ epochs?: number; batch_size?: number; learning_rate?: number }> | null;
+    },
+) =>
+    request<{ task_id: string; status: string }>(`/api/networks/${projectId}/autotune`, {
+        method: "POST",
+        body: JSON.stringify(body),
+    });
+
 // ---------------------------------------------------------------------------
 // 版本管理（阶段4 4d-2，模块详细设计 7.6）
 // ---------------------------------------------------------------------------
