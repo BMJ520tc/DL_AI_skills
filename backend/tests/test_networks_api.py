@@ -500,6 +500,66 @@ def test_run_options_lists_envs_and_datasets(tmp_networks):
 # 训练编排（monkeypatch 掉训练脚本执行，handler 直跑——与 test_dataset_alignment 同风格）
 # ---------------------------------------------------------------------------
 
+def _insert_running_task(task_id: str, project_id: str, params: dict) -> None:
+    """直接落一条 running 任务行，供 handler 直跑后查询任务进度。
+
+    不经队列：app_client 走 lifespan 起的后台 worker 会并发执行同一任务，
+    直插任务行可让「handler 直跑 + 任务进度查询」这条断言链完全确定。
+    """
+    from app.db.connection import get_connection
+
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO task(task_id, task_type, project_id, params, status, created_at, updated_at) "
+            "VALUES (?, 'network_train', ?, ?, 'running', '2026-10-04T00:00:00+00:00', "
+            "'2026-10-04T00:00:00+00:00')",
+            (task_id, project_id, json.dumps(params, ensure_ascii=False)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _prepare_train(client, tmp_path) -> tuple[str, str, str]:
+    """建「父原始项目 + 结构化网络 + 假环境 + 预处理数据集 + 模块包」并保存一次画布。"""
+    original_id = _create_original(client)
+    project_id = _create_structured(client, original_id)
+    _fake_env_python(original_id, tmp_path)
+    dataset_id = _record_dataset(tmp_path)
+    _record_module_ref(tmp_path)
+    body = {
+        "nodes": [{"id": "m1", "type": "module_ref", "data": {
+            "moduleId": "mod_ref_0001:v1",
+            "handles": {"inputs": ["in"], "outputs": ["out"]},
+        }}],
+        "edges": [],
+    }
+    assert client.put(f"/api/projects/{project_id}/graph", json=body).status_code == 200
+    return original_id, project_id, dataset_id
+
+
+def _train_params(project_id: str, dataset_id: str, original_id: str) -> dict:
+    return {
+        "project_id": project_id,
+        "dataset_id": dataset_id,
+        "environment_project_id": original_id,
+        "epochs": 1,
+        "batch_size": 8,
+        "learning_rate": 0.01,
+    }
+
+
+async def _fake_ok_run(cmd, *, cwd, timeout):
+    """假训练脚本：把指标写进 argv 末位的 out_json（与既有用例同风格）。"""
+    from pathlib import Path
+
+    Path(cmd[6]).write_text(
+        json.dumps({"metrics": {"loss": 0.1, "accuracy": 0.95}}), encoding="utf-8"
+    )
+    return 0, "[epoch 1/1] loss=0.100000"
+
+
 def test_train_orchestration_writes_run_record(tmp_networks, monkeypatch):
     """任务 handler 全链路：导出落盘 → 假执行产出指标 → run_record(run_type=train)。"""
     client, tmp_path = tmp_networks
@@ -619,3 +679,115 @@ def test_train_task_endpoint_and_failure_path(tmp_networks, monkeypatch):
     assert failed, "训练失败应落一条可检索的 run_record"
     assert all(r["task_id"] == task_id for r in failed), failed
     assert all("退出码 1" in (r["error"] or "") for r in failed), failed
+
+
+# ---------------------------------------------------------------------------
+# 运行即提交失败透出（4d-1 补强）：不连坐训练结果，但版本提交失败必须可查、不静默
+# ---------------------------------------------------------------------------
+
+def test_train_version_commit_failure_is_transparent(tmp_networks, monkeypatch):
+    """commit_run 抛异常 → 任务仍 success、成功 run_record 仍在（既有口径保持），
+    且失败透出在任务进度 version_error 与 run_record 失败留痕里（不静默）。"""
+    client, tmp_path = tmp_networks
+    original_id, project_id, dataset_id = _prepare_train(client, tmp_path)
+
+    from app.services import network_service, proc_util, version_service
+
+    def broken_commit_run(_project_id, _task_id, _metrics):
+        raise RuntimeError("git commit 失败（模拟）")
+
+    monkeypatch.setattr(proc_util, "run_command", _fake_ok_run)
+    monkeypatch.setattr(version_service, "commit_run", broken_commit_run)
+
+    params = _train_params(project_id, dataset_id, original_id)
+    task_id = "task-net-vc-fail"
+    _insert_running_task(task_id, project_id, params)
+
+    # 不抛出：版本提交失败与训练结果解耦（不连坐）
+    asyncio.run(network_service._run_train(params, task_id))
+
+    # 既有断言保持：训练成功记录照常、指标齐备
+    runs = client.get(f"/api/networks/{project_id}/runs").json()
+    assert len(runs) == 1
+    assert runs[0]["status"] == "success"
+    assert runs[0]["task_id"] == task_id
+    assert json.loads(runs[0]["metrics"]) == {"loss": 0.1, "accuracy": 0.95}
+
+    # 新增：失败透出到任务进度（GET /api/tasks/{id} → progress.version_error）
+    task = client.get(f"/api/tasks/{task_id}").json()
+    progress = json.loads(task["progress"])
+    assert progress["stage"] == "完成"
+    assert "版本提交失败" in progress["version_error"]
+    assert "训练结果已保留" in progress["version_error"]
+    assert "版本节点未生成" in progress["version_error"]
+    assert "git commit 失败（模拟）" in progress["version_error"]
+
+    # 新增：run_record 留一条失败留痕（可检索），且不污染成功记录列表
+    from app.services import knowledge_service as ks
+
+    failed = ks.list_runs(project_id, "train", status="failed")
+    assert len(failed) == 1
+    assert failed[0]["task_id"] == task_id
+    assert "版本提交失败" in (failed[0]["error"] or "")
+    assert "git commit 失败（模拟）" in (failed[0]["error"] or "")
+
+
+def test_train_version_commit_reports_written_but_uncommitted(tmp_networks, monkeypatch):
+    """边界（4d-1 实施要点 3）：commit_run 先写盘 network_version.json、再 git 提交；
+    只有提交步骤失败时文件已写盘、而版本节点未生成——文案应如实说明这一状态。"""
+    client, tmp_path = tmp_networks
+    original_id, project_id, dataset_id = _prepare_train(client, tmp_path)
+
+    from app.services import network_service, proc_util, version_service
+
+    real_run_git = version_service._run_git
+
+    def git_fails_on_commit(ws, *args, **kwargs):
+        if args and args[0] == "commit":
+            raise RuntimeError("git commit 失败（模拟）")
+        return real_run_git(ws, *args, **kwargs)
+
+    monkeypatch.setattr(proc_util, "run_command", _fake_ok_run)
+    monkeypatch.setattr(version_service, "_run_git", git_fails_on_commit)
+
+    params = _train_params(project_id, dataset_id, original_id)
+    task_id = "task-net-vc-uncommitted"
+    _insert_running_task(task_id, project_id, params)
+    asyncio.run(network_service._run_train(params, task_id))
+
+    # 版本内容在：network_version.json 已写盘且带本次 run_summary
+    ws = tmp_path / "projects" / project_id
+    written = json.loads((ws / "network_version.json").read_text(encoding="utf-8"))
+    assert written["run_summary"]["task_id"] == task_id
+    # 版本节点不在：git 提交失败，版本树没有「训练运行」这一版
+    tree = version_service.version_tree(project_id)
+    assert all("训练运行" not in v["message"] for v in tree["versions"])
+
+    progress = json.loads(client.get(f"/api/tasks/{task_id}").json()["progress"])
+    assert "版本提交失败" in progress["version_error"]
+    assert "已写盘但未提交" in progress["version_error"]
+    assert "版本内容在、版本节点不在" in progress["version_error"]
+
+
+def test_train_version_commit_success_has_no_version_error(tmp_networks, monkeypatch):
+    """反向用例：commit_run 正常时不出现 version_error（防误报），也不写失败留痕。"""
+    client, tmp_path = tmp_networks
+    original_id, project_id, dataset_id = _prepare_train(client, tmp_path)
+
+    from app.services import knowledge_service as ks, network_service, proc_util, version_service
+
+    monkeypatch.setattr(proc_util, "run_command", _fake_ok_run)
+
+    params = _train_params(project_id, dataset_id, original_id)
+    task_id = "task-net-vc-ok"
+    _insert_running_task(task_id, project_id, params)
+    asyncio.run(network_service._run_train(params, task_id))
+
+    # 任务进度不带 version_error（缺省或 null 均视为「无误报」，与项目创建响应同口径）
+    progress = json.loads(client.get(f"/api/tasks/{task_id}").json()["progress"])
+    assert progress.get("version_error") is None
+    assert progress["stage"] == "完成"
+    # 无失败留痕；版本节点已生成且带本次运行摘要
+    assert ks.list_runs(project_id, "train", status="failed") == []
+    tree = version_service.version_tree(project_id)
+    assert tree["versions"][0]["meta"]["run_summary"]["task_id"] == task_id

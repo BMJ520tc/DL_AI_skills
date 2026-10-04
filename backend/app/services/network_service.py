@@ -9,7 +9,8 @@
 报错引导先走模块一建环境——不静默退回宿主解释器（2.3 独立环境原则）。
 
 阶段4 4d-1：训练成功后「运行即提交」——指标摘要写进 network_version.json 并提交
-（version_service.commit_run；失败记日志，不连坐训练结果）。
+（version_service.commit_run；失败不连坐训练结果，但必须透出：任务进度 version_error
+字段 + run_record 失败留痕，并照旧记后端日志——不静默）。
 """
 from __future__ import annotations
 
@@ -198,6 +199,25 @@ async def _run_train(params: dict, task_id: str) -> None:
         raise
 
 
+def _version_error_message(ws: Path, task_id: str, exc: Exception) -> str:
+    """运行版本提交失败的透出文案（命名与保存路径的响应字段 version_error 同口径）。
+
+    commit_run 先写盘 network_version.json、再做 git add/commit，故失败有两种状态：
+    文件已写盘（版本内容在、版本节点不在）与提交前即失败（文件未更新）——文案据实区分，
+    使「训练结果已保留，但版本节点未生成」这件事对用户可读。
+    """
+    written = False
+    try:
+        payload = json.loads((ws / version_service.VERSION_FILENAME).read_text(encoding="utf-8"))
+        summary = payload.get("run_summary") if isinstance(payload, dict) else None
+        written = isinstance(summary, dict) and summary.get("task_id") == task_id
+    except Exception:  # noqa: BLE001 —— 文案辅助读取失败按「未写盘」表述，不掩盖原错误
+        written = False
+    state = ("版本节点未生成（network_version.json 已写盘但未提交：版本内容在、版本节点不在）"
+             if written else "版本节点未生成")
+    return f"版本提交失败（训练结果已保留；{state}）: {exc}"
+
+
 async def _do_train(params: dict, task_id: str, ctx: dict) -> None:
     """network_train 任务：导出 → 落盘 → 项目环境执行 → 指标与运行记录落库。"""
     project_id = params["project_id"]
@@ -259,17 +279,18 @@ async def _do_train(params: dict, task_id: str, ctx: dict) -> None:
     if not isinstance(metrics, dict):
         raise RuntimeError("训练指标 JSON 缺少 metrics 字典")
 
+    run_params = {
+        "dataset_id": params["dataset_id"],
+        "epochs": params["epochs"],
+        "batch_size": params["batch_size"],
+        "learning_rate": params["learning_rate"],
+    }
     knowledge_service.record_run({
         "project_id": project_id,
         "task_id": task_id,
         "run_type": "train",
         "environment": {"python": python, "environment_project_id": env_project_id},
-        "params": {
-            "dataset_id": params["dataset_id"],
-            "epochs": params["epochs"],
-            "batch_size": params["batch_size"],
-            "learning_rate": params["learning_rate"],
-        },
+        "params": run_params,
         "command": " ".join(cmd),
         "status": "success",
         "metrics": metrics,
@@ -279,12 +300,32 @@ async def _do_train(params: dict, task_id: str, ctx: dict) -> None:
         "finished_at": _now(),
     })
     ctx["recorded"] = "success"  # 成功后若再抛错，不再写一条自相矛盾的 failed 记录
-    # 4d-1 运行即提交：指标摘要入 network_version.json；失败不连坐训练结果
+    # 4d-1 运行即提交：指标摘要入 network_version.json；失败不连坐训练结果，
+    # 但必须透出（任务进度 version_error + run_record 失败留痕），不静默。
+    version_error: str | None = None
     try:
         await asyncio.to_thread(version_service.commit_run, project_id, task_id, metrics)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 —— 版本提交失败不连坐训练结果，但必须透出
+        version_error = _version_error_message(ws, task_id, exc)
         logger.exception("运行版本提交失败 project_id=%s task_id=%s", project_id, task_id)
-    task_manager.update_progress(task_id, {"stage": "完成", "metrics": metrics})
+        try:
+            knowledge_service.record_run({
+                "project_id": project_id,
+                "task_id": task_id,
+                "run_type": "train",
+                "environment": {"python": python, "environment_project_id": env_project_id},
+                "params": run_params,
+                "command": " ".join(cmd),
+                "status": "failed",
+                "error": version_error,
+                "log_path": str(log_path),
+                "started_at": started,
+                "finished_at": _now(),
+            })
+        except Exception:  # noqa: BLE001 —— 留痕写入失败不得掩盖版本提交失败本身
+            logger.exception("版本提交失败留痕落库失败 project_id=%s task_id=%s", project_id, task_id)
+    task_manager.update_progress(
+        task_id, {"stage": "完成", "metrics": metrics, "version_error": version_error})
 
 
 def register() -> None:
