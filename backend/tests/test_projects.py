@@ -226,3 +226,29 @@ def test_rollback_does_not_follow_source_link(tmp_projects, tmp_path, monkeypatc
     assert project_manager.get_project(project_id) is None
     assert not (tmp_path / "projects" / project_id).exists()
 
+
+def test_delete_project_removes_readonly_git_workspace(tmp_projects, tmp_path):
+    """工作区含 git 仓库（对象文件只读）时也必须整棵删掉。
+
+    2026-10-04 实测缺陷：`_remove_dir_safely` 遇到只读文件 `PermissionError` 就跳过，
+    而 Windows 上 `.git/objects/**` 是只读的 → 目录非空 → `rmdir` 失败，
+    「删项目」只删了数据库记录、工作区（含版本历史）留在盘上。
+    """
+    from app.services import project_manager
+
+    project_id = _create_original(tmp_projects)
+    ws = tmp_path / "projects" / project_id
+
+    git_obj = ws / ".git" / "objects" / "ab" / "deadbeef"
+    git_obj.parent.mkdir(parents=True, exist_ok=True)
+    git_obj.write_bytes(b"x")
+    os.chmod(git_obj, 0o444)  # 只读，模拟 git 对象文件
+    readonly_dir = ws / "runs"
+    readonly_dir.mkdir(exist_ok=True)
+    (readonly_dir / "log.txt").write_text("x", encoding="utf-8")
+
+    assert project_manager.delete_project(project_id) is True
+
+    assert project_manager.get_project(project_id) is None
+    assert not ws.exists(), "工作区（含只读 git 对象）应被完整删除"
+

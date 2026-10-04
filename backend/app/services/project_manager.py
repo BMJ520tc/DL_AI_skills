@@ -121,12 +121,50 @@ def _remove_link(path: Path) -> bool:
     return False
 
 
+def _force_unlink(path: Path) -> bool:
+    """删除文件；Windows 上 git 对象/包文件是只读的，先清只读位再删。
+
+    2026-10-04 实测缺陷：结构化项目工作区里含 `.git`，其 objects 下的文件带只读属性，
+    原来的 `p.unlink()` 抛 PermissionError 后 `continue` 跳过 → 目录非空 → `rmdir` 失败，
+    结果「删项目」只删了数据库记录、工作区（含版本历史）留在盘上。
+    """
+    try:
+        path.unlink()
+        return True
+    except PermissionError:
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            path.unlink()
+            return True
+        except OSError:
+            return False
+    except OSError:
+        return False
+
+
+def _force_rmdir(path: Path) -> bool:
+    """删除空目录；同样先清只读位（Windows 目录也可能带只读属性）。"""
+    try:
+        path.rmdir()
+        return True
+    except PermissionError:
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            path.rmdir()
+            return True
+        except OSError:
+            return False
+    except OSError:
+        return False
+
+
 def _remove_dir_safely(root: Path) -> None:
     """递归删除目录树，但遇到符号链接/联接只删链接本身。
 
     任意项目加载会把工作区 `source` 软链到用户本机目录（_mount_local）。shutil.rmtree
     对目录联接（junction）的处理随 Python 版本而异（3.13 起不再跟随，更早版本会递归进
     目标删用户数据），故此处自行遍历、逐个判定，不依赖该行为；删不掉就留下，绝不越界。
+    只读文件/目录（git 对象等）先清只读位再删，否则 Windows 上会留下半个工作区。
     """
     if _is_link(root):
         _remove_link(root)
@@ -144,13 +182,10 @@ def _remove_dir_safely(root: Path) -> None:
             if entry.is_dir(follow_symlinks=False):
                 _remove_dir_safely(p)
             else:
-                p.unlink()
+                _force_unlink(p)
         except OSError:
             continue
-    try:
-        root.rmdir()
-    except OSError:
-        pass
+    _force_rmdir(root)
 
 
 def delete_project(project_id: str) -> bool:
