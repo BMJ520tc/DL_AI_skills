@@ -20,6 +20,13 @@ import {
   type RequestOutcome,
   type SearchParams,
 } from "../api/knowledgeClient";
+import {
+  confirmKnowledgeItem,
+  getKnowledgeConflicts,
+  listKnowledgeDrafts,
+  supersedeKnowledgeItem,
+  type KnowledgeRow,
+} from "../api/client";
 
 /**
  * 知识库检索面板（只读）。
@@ -188,6 +195,15 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [detail, setDetail] = useState<DetailState>({ status: "idle" });
   const [showRaw, setShowRaw] = useState(false);
+  // 结果按类型分栏（需求六.1 / 模块详细设计 8.1）：tab 当前选中项，"all" 表示全部
+  const [activeTab, setActiveTab] = useState<string>("all");
+  // 面板模式：检索 / 草稿确认（模块详细设计 8.3、K4）
+  const [panelMode, setPanelMode] = useState<"search" | "drafts">("search");
+  const [drafts, setDrafts] = useState<KnowledgeRow[]>([]);
+  const [draftsLoading, setDraftsLoading] = useState(false);
+  const [draftsError, setDraftsError] = useState<string | null>(null);
+  const [conflictsByDraft, setConflictsByDraft] = useState<Record<string, KnowledgeRow[]>>({});
+  const [busyDraft, setBusyDraft] = useState<string | null>(null);
 
   const searchAbort = useRef<AbortController | null>(null);
   const detailAbort = useRef<AbortController | null>(null);
@@ -338,6 +354,67 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
     [baseUrl],
   );
 
+  /** 加载待确认草稿 + 每个草稿的潜在冲突（8.3）。 */
+  const loadDrafts = useCallback(async () => {
+    setDraftsLoading(true);
+    setDraftsError(null);
+    try {
+      const rows = await listKnowledgeDrafts();
+      setDrafts(rows);
+      const entries = await Promise.all(
+        rows.map(async row => {
+          try {
+            return [row.knowledge_id, await getKnowledgeConflicts(row.knowledge_id)] as const;
+          } catch {
+            return [row.knowledge_id, [] as KnowledgeRow[]] as const;
+          }
+        }),
+      );
+      setConflictsByDraft(Object.fromEntries(entries));
+    } catch (e) {
+      setDraftsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDraftsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (panelMode !== "drafts") return;
+    void loadDrafts();
+  }, [panelMode, loadDrafts]);
+
+  const handleConfirmDraft = useCallback(
+    async (id: string, supersede: boolean) => {
+      setBusyDraft(id);
+      setDraftsError(null);
+      try {
+        await confirmKnowledgeItem(id, supersede);
+        await loadDrafts();
+      } catch (e) {
+        setDraftsError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setBusyDraft(null);
+      }
+    },
+    [loadDrafts],
+  );
+
+  const handleSupersedeKnowledge = useCallback(
+    async (id: string) => {
+      setBusyDraft(id);
+      setDraftsError(null);
+      try {
+        await supersedeKnowledgeItem(id);
+        await loadDrafts();
+      } catch (e) {
+        setDraftsError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setBusyDraft(null);
+      }
+    },
+    [loadDrafts],
+  );
+
   const detailJson = useMemo(() => {
     if (detail.status !== "ready") return "";
     const normalized = normalizeDetailPayload(detail.payload);
@@ -351,6 +428,20 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
   }, [detail]);
 
   const handledCount = hits.length;
+
+  // 分栏：按 data_type 统计与过滤（tab 内计数真实反映本次检索返回的条目）
+  const typeCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    hits.forEach(hit => {
+      const key = hit.data_type || "knowledge";
+      counts[key] = (counts[key] || 0) + 1;
+    });
+    return counts;
+  }, [hits]);
+  const visibleHits = useMemo(
+    () => (activeTab === "all" ? hits : hits.filter(hit => (hit.data_type || "knowledge") === activeTab)),
+    [hits, activeTab],
+  );
 
   return (
     <>
@@ -372,7 +463,31 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
             background: "#12151b",
           }}
         >
-          <span style={{ fontSize: 15, fontWeight: 600 }}>📚 知识库检索</span>
+          <span style={{ fontSize: 15, fontWeight: 600 }}>📚 知识库</span>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button
+              onClick={() => setPanelMode("search")}
+              style={{
+                ...BUTTON_BASE, padding: "3px 12px", fontSize: 12,
+                background: panelMode === "search" ? "#1d4ed8" : "#1f2937",
+                color: panelMode === "search" ? "#fff" : "#cbd5e1",
+                border: "1px solid #374151",
+              }}
+            >
+              检索
+            </button>
+            <button
+              onClick={() => setPanelMode("drafts")}
+              style={{
+                ...BUTTON_BASE, padding: "3px 12px", fontSize: 12,
+                background: panelMode === "drafts" ? "#7c3aed" : "#1f2937",
+                color: panelMode === "drafts" ? "#fff" : "#cbd5e1",
+                border: "1px solid #374151",
+              }}
+            >
+              草稿
+            </button>
+          </div>
           <span style={{ color: "#6b7280", fontSize: 12 }}>
             后端：<code style={{ color: "#9ca3af" }}>{describeApiBaseUrl(baseUrl)}</code>
           </span>
@@ -386,6 +501,8 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
           </button>
         </div>
 
+        {panelMode === "search" ? (
+        <>
         {/* 检索条件 */}
         <div style={{ padding: "12px 16px", borderBottom: "1px solid #262b36", display: "grid", gap: 10 }}>
           <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
@@ -532,14 +649,49 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
                 position: "sticky",
                 top: 0,
                 background: "#0f1115",
-                display: "flex",
-                justifyContent: "space-between",
+                zIndex: 1,
               }}
             >
-              <span>结果</span>
-              <span>
-                {loading ? "检索中…" : hasSearched ? `${handledCount} 条` : "—"}
-              </span>
+              <div style={{ display: "flex", justifyContent: "space-between" }}>
+                <span>结果</span>
+                <span>
+                  {loading ? "检索中…" : hasSearched ? `${handledCount} 条` : "—"}
+                </span>
+              </div>
+              {/* 按类型分栏（tab）：全部 + 命中到的类型，各自带计数 */}
+              {hits.length > 0 ? (
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+                  <button
+                    onClick={() => setActiveTab("all")}
+                    style={{
+                      ...BUTTON_BASE,
+                      padding: "3px 9px",
+                      fontSize: 11,
+                      background: activeTab === "all" ? "#1d4ed8" : "#1f2937",
+                      color: activeTab === "all" ? "#fff" : "#cbd5e1",
+                      border: "1px solid #374151",
+                    }}
+                  >
+                    全部 <span style={{ color: "#9ca3af" }}>{hits.length}</span>
+                  </button>
+                  {KNOWLEDGE_DATA_TYPES.filter(value => (typeCounts[value] || 0) > 0).map(value => (
+                    <button
+                      key={value}
+                      onClick={() => setActiveTab(value)}
+                      style={{
+                        ...BUTTON_BASE,
+                        padding: "3px 9px",
+                        fontSize: 11,
+                        background: activeTab === value ? typeColor(value) : "#1f2937",
+                        color: activeTab === value ? "#fff" : typeColor(value),
+                        border: "1px solid #374151",
+                      }}
+                    >
+                      {DATA_TYPE_LABELS[value]} <span style={{ color: "#9ca3af" }}>{typeCounts[value]}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
             </div>
 
             {failure ? (
@@ -564,7 +716,7 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
               <div style={{ padding: 16, color: "#6b7280" }}>输入关键词后点击「检索」。</div>
             ) : null}
 
-            {hits.map((hit, index) => {
+            {visibleHits.map((hit, index) => {
               const dataType = hit.data_type || "knowledge";
               const refId = hit.ref_id || hit.id || "";
               const key = `${dataType}:${refId}:${index}`;
@@ -727,6 +879,72 @@ export default function KnowledgeSearchPanel({ onClose }: Props) {
           </div>
         </div>
 
+        </>
+        ) : (
+        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 16, display: "grid", gap: 12, alignContent: "start" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontWeight: 600 }}>待确认蒸馏草稿</span>
+            <span style={{ color: "#6b7280", fontSize: 12 }}>{drafts.length} 条</span>
+            <div style={{ flex: 1 }} />
+            <button onClick={() => void loadDrafts()} disabled={draftsLoading}
+                    style={{ ...BUTTON_BASE, padding: "3px 10px", fontSize: 12, background: "#1f2937", color: "#cbd5e1" }}>
+              {draftsLoading ? "刷新中…" : "刷新"}
+            </button>
+          </div>
+
+          {draftsError ? <FailureBox failure={{ message: draftsError, hint: "请确认后端已启动且知识库接口可用。", url: "/api/knowledge/list" }} onRetry={() => void loadDrafts()} /> : null}
+
+          {!draftsLoading && drafts.length === 0 && !draftsError ? (
+            <div style={{ color: "#6b7280", lineHeight: 1.7 }}>
+              暂无待确认草稿。任务结束后（如环境创建、训练、拆解、复现）系统会起草结论，
+              在此确认后进入知识库并参与后续任务带入。
+            </div>
+          ) : null}
+
+          {drafts.map(draft => {
+            const conflicts = conflictsByDraft[draft.knowledge_id] || [];
+            const busy = busyDraft === draft.knowledge_id;
+            return (
+              <div key={draft.knowledge_id}
+                   style={{ border: "1px solid #262b36", background: "#12151b", borderRadius: 8, padding: 12 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: "#fff", background: "#7c3aed",
+                                 borderRadius: 4, padding: "1px 6px" }}>{draft.type}</span>
+                  <span style={{ fontWeight: 600 }}>{draft.title || "(无标题)"}</span>
+                  {draft.confidence ? <span style={{ color: "#64748b", fontSize: 11 }}>{draft.confidence}</span> : null}
+                  <span style={{ color: "#64748b", fontSize: 11, marginLeft: "auto" }}>{formatTimestamp(draft.created_at)}</span>
+                </div>
+                <div style={{ color: "#cbd5e1", whiteSpace: "pre-wrap", lineHeight: 1.6 }}>{draft.content}</div>
+                {conflicts.length > 0 ? (
+                  <div style={{ marginTop: 8, color: "#fbbf24", fontSize: 12 }}>
+                    ⚠ 与 {conflicts.length} 条已确认知识冲突：{conflicts.map(c => c.title || c.knowledge_id).join("、")}
+                  </div>
+                ) : null}
+                <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                  <button onClick={() => void handleConfirmDraft(draft.knowledge_id, false)} disabled={busy}
+                          style={{ ...BUTTON_BASE, padding: "4px 12px", fontSize: 12, background: "#1d4ed8", color: "#fff", border: "1px solid #2563eb" }}>
+                    {busy ? "处理中…" : "确认入库"}
+                  </button>
+                  {conflicts.length > 0 ? (
+                    <>
+                      <button onClick={() => void handleConfirmDraft(draft.knowledge_id, true)} disabled={busy}
+                              style={{ ...BUTTON_BASE, padding: "4px 12px", fontSize: 12, background: "#b45309", color: "#fff", border: "1px solid #d97706" }}>
+                        确认并推翻旧结论
+                      </button>
+                      {conflicts.map(c => (
+                        <button key={c.knowledge_id} onClick={() => void handleSupersedeKnowledge(c.knowledge_id)} disabled={busy}
+                                style={{ ...BUTTON_BASE, padding: "4px 10px", fontSize: 12, background: "#1f2937", color: "#fca5a5" }}>
+                          作废「{c.title || c.knowledge_id.slice(0, 8)}」
+                        </button>
+                      ))}
+                    </>
+                  ) : null}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        )}
         {/* 底部调试信息 */}
         <div
           style={{

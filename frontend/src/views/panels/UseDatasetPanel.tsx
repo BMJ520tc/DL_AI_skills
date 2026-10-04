@@ -20,6 +20,7 @@ import {
     type DatasetSearchResult,
 } from "../../api/client";
 import { useTaskPolling } from "../../hooks/useTaskPolling";
+import KnowledgeBringBanner from "../../components/KnowledgeBringBanner";
 
 export type UseDatasetPanelProps = {
     projectId: string;
@@ -326,6 +327,11 @@ export default function UseDatasetPanel({ projectId }: UseDatasetPanelProps) {
     // 基准运行可用性：自带数据已登记为数据集（预处理产物）才真正跑得动
     const selfDatasets = datasets.filter(d => d.source === "自带" && d.local_path);
 
+    // 任务前带入选用的维度：当前目标数据集（模块详细设计 8.2「模块三新数据集评估」）
+    const selectedDataset = datasets.find(d => d.dataset_id === selectedDatasetId) ?? null;
+    const selectedDatasetName = selectedDataset?.name ? String(selectedDataset.name) : undefined;
+    const selectedTaskType = selectedDataset?.task_type ? String(selectedDataset.task_type) : undefined;
+
     return (
         <div style={{ fontSize: 12 }}>
             {/* 数据集选择 */}
@@ -348,6 +354,11 @@ export default function UseDatasetPanel({ projectId }: UseDatasetPanelProps) {
                 </label>
                 {datasets.length === 0 && <span style={{ color: "#64748b", fontSize: 11 }}>数据集登记表为空（可先做预处理或检索下载）</span>}
             </div>
+
+            {/* 任务前知识带入（模块详细设计 8.2）：按目标数据集维度检索已确认蒸馏结论 */}
+            {selectedDatasetId ? (
+                <KnowledgeBringBanner dataset={selectedDatasetName} task_type={selectedTaskType} />
+            ) : null}
 
             {(banner || flash || taskInfo) && (
                 <div style={{ marginTop: 8 }}>

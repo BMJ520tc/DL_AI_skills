@@ -6,10 +6,24 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-    createProjectEnv, getNetworkRunOptions, getProjectEnvStatus, listNetworkRuns, listProjects,
-    postNetworkRun, type NetworkRunOptions, type NetworkRunRecord, type Project, type Task,
+    bringKnowledge, createProjectEnv, getNetworkRunOptions, getProjectEnvStatus, listNetworkRuns, listProjects,
+    postNetworkRun, type KnowledgeBringResult, type NetworkRunOptions, type NetworkRunRecord, type Project, type Task,
 } from "../../api/client";
 import { useTaskPolling } from "../../hooks/useTaskPolling";
+
+/** 从带入的参数建议里取可用的超参（八.2「默认填入参数面板」）：只认数值型 epochs/batch_size/learning_rate。 */
+function suggestedParams(advice: KnowledgeBringResult | null): Partial<Record<"epochs" | "batch_size" | "learning_rate", number>> {
+    const out: Partial<Record<"epochs" | "batch_size" | "learning_rate", number>> = {};
+    const raw = advice?.param_advice?.[0]?.structured;
+    const params = raw && typeof raw === "object" ? (raw as { params?: unknown }).params : null;
+    if (params && typeof params === "object") {
+        for (const key of ["epochs", "batch_size", "learning_rate"] as const) {
+            const val = (params as Record<string, unknown>)[key];
+            if (typeof val === "number" && Number.isFinite(val)) out[key] = val;
+        }
+    }
+    return out;
+}
 
 export type NetworkRunPanelProps = {
     projectId: string;
@@ -70,6 +84,10 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
     const [options, setOptions] = useState<NetworkRunOptions | null>(null);
     const [optionsError, setOptionsError] = useState<string | null>(null);
     const [runs, setRuns] = useState<NetworkRunRecord[]>([]);
+    // 任务前知识带入（8.2）：选数据集后按其维度检索已确认蒸馏结论，作为可改的默认建议。
+    const [bringAdvice, setBringAdvice] = useState<KnowledgeBringResult | null>(null);
+    // 安装依赖前的冲突预检（8.2）：建环境任务进度里的 env_precheck，透出到界面（③）
+    const [envPrecheck, setEnvPrecheck] = useState<{ count: number; items: Array<{ title?: string; content?: string }> } | null>(null);
 
     const [datasetId, setDatasetId] = useState<string>("");
     const [environmentProjectId, setEnvironmentProjectId] = useState<string>("");
@@ -129,6 +147,38 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
             }
         })();
     }, [projectId, refreshOptions, loadOriginals]);
+
+    const selectedDataset = useMemo(
+        () => options?.datasets.find(d => d.dataset_id === datasetId) ?? null,
+        [options, datasetId],
+    );
+
+    // 选好数据集 → 带入已确认知识（参数建议默认填入超参，冲突预警展示；用户均可忽略/改）。
+    // 结果在 async 路径内落地（不在 effect 体内同步 setState）；渲染侧以 selectedDataset 门控，
+    // 清空数据集时旧建议自然不再显示。
+    useEffect(() => {
+        if (!selectedDataset) return;
+        let cancelled = false;
+        void (async () => {
+            try {
+                const advice = await bringKnowledge({
+                    dataset: selectedDataset.name ?? undefined,
+                    task_type: selectedDataset.task_type ?? undefined,
+                });
+                if (cancelled) return;
+                setBringAdvice(advice);
+                const suggested = suggestedParams(advice);
+                if (suggested.epochs !== undefined) setEpochs(suggested.epochs);
+                if (suggested.batch_size !== undefined) setBatchSize(suggested.batch_size);
+                if (suggested.learning_rate !== undefined) setLearningRate(suggested.learning_rate);
+            } catch {
+                if (!cancelled) setBringAdvice(null);
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [selectedDataset]);
 
     // 建环境的目标：显式选择 > 父项目 > 第一个 original 项目（没有父项目也能建）
     const envTarget = envTargetId || options?.parent_project_id || originals[0]?.project_id || null;
@@ -192,6 +242,7 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
         if (!envTarget || envTaskId) return;
         setEnvError(null);
         setEnvStatus(null);
+        setEnvPrecheck(null);
         try {
             const res = await createProjectEnv(envTarget);
             setEnvTaskId(res.task_id);
@@ -202,6 +253,15 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
 
     useTaskPolling({
         taskId: envTaskId,
+        onProgress: t => {
+            if (!t.progress) return;
+            try {
+                const parsed = JSON.parse(t.progress);
+                if (parsed && parsed.env_precheck) setEnvPrecheck(parsed.env_precheck);
+            } catch {
+                /* 进度非 JSON 时忽略 */
+            }
+        },
         onDone: async () => {
             setEnvTaskId(null);
             await refreshOptions();
@@ -289,6 +349,30 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
                 ))}
             </select>
 
+            {selectedDataset && bringAdvice && (bringAdvice.param_advice.length > 0 || bringAdvice.dependency_conflict.length > 0) && (
+                <div
+                    style={{
+                        marginTop: 8,
+                        padding: "6px 8px",
+                        border: "1px solid #1e3a5f",
+                        background: "#0b1a2b",
+                        borderRadius: 6,
+                        fontSize: 11,
+                        color: "#cbd5e1",
+                        lineHeight: 1.5,
+                    }}
+                >
+                    <div style={{ color: "#7dd3fc", fontWeight: 600, marginBottom: 2 }}>知识库带入建议</div>
+                    {bringAdvice.param_advice.map((a, i) => (
+                        <div key={`pa-${i}`}>· 参数：{a.title || a.content}</div>
+                    ))}
+                    {bringAdvice.dependency_conflict.map((a, i) => (
+                        <div key={`dc-${i}`} style={{ color: "#fca5a5" }}>⚠ 冲突：{a.title || a.content}</div>
+                    ))}
+                    <div style={{ color: "#64748b", marginTop: 2 }}>（建议已默认填入，可直接修改或忽略）</div>
+                </div>
+            )}
+
             <label style={{ ...labelStyle, marginTop: 10 }}>目标环境（项目独立环境）</label>
             <select
                 style={inputStyle}
@@ -349,6 +433,15 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
             </select>
             {envError && (
                 <div style={{ color: "#f87171", marginTop: 4, fontSize: 11, whiteSpace: "pre-wrap" }}>{envError}</div>
+            )}
+            {envPrecheck && envPrecheck.count > 0 && (
+                <div style={{ marginTop: 6, padding: "5px 8px", border: "1px solid #b45309", background: "#3b2d0e",
+                              borderRadius: 6, color: "#fde68a", fontSize: 11, lineHeight: 1.5 }}>
+                    ⚠ 安装依赖前预检到 {envPrecheck.count} 条已知依赖冲突（已按绕开方案处理）：
+                    {envPrecheck.items.slice(0, 3).map((it, i) => (
+                        <div key={i}>· {it.title || it.content}</div>
+                    ))}
+                </div>
             )}
 
             <div style={{ display: "flex", gap: 8, marginTop: 10 }}>

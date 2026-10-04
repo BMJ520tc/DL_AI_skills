@@ -399,8 +399,94 @@ export const listModules = () => request<ModuleItem[]>("/api/modules");
 export const listKnowledge = (dataType: string, limit = 200) =>
     request<Array<Record<string, unknown>>>(`/api/knowledge/list?data_type=${dataType}&limit=${limit}`);
 
-export const confirmKnowledgeItem = (knowledgeId: string) =>
-    request<{ knowledge_id: string; status: string }>(`/api/knowledge/confirm/${knowledgeId}`, { method: "POST" });
+export const confirmKnowledgeItem = (knowledgeId: string, supersedeConflicts = false) =>
+    request<{ knowledge_id: string; status: string }>(
+        `/api/knowledge/confirm/${knowledgeId}${supersedeConflicts ? "?supersede=true" : ""}`,
+        { method: "POST" },
+    );
+
+/** 蒸馏知识行（knowledge 表的记录，草稿确认界面用）。 */
+export interface KnowledgeRow {
+    knowledge_id: string;
+    type: string;
+    title: string | null;
+    content: string | null;
+    structured: string | null;
+    scope: string | null;
+    confidence: string | null;
+    status: string;
+    created_at: string | null;
+}
+
+/** 蒸馏草稿列表（status=draft，模块详细设计 8.3）。 */
+export const listKnowledgeDrafts = (limit = 100) =>
+    request<KnowledgeRow[]>(`/api/knowledge/list?data_type=knowledge&status=draft&limit=${limit}`);
+
+/** 某草稿的潜在冲突（同类型 + scope 相容的已确认知识）。 */
+export const getKnowledgeConflicts = (knowledgeId: string) =>
+    request<KnowledgeRow[]>(`/api/knowledge/conflicts/${knowledgeId}`);
+
+/** 把已确认知识置为 superseded（被后续运行推翻）。 */
+export const supersedeKnowledgeItem = (knowledgeId: string) =>
+    request<{ knowledge_id: string; status: string }>(`/api/knowledge/supersede/${knowledgeId}`, { method: "POST" });
+
+// ---------------------------------------------------------------------------
+// 多模型综合分析（模块六 8.4，需求六.2）
+// ---------------------------------------------------------------------------
+
+export interface MultiModelReport {
+    analysis_id: string;
+    models: Array<{ run_id: string; name: string }>;
+    fusion: string;
+    n_common_samples: number;
+    consistent: Array<Record<string, unknown>>;
+    disagreements: Array<Record<string, unknown>>;
+    incomparable: Array<Record<string, unknown>>;
+    metrics_before: Record<string, { accuracy: number | null; n: number }>;
+    metrics_after: { accuracy: number | null; n: number; fusion: string };
+    attribution: {
+        summary?: string;
+        reasons?: Array<{ cause: string; explanation: string; sample_ids?: string[] }>;
+    } | null;
+    attribution_error?: string | null;
+    knowledge_id?: string;
+}
+
+export const startMultiModel = (body: { run_ids: string[]; labels?: string[]; fusion?: string; task_type?: string }) =>
+    request<{ task_id: string; status: string }>("/api/multi-model", {
+        method: "POST",
+        body: JSON.stringify(body),
+    });
+
+export const getMultiModelReport = (analysisId: string) =>
+    request<MultiModelReport>(`/api/multi-model/${analysisId}`);
+
+/** 蒸馏知识条目（带入结果里的单条，八.2）。 */
+export interface KnowledgeAdviceItem {
+    knowledge_id?: string;
+    title?: string;
+    content?: string;
+    structured?: Record<string, unknown> | null;
+}
+
+export interface KnowledgeBringResult {
+    param_advice: KnowledgeAdviceItem[];
+    dependency_conflict: KnowledgeAdviceItem[];
+}
+
+/** 任务前知识带入（模块详细设计 8.2、数据设计三.3）：后端为查询参数，故走 query string。 */
+export const bringKnowledge = (
+    params: { task_type?: string; model?: string; dataset?: string } = {},
+) => {
+    const q = new URLSearchParams();
+    if (params.task_type) q.set("task_type", params.task_type);
+    if (params.model) q.set("model", params.model);
+    if (params.dataset) q.set("dataset", params.dataset);
+    const suffix = q.toString();
+    return request<KnowledgeBringResult>(`/api/knowledge/bring${suffix ? `?${suffix}` : ""}`, {
+        method: "POST",
+    });
+};
 
 // ---------------------------------------------------------------------------
 // 模块二：论文复现（三并列入口「先复现」，4.2~4.4）

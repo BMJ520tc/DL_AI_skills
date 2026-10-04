@@ -11,6 +11,7 @@ import DiagnosticsPanel from "./components/DiagnosticsPanel";
 import ComputePanel from "./components/ComputePanel";
 import TraceView from "./components/TraceView";
 import KnowledgeSearchPanel from "./components/KnowledgeSearchPanel";
+import MultiModelPanel from "./components/MultiModelPanel";
 import { EditorToolbar } from "./features/editor/components/EditorToolbar";
 import { EditorSidebar } from "./features/editor/components/EditorSidebar";
 import { CodePanel } from "./features/editor/components/CodePanel";
@@ -185,6 +186,8 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
 
     // 知识库检索面板开关（独立于画布状态，不影响既有编辑流程）
     const [showKnowledge, setShowKnowledge] = useState(false);
+    // 多模型综合分析面板开关（模块六 8.4，独立于画布状态）
+    const [showMultiModel, setShowMultiModel] = useState(false);
 
     // 画布保存（模块四 B3 结构化项目最小闭环：全量 GraphIR v2 快照覆盖）
     const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "warned" | "error">("idle");
@@ -386,6 +389,7 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                         layout.setShowComputePanel(next);
                     }}
                     onOpenKnowledge={() => setShowKnowledge(true)}
+                    onOpenMultiModel={() => setShowMultiModel(true)}
                     statusSlot={
                         trace.shapeResult &&
                         (trace.shapeResult.failures.length > 0 || trace.shapeMissing.length > 0) ? (
@@ -780,6 +784,7 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
             )}
 
             {showKnowledge && <KnowledgeSearchPanel onClose={() => setShowKnowledge(false)} />}
+            {showMultiModel && <MultiModelPanel onClose={() => setShowMultiModel(false)} />}
         </div>
     );
 }

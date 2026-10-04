@@ -33,6 +33,8 @@ type Props = {
     onToggleComputePanel: () => void;
     /** 可选：传入后工具栏右侧出现「知识库」按钮，用于打开知识库检索面板。 */
     onOpenKnowledge?: () => void;
+    /** 可选：传入后工具栏右侧出现「多模型」按钮，用于打开多模型综合分析面板（模块六 8.4）。 */
+    onOpenMultiModel?: () => void;
     /** 可选：为 true 时隐藏「分析」（张量追踪/种子）入口（外部画布模式）。 */
     hideTrace?: boolean;
     statusSlot?: ReactNode;
@@ -74,6 +76,7 @@ export default function EditorHeader({
     onToggleDiagnostics,
     onToggleComputePanel,
     onOpenKnowledge,
+    onOpenMultiModel,
     hideTrace = false,
     statusSlot,
     selectionSummary,
@@ -411,6 +414,25 @@ export default function EditorHeader({
                             title="打开知识库检索面板"
                         >
                             知识库
+                        </button>
+                    ) : null}
+                    {onOpenMultiModel ? (
+                        <button
+                            className="nodrag"
+                            onClick={onOpenMultiModel}
+                            style={{
+                                padding: "4px 8px",
+                                borderRadius: 6,
+                                border: "1px solid #3f3f46",
+                                background: "#111318",
+                                color: "#e6edf3",
+                                cursor: "pointer",
+                                fontSize: 12,
+                                flexShrink: 0,
+                            }}
+                            title="打开多模型综合分析面板"
+                        >
+                            多模型
                         </button>
                     ) : null}
                     <button

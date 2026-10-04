@@ -37,6 +37,7 @@ import {
 import CodeViewer from "../components/CodeViewer";
 import DiagramView from "../components/DiagramView";
 import { useTaskPolling } from "../hooks/useTaskPolling";
+import KnowledgeBringBanner from "../components/KnowledgeBringBanner";
 import { graphIRToFlow, irToGraphIR } from "../utils/irAdapter";
 import ReproducePanel from "./panels/ReproducePanel";
 import UseDatasetPanel from "./panels/UseDatasetPanel";
@@ -549,6 +550,8 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
     const [envStatus, setEnvStatus] = useState<string | null>(null);
     const [envTaskId, setEnvTaskId] = useState<string | null>(null);
     const [envError, setEnvError] = useState<string | null>(null);
+    // 安装依赖前的知识库冲突预检（模块详细设计 8.2）：env_create 任务进度里的 env_precheck（③ 界面可见）
+    const [envPrecheck, setEnvPrecheck] = useState<{ count: number; items: Array<{ title?: string; content?: string }> } | null>(null);
     const [smokeRuns, setSmokeRuns] = useState<RunRecord[]>([]);
     // 模块四 6.2：入口输入规格补参（agent 给不出维度时的唯一通道）
     const [specShape, setSpecShape] = useState("");
@@ -662,6 +665,16 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
     // 独立环境创建任务：终态刷新环境状态；失败把原因透出（不静默）
     useTaskPolling({
         taskId: envTaskId,
+        onProgress: t => {
+            // 安装依赖前的冲突预检结论（8.2）在任务进度里，透出到界面（③）
+            if (!t.progress) return;
+            try {
+                const parsed = JSON.parse(t.progress);
+                if (parsed && parsed.env_precheck) setEnvPrecheck(parsed.env_precheck);
+            } catch {
+                /* 进度非 JSON 时忽略 */
+            }
+        },
         onDone: async () => {
             setEnvTaskId(null);
             setEnvError(null);
@@ -777,6 +790,7 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
     const handleCreateEnv = () => {
         if (envTaskId) return;
         setEnvError(null);
+        setEnvPrecheck(null);
         setBanner(null);
         void (async () => {
             try {
@@ -1110,6 +1124,19 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                                 <button style={{ ...btnStyle, marginLeft: 10 }} onClick={() => setEnvError(null)}>关闭</button>
                             </div>
                         )}
+                        {/* 安装依赖前的冲突预检（模块详细设计 8.2）：把已确认的依赖冲突预警透出到界面 */}
+                        {envPrecheck && envPrecheck.count > 0 && (
+                            <div style={{ ...infoBanner, background: "#3b2d0e", borderColor: "#b45309", color: "#fde68a" }}>
+                                ⚠ 安装依赖前预检到 {envPrecheck.count} 条已知依赖冲突（已按绕开方案处理）：
+                                <div style={{ marginTop: 4, fontSize: 11 }}>
+                                    {envPrecheck.items.slice(0, 3).map((it, i) => (
+                                        <div key={i}>· {it.title || it.content}</div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                        {/* 任务前知识带入建议（模块详细设计 8.2）：模块一以项目名作模型维度检索 */}
+                        <KnowledgeBringBanner model={project?.name ?? undefined} />
                         {smokeRuns.length > 0 && (
                             <div style={{ border: "1px solid #1f2937", borderRadius: 8, padding: "6px 10px", marginBottom: 8 }}>
                                 <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>
