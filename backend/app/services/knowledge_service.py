@@ -263,13 +263,61 @@ def update_paper(paper_id: str, **fields) -> bool:
         conn.close()
 
 
+def _index_experiment_item(conn, item_id: str, item: dict) -> None:
+    """experiment_item 的统一索引（数据设计三.1：ref_id 用主键、data_type 用表名）。
+
+    维度（task_type/model_name/dataset_name）只取该行上下文里已有的约定键，
+    缺省保持 None——不凭空臆造（对齐 `test_dimensions_not_invented_when_absent`）。
+    不写 source_project_id：论文子条目若把它设成 paper_id，会让 `delete_item("paper", …)`
+    的引用检查把自己的子条目当成「外部引用」而拒绝删除。
+    """
+    dims = _derive_dimensions(item)
+    title = item.get("metric_name")
+    bits = [
+        f"数据集 {item['dataset_name']}" if item.get("dataset_name") else "",
+        f"划分 {item['split_method']}" if item.get("split_method") else "",
+        f"报告值 {item['metric_value_reported']}" if item.get("metric_value_reported") else "",
+        f"单位 {item['metric_unit']}" if item.get("metric_unit") else "",
+        f"来源 {item['section_ref']}" if item.get("section_ref") else "",
+    ]
+    index_entry(
+        conn, "experiment_item", item_id,
+        title=title,
+        summary="；".join(b for b in bits if b) or None,
+        tags=[item["dataset_name"]] if item.get("dataset_name") else None,
+        keywords=" ".join(x for x in (title, item.get("dataset_name"), item.get("split_method")) if x) or None,
+        **dims,
+    )
+
+
+def _index_reproduction_result(conn, result_id: str, result: dict, item: dict) -> None:
+    """reproduction_result 的统一索引（维度取条目/结果上下文，缺省不编造）。"""
+    dims = _derive_dimensions(result, item)
+    metric = item.get("metric_name")
+    verdict = result.get("verdict")
+    bits = [
+        f"指标 {metric}" if metric else "",
+        f"实测 {result['metric_value_actual']}" if result.get("metric_value_actual") is not None else "",
+        f"报告值 {item['metric_value_reported']}" if item.get("metric_value_reported") else "",
+        f"判定 {verdict}" if verdict else "",
+        f"偏差 {result['deviation']}" if result.get("deviation") is not None else "",
+    ]
+    index_entry(
+        conn, "reproduction_result", result_id,
+        title=f"{metric} 复现对照" if metric else "复现对照",
+        summary="；".join(b for b in bits if b) or None,
+        tags=[verdict] if verdict else None,
+        keywords=" ".join(x for x in (metric, verdict, item.get("dataset_name")) if x) or None,
+        **dims,
+    )
+
+
 def record_experiment_items(paper_id: str, items: list[dict]) -> list[str]:
     """写入实验条目（模块二 4.2）：先清掉该论文的旧条目再重建，保证重抽取幂等。
 
-    条目不对应 unified_index 独立数据类型（数据设计三.1 枚举为 paper/run/knowledge/
-    module/dataset），其检索随所属 paper 条目进行。
+    条目同步写 unified_index（data_type=experiment_item），使知识库全文检索
+    （`GET /api/knowledge/search`）与前端检索面板能搜到论文抽取结果。
     """
-    now = _now()
     conn = get_connection()
     try:
         # 重抽取即旧的条目失效：条目本身与其派生的复现结果/可信度结论一并清掉（同 delete_item 级联）
@@ -298,6 +346,7 @@ def record_experiment_items(paper_id: str, items: list[dict]) -> list[str]:
                     it.get("status", "extracted"),
                 ),
             )
+            _index_experiment_item(conn, item_id, {**it, "metric_value_reported": _as_text(it.get("metric_value_reported"))})
             item_ids.append(item_id)
         conn.commit()
     finally:
@@ -335,7 +384,10 @@ def get_experiment_item(item_id: str) -> Optional[dict]:
 
 
 def update_experiment_item(item_id: str, **fields) -> bool:
-    """用户编辑实验条目（模块二 4.2：用户在界面确认或修改后条目生效）。"""
+    """用户编辑实验条目（模块二 4.2：用户在界面确认或修改后条目生效）。
+
+    主表改了必须同步统一索引，否则检索到的是旧的指标名/报告值。
+    """
     allowed = {"section_ref", "dataset_name", "split_method", "metric_name",
                "metric_value_reported", "metric_unit", "hyperparams", "baselines", "status"}
     sets, args = [], []
@@ -354,6 +406,10 @@ def update_experiment_item(item_id: str, **fields) -> bool:
     conn = get_connection()
     try:
         cur = conn.execute(f"UPDATE experiment_item SET {', '.join(sets)} WHERE item_id = ?", args)
+        if cur.rowcount:
+            row = conn.execute("SELECT * FROM experiment_item WHERE item_id = ?", (item_id,)).fetchone()
+            if row is not None:
+                _index_experiment_item(conn, item_id, dict(row))
         conn.commit()
         return cur.rowcount > 0
     finally:
@@ -375,7 +431,7 @@ def confirm_experiment_item(item_id: str) -> bool:
 
 
 def record_reproduction_result(result: dict) -> str:
-    """写入复现对照记录（模块二 4.3/4.4，数据设计四.3）。"""
+    """写入复现对照记录（模块二 4.3/4.4，数据设计四.3），并同步统一索引。"""
     result_id = result.get("result_id") or uuid.uuid4().hex
     conn = get_connection()
     try:
@@ -396,14 +452,24 @@ def record_reproduction_result(result: dict) -> str:
                 result.get("evidence_path"),
             ),
         )
+        _reindex_reproduction_result(conn, result_id)
         conn.commit()
     finally:
         conn.close()
     return result_id
 
 
+def _reindex_reproduction_result(conn, result_id: str) -> None:
+    """按库中最新的一行复现对照 + 其条目刷新统一索引。"""
+    row = conn.execute("SELECT * FROM reproduction_result WHERE result_id = ?", (result_id,)).fetchone()
+    if row is None:
+        return
+    item = conn.execute("SELECT * FROM experiment_item WHERE item_id = ?", (row["item_id"],)).fetchone()
+    _index_reproduction_result(conn, result_id, dict(row), dict(item) if item is not None else {})
+
+
 def update_reproduction_result(result_id: str, **fields) -> bool:
-    """4.4 逐条对照写回 deviation/passed_threshold/verdict。"""
+    """4.4 逐条对照写回 deviation/passed_threshold/verdict（并刷新统一索引摘要）。"""
     allowed = {"run_id", "metric_value_actual", "deviation", "passed_threshold", "verdict", "evidence_path"}
     sets, args = [], []
     for key, val in fields.items():
@@ -419,6 +485,8 @@ def update_reproduction_result(result_id: str, **fields) -> bool:
     conn = get_connection()
     try:
         cur = conn.execute(f"UPDATE reproduction_result SET {', '.join(sets)} WHERE result_id = ?", args)
+        if cur.rowcount:
+            _reindex_reproduction_result(conn, result_id)
         conn.commit()
         return cur.rowcount > 0
     finally:
@@ -426,9 +494,21 @@ def update_reproduction_result(result_id: str, **fields) -> bool:
 
 
 def clear_reproduction_results(paper_id: str) -> int:
-    """清除某论文的全部复现对照记录（重跑复现前调用，避免旧记录使结论重复计入）。"""
+    """清除某论文的全部复现对照记录（重跑复现前调用，避免旧记录使结论重复计入）。
+
+    同时清掉这些记录的 unified_index 条目，避免索引里留下 join 不可见的孤儿。
+    """
     conn = get_connection()
     try:
+        result_ids = [r[0] for r in conn.execute(
+            "SELECT result_id FROM reproduction_result WHERE item_id IN "
+            "(SELECT item_id FROM experiment_item WHERE paper_id = ?)",
+            (paper_id,),
+        ).fetchall()]
+        for rid in result_ids:
+            conn.execute(
+                "DELETE FROM unified_index WHERE data_type = 'reproduction_result' AND ref_id = ?", (rid,)
+            )
         cur = conn.execute(
             "DELETE FROM reproduction_result WHERE item_id IN "
             "(SELECT item_id FROM experiment_item WHERE paper_id = ?)",
@@ -461,10 +541,20 @@ def list_reproduction_results(paper_id: str) -> list[dict]:
 
 
 def record_credibility_conclusion(paper_id: str, conclusion: dict) -> str:
-    """写入可信度结论（模块二 4.4）：同论文重算则先删旧结论，保持一论文一结论。"""
+    """写入可信度结论（模块二 4.4）：同论文重算则先删旧结论，保持一论文一结论。
+
+    结论同步写 unified_index（data_type=credibility_conclusion）；删旧结论时连它的索引条目
+    一起删，避免索引里留下指向已删行的孤儿。
+    """
     conclusion_id = conclusion.get("conclusion_id") or uuid.uuid4().hex
     conn = get_connection()
     try:
+        old_ids = [r[0] for r in conn.execute(
+            "SELECT conclusion_id FROM credibility_conclusion WHERE paper_id = ?", (paper_id,)).fetchall()]
+        for old_id in old_ids:
+            conn.execute(
+                "DELETE FROM unified_index WHERE data_type = 'credibility_conclusion' AND ref_id = ?", (old_id,)
+            )
         conn.execute("DELETE FROM credibility_conclusion WHERE paper_id = ?", (paper_id,))
         conn.execute(
             """
@@ -481,6 +571,15 @@ def record_credibility_conclusion(paper_id: str, conclusion: dict) -> str:
                 if conclusion.get("item_results") is not None else None,
                 _now(),
             ),
+        )
+        verdict = conclusion.get("overall_verdict")
+        index_entry(
+            conn, "credibility_conclusion", conclusion_id,
+            title=f"可信度结论：{verdict}" if verdict else "可信度结论",
+            summary=conclusion.get("summary"),
+            tags=[verdict] if verdict else None,
+            keywords=" ".join(x for x in (verdict, "可信度", "复现结论") if x) or None,
+            **_derive_dimensions(conclusion),
         )
         conn.commit()
     finally:
