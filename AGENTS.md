@@ -57,7 +57,7 @@ Python 的 FastAPI）。`agents/prompts/` 里是交给大模型的任务提示�
 ```powershell
 # 解释器：本仓库当前用 D:\python.exe（Python 3.13，后端依赖 + torch/uvicorn/websockets 齐全）；
 # 若换到带项目内虚拟环境的机器，把下文的 D:\python.exe 换成该环境里的解释器。
-#   后端自动化用例（当前 321 个，全部通过；用 `D:\python.exe -m pytest -o addopts="" -p no:cacheprovider` 可核对，
+#   后端自动化用例（当前 323 个，全部通过；用 `D:\python.exe -m pytest -o addopts="" -p no:cacheprovider` 可核对，
 #   注意 pytest.ini 里有 addopts=-q，命令行再给 -q 会变成 -qq 而不打印统计行）
 D:\python.exe scripts/run_tests.py
 
@@ -143,17 +143,18 @@ FASTA・PDB 与图片归一 / `unified_index` 三维索引），2 行**表述不
 画布形状校验与**节点复制**、**拆解 ir 图可导出/训练**、单位统一与三图覆盖与 `per_class`、
 `agents/prompts` 模板接线与 `--help` 输出解析、完整克隆与抽址自动克隆与 bioRxiv 全文与补充材料、
 容器 docker 探测与版本判断生效。同时**更正上一轮缺口表自己写错的一行**（形状校验是纯前端，
-与 `torchlens` 无关）。验证：后端 **321/321**（退出码 0）、前端 lint 0 + build 0、
-`ui_check_4a` **42/42** + `ui_check_4b` **23/23** + `ui_check_4c` **17/17**（含真实 CPU 训练）+ `ui_check_4d2` **14/14**、
+与 `torchlens` 无关）。验证：后端 **323/323**（退出码 0）、前端 lint 0 + build 0、
+`ui_check_4a` **42/42** + `ui_check_4b` **23/23** + `ui_check_4c` **17/17**（含真实 CPU 训练）+ `ui_check_4d2` **16/16**（新增「分叉可辨」用 `git commit-tree` 在临时工作区合成旁支+合并提交）、
 前端纯函数自检 **45/45** 与 **23/23**（`repeat_layer` 拆键）。
 第二轮收尾（`2373949`…`67455b4`）：修掉 `repeat_layer` 键冲突（张量 Repeat 拆键 `repeat_tensor` + 后端导出实现）、
 **真实 DOI 可落库**（bioRxiv 论文此前一入库就失败）与公开数据按任务类型/数据类型检索、抽址登记如实写入 `format`、
 知识库按主键支持含 `/` 的 DOI、以及把模块一/二/三与画布上「后端有、界面点不到」的**约 20 处入口全部接出**
 （检索与批量下载、建环境、最小命令验证、报告内容、解析论文、条目五要素编辑、结论确认、预处理、公开数据检索、
 对比表渲染、`input_spec` 补参、画布环境来源）；并修掉 `ui_check` 的竞态与 `max()` 空值 traceback。
+第三段收尾（`0e4a327`）：需求五.3 的版本面板现在**真正显示演化关系**（每行标出派生自哪个版本、分叉行缩进并以 `└─` 与「从 <short> 分出（分支）」区分、合并提交标注父数），并让**训练失败也生成版本节点**（提交信息「训练失败 <task_id>」+ `run_summary.status/error`）；连带把 `version_tree()` 的 `git log` 换成 `--topo-order`（否则同秒提交会被排成非拓扑序、把线性历史画成分叉）。
 本轮新登记 10 条边界（矢量公式不可召回、bioRxiv 站点无可靠全文通路、老 `graph.json` 缺 `code_hint`、
 ir 与标准节点混拼不支持、容器通道未实现、单位归一误判风险、模糊量级判无法复现、
-**M2a 旧数字需带真实权重与凭证重跑**、训练仅数值与 CPU、版本面板仍为线性列表）。
+**M2a 旧数字需带真实权重与凭证重跑**、训练仅数值与 CPU；**版本面板已改为显示演化关系与分叉**（`0e4a327`，原「线性列表」边界已消除）。
 另修一处事故根因：`ui_check_*` 端口写死 8000 时会**连到真实后端并把自检数据写进真实库**（实际发生两起，
 已清理；现端口可配 + 端口被占即中止 + 按临时后端地址重建产物）。
 
