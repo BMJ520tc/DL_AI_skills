@@ -3,11 +3,14 @@
 # 覆盖 M5 三条验收判据（临时库后端 + 临时项目工作区，绝不触碰 data/ 真实数据；
 # 无训练、不需要 venv_smoke）：
 #   1. 版本树展示演化关系：初始空画布 + 两次保存共 3 个版本，面板按父子关系
-#      缩进渲染、当前版本有标注；
+#      缩进渲染、当前版本有标注，且每行标出它派生自哪个版本（父版本短号）；
 #   2. 任意两版本对比出代码与参数差异：选 V1/V2 → 代码差异（再生成代码 diff，
 #      与导出/训练同源）→ 参数差异表（新增节点 n4、n3 的 out_features 变化）；
 #   3. 回退后画布内容变为目标版本、继续编辑保存后产生新版本节点：回退到 V1 →
-#      画布变 3 节点 → 保存 → 树上出现新版本（共 5 个，回退本身也是新版本）。
+#      画布变 3 节点 → 保存 → 树上出现新版本（共 5 个，回退本身也是新版本）；
+#   4. 分叉可辨（需求五.3「多个版本以树或图呈现」）：应用内的保存/运行/回退都是向前
+#      提交、历史上恒线性，故在临时工作区里用 git commit-tree 合成一个旁支版本与一个
+#      合并提交（父提交不在日志相邻行）——面板应缩进该行并标「从 <short> 分出（分支）」。
 #
 # 用法（需已执行 `npm run build`）：
 #   D:\python.exe scripts/ui_check_4d2.py
@@ -96,6 +99,16 @@ def http(method: str, path: str, body: dict | None = None) -> dict:
         headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def git(ws: Path, *args: str, env_extra: dict | None = None) -> str:
+    """临时工作区里的 git 命令（仅自检用：合成旁支版本，验证分叉呈现）。"""
+    proc = subprocess.run(
+        ["git", "-C", str(ws), *args], capture_output=True, text=True,
+        encoding="utf-8", errors="replace", env={**os.environ, **(env_extra or {})})
+    if proc.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} 失败：{(proc.stderr or proc.stdout).strip()[:300]}")
+    return proc.stdout.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -298,8 +311,9 @@ def main() -> int:
         network_id, tree = seed_network(tmp_dir)
         v2_short = tree["versions"][0]["short"]
         v1_short = tree["versions"][1]["short"]
+        v0_short = tree["versions"][2]["short"]  # 根版本（初始空画布提交）
         check("版本种子就绪：结构化网络 + 3 个版本（空画布→3 节点→4 节点）",
-              True, f"net={network_id} v2={v2_short} v1={v1_short}")
+              True, f"net={network_id} v2={v2_short} v1={v1_short} v0={v0_short}")
 
         preview_log = open(tmp_dir / "preview.log", "w", encoding="utf-8")
         preview = subprocess.Popen(
@@ -390,7 +404,8 @@ def main() -> int:
             f"""(() => {{
                 const row = (s) => document.querySelector('[data-version=' + JSON.stringify(s) + ']');
                 const r2 = row({json.dumps(v2_short)}), r1 = row({json.dumps(v1_short)});
-                const r0 = [...document.querySelectorAll('[data-version]')][2];
+                const rows = [...document.querySelectorAll('[data-version]')];
+                const r0 = rows[2];
                 const gutter = (r) => r && r.previousElementSibling;
                 return !!(r2 && r1 && r0
                     && r2.textContent.includes('当前')          // 最新版本有标注
@@ -398,8 +413,19 @@ def main() -> int:
                     && gutter(r1).textContent.includes('●─')
                     && gutter(r0).textContent.includes('●')     // 根版本：● 终点
                     && parseFloat(getComputedStyle(gutter(r2)).borderLeftWidth) > 0
-                    && parseFloat(getComputedStyle(gutter(r0)).borderLeftWidth) === 0);
-            }})()""", True, "版本树演化关系（竖线链 + ● + 当前标注）")
+                    && parseFloat(getComputedStyle(gutter(r0)).borderLeftWidth) === 0
+                    // 4d-2 补强（需求五.3「看出某个版本是从哪个版本改出来的」）：
+                    // 每行标出父版本短号与派生文案；线性历史不缩进、无分叉行
+                    && r2.getAttribute('data-derived-from') === {json.dumps(v1_short)}
+                    && r1.getAttribute('data-derived-from') === {json.dumps(v0_short)}
+                    && r2.textContent.includes('↑ 上一版本 ' + {json.dumps(v1_short)})
+                    && r1.textContent.includes('↑ 上一版本 ' + {json.dumps(v0_short)})
+                    && r0.getAttribute('data-derived-from') === ''
+                    && r0.textContent.includes('根版本（无父版本）')
+                    && r2.getAttribute('data-branch') === 'false'
+                    && r2.getAttribute('data-lane') === '0'
+                    && rows.every(r => r.getAttribute('data-branch') === 'false'));
+            }})()""", True, "版本树演化关系（竖线链 + ● + 当前标注 + 派生自父版本）")
         if not evolution:
             print("[diag] 演化关系子条件：" + str(cdp.evaluate(
                 f"""(() => {{
@@ -417,10 +443,16 @@ def main() -> int:
                         g0: gutter(r0) ? gutter(r0).textContent : null,
                         bl2: gutter(r2) ? getComputedStyle(gutter(r2)).borderLeftWidth : null,
                         bl0: gutter(r0) ? getComputedStyle(gutter(r0)).borderLeftWidth : null,
+                        d2: r2 ? r2.getAttribute('data-derived-from') : null,
+                        d1: r1 ? r1.getAttribute('data-derived-from') : null,
+                        d0: r0 ? r0.getAttribute('data-derived-from') : null,
+                        lane2: r2 ? r2.getAttribute('data-lane') : null,
+                        branch: rows.map(x => x.getAttribute('data-branch')).join(','),
+                        text2: r2 ? r2.textContent : null,
                         zoom: getComputedStyle(document.body).zoom || document.body.style.zoom || null,
                     }});
                 }})()""")))
-        check("版本树展示演化关系（竖线链 + ● 节点 + 当前标注，新→旧）", bool(evolution))
+        check("版本树展示演化关系（竖线链 + ● 节点 + 当前标注 + 派生自父版本，新→旧）", bool(evolution))
         shot(cdp, "4d2-version-tree")
 
         # ================= 阶段 C：两版本对比（M5 判据 2） =================
@@ -482,7 +514,74 @@ def main() -> int:
         check("继续编辑保存后产生新版本节点（树 5 个版本，最新为保存画布）",
               grew and top_msg == "保存画布", top_msg)
 
-        # ================= 阶段 E：控制台 =================
+        # ================= 阶段 E：分叉呈现（需求五.3「多个版本以树或图呈现」，4d-2 补强） =========
+        # 应用内的保存/运行/回退都是向前提交，git 历史恒线性，天然造不出分支。为验证「画得出
+        # 分叉」，在**临时**工作区里用 git commit-tree 合成两个提交：旁支版本 Y（父提交 = 最老的
+        # 根版本 R，故它在 git log 里的父提交不是紧邻的下一行）与合并提交 M（父提交 = 当前
+        # HEAD 与 Y），再把 HEAD 指向 M。面板应把 Y 缩进一层并标「从 <R> 分出（分支）」。
+        from datetime import datetime, timedelta, timezone
+
+        r_short = tree_after["versions"][-1]["short"]  # 根版本（初始空画布提交）
+        head_short = tree_after["versions"][0]["short"]
+        ws = tmp_dir / "projects" / network_id
+        tree_hash = git(ws, "rev-parse", "HEAD^{tree}")
+        now = datetime.now(timezone.utc)
+        y_date = (now + timedelta(seconds=5)).isoformat()
+        m_date = (now + timedelta(seconds=10)).isoformat()
+        y_commit = git(
+            ws, "commit-tree", tree_hash, "-p", tree_after["versions"][-1]["commit"],
+            "-m", "旁支保存", env_extra={"GIT_AUTHOR_DATE": y_date, "GIT_COMMITTER_DATE": y_date})
+        m_commit = git(
+            ws, "commit-tree", tree_hash, "-p", tree_after["versions"][0]["commit"], "-p", y_commit,
+            "-m", "合并旁支", env_extra={"GIT_AUTHOR_DATE": m_date, "GIT_COMMITTER_DATE": m_date})
+        git(ws, "update-ref", "HEAD", m_commit)
+        branch_tree = http_json(f"/api/versions/{network_id}/tree")
+        check("分叉种子就绪：旁支版本 + 合并提交（父提交不在相邻行）",
+              len(branch_tree["versions"]) == len(tree_after["versions"]) + 2
+              and branch_tree["versions"][1]["short"] == y_commit[:7],
+              f"rows={len(branch_tree['versions'])} 旁支={y_commit[:7]} 根={r_short}")
+
+        if not click_button(cdp, "刷新", exact=True):
+            return 1
+        want_rows = len(tree_after["versions"]) + 2
+        branched = wait_for(cdp,
+            f"""(() => {{
+                const rows = [...document.querySelectorAll('[data-version]')];
+                if (rows.length !== {want_rows}) return false;
+                const y = rows[1];                       // 旁支版本：父提交 = 根版本
+                const m = rows[0];                       // 合并提交：父提交 = 上一版本 + 旁支
+                const branches = rows.filter(r => r.getAttribute('data-branch') === 'true');
+                const gutter = y.previousElementSibling;
+                return branches.length === 1
+                    && y.getAttribute('data-derived-from') === {json.dumps(r_short)}
+                    && y.getAttribute('data-lane') === '1'
+                    && y.textContent.includes('从 ' + {json.dumps(r_short)} + ' 分出（分支）')
+                    && gutter.textContent.includes('└─')
+                    && gutter.offsetWidth > 20               // 分叉行缩进（线性行 20px）
+                    && m.getAttribute('data-lane') === '0'
+                    && m.getAttribute('data-branch') === 'false'
+                    && m.textContent.includes('↑ 上一版本 ' + {json.dumps(head_short)})
+                    && m.textContent.includes('（合并 2 个父版本）')
+                    && rows[2].getAttribute('data-lane') === '1';
+            }})()""", True, "分叉版本缩进 + 「从 <short> 分出（分支）」+ 合并父版本标注")
+        if not branched:
+            print("[diag] 分叉子条件：" + str(cdp.evaluate(
+                f"""(() => {{
+                    const rows = [...document.querySelectorAll('[data-version]')];
+                    return JSON.stringify(rows.map(r => ({{
+                        v: r.getAttribute('data-version'),
+                        from: r.getAttribute('data-derived-from'),
+                        lane: r.getAttribute('data-lane'),
+                        branch: r.getAttribute('data-branch'),
+                        gw: r.previousElementSibling ? r.previousElementSibling.offsetWidth : null,
+                        g: r.previousElementSibling ? r.previousElementSibling.textContent : null,
+                        text: r.textContent,
+                    }})));
+                }})()""")))
+        check("分叉可辨（旁支行缩进 + 「从 <short> 分出（分支）」+ 合并标注）", bool(branched))
+        shot(cdp, "4d2-version-branch")
+
+        # ================= 阶段 F：控制台 =================
         time.sleep(1.0)
         errors = console_errors(cdp)
         check("全程控制台 0 应用错误", not errors, "；".join(errors[:5]) if errors else "0 条")

@@ -620,13 +620,24 @@ export const postNetworkRun = (
 // 版本管理（阶段4 4d-2，模块详细设计 7.6）
 // ---------------------------------------------------------------------------
 
+export interface VersionRunSummary {
+    task_id: string;
+    /** 运行结果：成功（默认，成功路径的历史数据可能不带该字段）/ 失败。 */
+    status?: "success" | "failed";
+    /** 成功时的指标摘要；失败时后端不写该字段。 */
+    metrics?: Record<string, unknown> | null;
+    /** 失败时的原因摘要（前若干字符）；成功时无。 */
+    error?: string | null;
+    finished_at: string;
+}
+
 export interface VersionMeta {
     saved_at: string | null;
     node_count: number;
     edge_count: number;
     input_spec: Array<{ node_id: string; type: string }>;
     output_spec: Array<{ node_id: string; type: string }>;
-    run_summary: { task_id: string; metrics: Record<string, unknown>; finished_at: string } | null;
+    run_summary: VersionRunSummary | null;
     rollback_to: string | null;
 }
 

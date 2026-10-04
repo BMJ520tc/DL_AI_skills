@@ -57,13 +57,64 @@ function commitTime(iso: string): string {
     return iso.slice(0, 16).replace("T", " ");
 }
 
-/** 版本行徽标：训练运行（run_summary）与回退（rollback_to）。 */
+/** 版本行徽标：训练运行 / 训练失败（run_summary）与回退（rollback_to）——三类徽标保留。 */
 function badgesOf(message: string, meta: VersionTree["versions"][number]["meta"]): string {
     const parts: string[] = [];
-    if (message.startsWith("训练运行")) parts.push("训练");
+    if (meta?.run_summary?.status === "failed") parts.push("训练失败");
+    else if (message.startsWith("训练运行")) parts.push("训练");
     if (meta?.run_summary?.task_id) parts.push(`任务 ${meta.run_summary.task_id.slice(0, 8)}`);
     if (meta?.rollback_to) parts.push("回退");
     return parts.join(" · ");
+}
+
+/** 一行版本的演化信息（需求五.3「树或图呈现」+「看出某个版本是从哪个版本改出来的」）。 */
+type Derivation = {
+    /** 泳道/缩进层级：父提交即紧邻的下一行（线性延续）时不缩进；分叉时比上一行深一层。 */
+    lane: number;
+    /** 父版本短号（根版本为空串）。 */
+    parentShort: string;
+    /** 父版本个数（>1 为合并提交，本应用不产生，但渲染上如实标出）。 */
+    parentCount: number;
+    /** 父提交是否为紧邻的下一行（列表为新→旧，故父提交在下方）。 */
+    parentBelow: boolean;
+    isRoot: boolean;
+    /** 父提交不在相邻行——画成树时的分叉点，需要显式的可视标记。 */
+    isBranch: boolean;
+};
+
+/**
+ * 按父链算每行的缩进层级（新→旧遍历）：
+ * 某行的父提交就是紧邻的下一行时与上一行同层（线性历史恒为第 0 层，与既有竖线链一致）；
+ * 否则视为「从更早的版本分叉出来的新枝」，缩进加深一层——于是分叉行缩进、「从 <short> 分出」可辨。
+ */
+function derivationsOf(
+    versions: VersionTree["versions"],
+    shortOf: (commit: string) => string,
+): Derivation[] {
+    const out: Derivation[] = [];
+    versions.forEach((v, i) => {
+        const isRoot = v.parents.length === 0;
+        const next = versions[i + 1];
+        const parentBelow = !!next && v.parents.includes(next.commit);
+        const lane = i === 0 ? 0 : out[i - 1].lane + (parentBelow ? 0 : 1);
+        out.push({
+            lane,
+            parentShort: v.parents[0] ? shortOf(v.parents[0]) : "",
+            parentCount: v.parents.length,
+            parentBelow,
+            isRoot,
+            isBranch: !isRoot && !parentBelow,
+        });
+    });
+    return out;
+}
+
+/** 派生关系的可读文案：根版本 / ↑ 上一版本 <short> / 从 <short> 分出（分支）。 */
+function derivationText(d: Derivation): string {
+    if (d.isRoot) return "根版本（无父版本）";
+    const merge = d.parentCount > 1 ? `（合并 ${d.parentCount} 个父版本）` : "";
+    if (d.parentBelow) return `↑ 上一版本 ${d.parentShort}${merge}`;
+    return `从 ${d.parentShort} 分出（分支）${merge}`;
 }
 
 function diffLineStyle(line: string): React.CSSProperties {
@@ -112,6 +163,11 @@ export default function VersionPanel({ projectId, onRollback, onClose }: Version
     }, [loadTree]);
 
     const byCommit = new Map((tree?.versions ?? []).map(v => [v.commit, v]));
+
+    /** 父版本短号：在树里的用后端给的 short，取不到时退回提交号前 7 位。 */
+    const shortOf = (commit: string): string =>
+        byCommit.get(commit)?.short ?? commit.slice(0, 7);
+    const derivations = derivationsOf(tree?.versions ?? [], shortOf);
 
     const toggleSelect = useCallback((commit: string) => {
         if (selA === commit) {
@@ -204,21 +260,22 @@ export default function VersionPanel({ projectId, onRollback, onClose }: Version
             {tree && tree.versions.length > 0 && (
                 <>
                     <div style={{ color: "#64748b", fontSize: 11, marginBottom: 4 }}>
-                        共 {tree.versions.length} 个版本；点选两个版本后「对比」，可对任意历史版本「回退」
+                        共 {tree.versions.length} 个版本；每行标出它派生自哪个版本（分叉行缩进并标「从 … 分出」）；
+                        点选两个版本后「对比」，可对任意历史版本「回退」
                     </div>
                     {tree.versions.map((v, i) => {
+                        const d = derivations[i];
                         const selected = selA === v.commit || selB === v.commit;
                         const isCurrent = tree.current === v.short;
-                        const isRoot = v.parents.length === 0;
                         const last = i === tree.versions.length - 1;
-                        const parentBelow = !isRoot && !last && v.parents.includes(tree.versions[i + 1].commit);
+                        // 演化关系左槽：竖线串起整条链，● 为提交节点；父提交不在正下方的行
+                        // 用 └─ 拐入并缩进一层（线性历史时恒为 ●─，与既有口径一致）。
+                        const glyph = d.isRoot ? "●" : d.parentBelow ? "●─" : "└─";
                         return (
                             <div key={v.commit} style={{ display: "flex", alignItems: "stretch" }}>
-                                {/* 演化关系左槽：竖线串起整条链，● 为提交节点；父提交不在
-                                    正下方的行用 └─ 拐入（历史线性时恒为 ●─） */}
                                 <div
                                     style={{
-                                        width: 20,
+                                        width: 20 + d.lane * 12,
                                         flexShrink: 0,
                                         display: "flex",
                                         alignItems: "center",
@@ -229,17 +286,21 @@ export default function VersionPanel({ projectId, onRollback, onClose }: Version
                                         borderLeft: last ? "none" : "1px solid #334155",
                                     }}
                                 >
-                                    {isRoot ? "●" : parentBelow ? "●─" : "└─"}
+                                    {"│ ".repeat(d.lane) + glyph}
                                 </div>
                                 <div
                                     data-version={v.short}
+                                    data-parents={v.parents.map(shortOf).join(",")}
+                                    data-derived-from={d.parentShort}
+                                    data-lane={String(d.lane)}
+                                    data-branch={d.isBranch ? "true" : "false"}
                                     onClick={() => toggleSelect(v.commit)}
                                     style={{
                                         flex: 1,
                                         minWidth: 0,
                                         display: "flex",
-                                        alignItems: "center",
-                                        gap: 6,
+                                        flexDirection: "column",
+                                        gap: 2,
                                         padding: "5px 8px",
                                         marginTop: 4,
                                         borderRadius: 6,
@@ -249,38 +310,71 @@ export default function VersionPanel({ projectId, onRollback, onClose }: Version
                                             ? "1px solid #3b82f6"
                                             : isCurrent
                                               ? "1px solid #0f766e"
-                                              : "1px solid #1f2a2f",
+                                              : d.isBranch
+                                                ? "1px dashed #f472b6"
+                                                : "1px solid #1f2a2f",
                                         fontSize: 11,
                                     }}
                                 >
-                                    <span style={{ fontFamily: "monospace", color: "#93c5fd" }}>{v.short}</span>
-                                    <span style={{ color: "#cbd5e1" }}>{v.message}</span>
-                                    <span style={{ color: "#64748b" }}>{commitTime(v.committed_at)}</span>
-                                    <span style={{ color: "#64748b" }}>
-                                        {v.meta ? `${v.meta.node_count} 节点/${v.meta.edge_count} 连线` : "无元数据"}
-                                    </span>
-                                    {badgesOf(v.message, v.meta) && (
-                                        <span style={{ color: "#fbbf24" }}>{badgesOf(v.message, v.meta)}</span>
-                                    )}
-                                    {isCurrent && (
-                                        <span style={{ color: "#5eead4", fontWeight: 700 }}>当前</span>
-                                    )}
-                                    <button
-                                        onClick={e => {
-                                            e.stopPropagation();
-                                            setRollbackTarget(v.commit);
-                                            setRollbackError(null);
-                                        }}
-                                        disabled={isCurrent || rollbackBusy}
+                                    <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+                                        <span style={{ fontFamily: "monospace", color: "#93c5fd" }}>{v.short}</span>
+                                        <span
+                                            style={{
+                                                color: "#cbd5e1",
+                                                overflow: "hidden",
+                                                textOverflow: "ellipsis",
+                                                whiteSpace: "nowrap",
+                                            }}
+                                        >
+                                            {v.message}
+                                        </span>
+                                        {badgesOf(v.message, v.meta) && (
+                                            <span style={{ color: "#fbbf24", whiteSpace: "nowrap" }}>
+                                                {badgesOf(v.message, v.meta)}
+                                            </span>
+                                        )}
+                                        {isCurrent && (
+                                            <span style={{ color: "#5eead4", fontWeight: 700 }}>当前</span>
+                                        )}
+                                        <button
+                                            onClick={e => {
+                                                e.stopPropagation();
+                                                setRollbackTarget(v.commit);
+                                                setRollbackError(null);
+                                            }}
+                                            disabled={isCurrent || rollbackBusy}
+                                            style={{
+                                                ...smallButtonStyle,
+                                                marginLeft: "auto",
+                                                opacity: isCurrent ? 0.4 : 1,
+                                                cursor: isCurrent ? "not-allowed" : "pointer",
+                                            }}
+                                        >
+                                            回退
+                                        </button>
+                                    </div>
+                                    <div
                                         style={{
-                                            ...smallButtonStyle,
-                                            marginLeft: "auto",
-                                            opacity: isCurrent ? 0.4 : 1,
-                                            cursor: isCurrent ? "not-allowed" : "pointer",
+                                            display: "flex",
+                                            alignItems: "center",
+                                            gap: 8,
+                                            color: "#64748b",
+                                            fontSize: 10,
+                                            flexWrap: "wrap",
                                         }}
                                     >
-                                        回退
-                                    </button>
+                                        <span>{commitTime(v.committed_at)}</span>
+                                        <span>
+                                            {v.meta ? `${v.meta.node_count} 节点/${v.meta.edge_count} 连线` : "无元数据"}
+                                        </span>
+                                        <span
+                                            style={{
+                                                color: d.isBranch ? "#f472b6" : d.isRoot ? "#64748b" : "#94a3b8",
+                                            }}
+                                        >
+                                            {derivationText(d)}
+                                        </span>
+                                    </div>
                                 </div>
                             </div>
                         );

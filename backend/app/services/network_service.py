@@ -17,6 +17,9 @@ ir 图缺字段/结构不合法 → `ExportError`：导出端点 400，训练入
 阶段4 4d-1：训练成功后「运行即提交」——指标摘要写进 network_version.json 并提交
 （version_service.commit_run；失败不连坐训练结果，但必须透出：任务进度 version_error
 字段 + run_record 失败留痕，并照旧记后端日志——不静默）。
+阶段4 4d-2 补强（需求五.3「每次运行生成一个版本节点」）：训练**失败**同样提交一条
+「训练失败 <task_id>」版本节点（run_summary.status="failed"，含失败原因摘要），
+提交失败只记日志、不掩盖原始训练失败原因。
 """
 from __future__ import annotations
 
@@ -180,10 +183,12 @@ def start_run(project_id: str, body: dict) -> str:
 
 
 async def _run_train(params: dict, task_id: str) -> None:
-    """network_train 任务入口：失败也落一条 run_record(status=failed)。
+    """network_train 任务入口：失败也落一条 run_record(status=failed)，且同样生成版本节点。
 
     《知识库与数据设计》五.2：每次实际执行都落一条运行记录，**结果与报错只写 run_record**——
     故训练失败必须可检索（与模块四验证任务同口径）。记录后原样抛出，任务状态由 task_manager 置 failed。
+    需求五.3「每次运行生成一个版本节点」：失败运行在 run_record 之后提交一条
+    「训练失败 <task_id>」版本（run_summary.status="failed"）；该提交失败只记日志，不掩盖原始失败原因。
     """
     ctx: dict = {}
     try:
@@ -214,6 +219,16 @@ async def _run_train(params: dict, task_id: str) -> None:
             })
         except Exception:  # noqa: BLE001 —— 失败记录的写入失败不得掩盖原异常
             logger.exception("训练失败记录落库失败 project_id=%s task_id=%s",
+                             params.get("project_id"), task_id)
+        # 需求五.3「每次运行生成一个版本节点」：失败也是一次运行，故在 run_record(failed) 之后
+        # 再提交一条「训练失败 <task_id>」版本节点（失败原因前若干字符进 run_summary.error）。
+        # 顺序要求：先留 run_record，再提交版本；提交本身失败只记日志，绝不掩盖原始训练失败原因。
+        try:
+            await asyncio.to_thread(
+                version_service.commit_run, params.get("project_id"), task_id, None,
+                status="failed", error=str(exc))
+        except Exception:  # noqa: BLE001 —— 版本提交失败不得掩盖原始训练失败原因
+            logger.exception("训练失败版本提交失败 project_id=%s task_id=%s",
                              params.get("project_id"), task_id)
         raise
 

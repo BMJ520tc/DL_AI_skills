@@ -1,7 +1,8 @@
 """版本管理（阶段4 4d-1/4d-2，模块详细设计 7.6，D8）。
 
 结构化项目工作区即 git 仓库：创建时初始化（或首次保存时懒初始化，覆盖 4d-1 之前的
-老项目），「保存即提交」「运行即提交」把 graph.json 与 network_version.json 逐版本入库；
+老项目），「保存即提交」「运行即提交」把 graph.json 与 network_version.json 逐版本入库
+（需求五.3「每次运行」含失败运行：训练失败同样提交一条「训练失败 <task_id>」版本节点）；
 4d-2 在此之上提供版本树（git 提交历史 + 元数据摘要 + 父子关系）、两版本对比
 （代码差异 = 各自再生成代码的 unified diff + 参数差异表）、回退（检出目标版本图并
 把回退动作本身记为一个新提交，需求五.3）。
@@ -144,23 +145,52 @@ def commit_graph(project_id: str, graph: dict) -> dict:
     return {"commit": commit}
 
 
-def commit_run(project_id: str, task_id: str, metrics: dict) -> dict:
-    """运行即提交：run_summary（指标摘要）写进 network_version.json 并提交。"""
+RUN_ERROR_SUMMARY_CHARS = 500
+
+
+def commit_run(project_id: str, task_id: str, metrics: Optional[dict] = None, *,
+               status: str = "success", error: Optional[str] = None) -> dict:
+    """运行即提交：run_summary（指标摘要）写进 network_version.json 并提交。
+
+    需求五.3「每次保存或运行时生成一个版本节点」：**失败也是一次运行**，故按 status 分两种提交
+    （4d-1 成功口径不变，参数均为增量、向后兼容）：
+    - status="success"（默认，与既有调用点/用例完全一致）：提交信息「训练运行 <task_id>」，
+      run_summary = {status, task_id, metrics, finished_at}（status 为新增字段，未改名）；
+    - status="failed"：提交信息「训练失败 <task_id>」，
+      run_summary = {status: "failed", task_id, error: 失败原因前 RUN_ERROR_SUMMARY_CHARS 字符,
+      finished_at}，无 metrics。
+    """
     project = project_manager.get_project(project_id)
     if project is None:
         raise LookupError(f"project {project_id} not found")
+    if status not in ("success", "failed"):
+        raise ValueError(f"未知的运行状态：{status}")
     ws = Path(project["workspace_path"])
     with _lock_for(ws):
         init_repo(ws)
         graph_path = ws / "graph.json"
         graph = json.loads(graph_path.read_text(encoding="utf-8")) if graph_path.exists() \
             else {"nodes": [], "edges": []}
-        _write_version(ws, graph, run_summary={
-            "task_id": task_id, "metrics": metrics, "finished_at": _now(),
-        })
+        if status == "failed":
+            summary = {
+                "status": "failed",
+                "task_id": task_id,
+                "error": (error or "")[:RUN_ERROR_SUMMARY_CHARS],
+                "finished_at": _now(),
+            }
+            message = f"训练失败 {task_id}"
+        else:
+            summary = {
+                "status": "success",
+                "task_id": task_id,
+                "metrics": metrics,
+                "finished_at": _now(),
+            }
+            message = f"训练运行 {task_id}"
+        _write_version(ws, graph, run_summary=summary)
         add_args = [VERSION_FILENAME] + (["graph.json"] if graph_path.exists() else [])
         _run_git(ws, "add", *add_args)
-        commit = _commit_staged(ws, f"训练运行 {task_id}")
+        commit = _commit_staged(ws, message)
     return {"commit": commit}
 
 
@@ -172,6 +202,10 @@ def version_tree(project_id: str) -> dict:
     """版本树：git 提交历史（新→旧）＋ 每个版本的元数据摘要（节点/连线数、
     输入输出规格、运行摘要、回退来源）＋ 父子关系（4d-2 实施要点 1）。
 
+    **--topo-order**：默认的 git log 按提交时间排序、同秒提交之间不保证拓扑次序
+    （实测：同一秒里连提的版本会被排成「根版本在子版本之前」），而「树」的呈现前提是
+    父提交出现在所有子提交之后，否则界面会把线性历史误画成分叉。故显式取拓扑序。
+
     空仓库（git 已初始化但尚无提交）返回空树，不算错误——此刻画布尚无任何版本。
     """
     ws = Path(_require_network(project_id)["workspace_path"])
@@ -182,7 +216,7 @@ def version_tree(project_id: str) -> dict:
         if head.returncode != 0:
             return {"current": None, "versions": []}
         current = head.stdout.strip()[:7]  # 与 versions[].short 同口径（--short 歧义时会加长）
-        log = _run_git(ws, "log", "--format=%H%x09%P%x09%ct%x09%s").stdout.strip()
+        log = _run_git(ws, "log", "--topo-order", "--format=%H%x09%P%x09%ct%x09%s").stdout.strip()
         versions = []
         for line in log.splitlines():
             if not line.strip():

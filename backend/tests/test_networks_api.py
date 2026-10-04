@@ -839,3 +839,93 @@ def test_train_version_commit_success_has_no_version_error(tmp_networks, monkeyp
     assert ks.list_runs(project_id, "train", status="failed") == []
     tree = version_service.version_tree(project_id)
     assert tree["versions"][0]["meta"]["run_summary"]["task_id"] == task_id
+
+
+# ---------------------------------------------------------------------------
+# 需求五.3「每次运行生成一个版本节点」：训练失败也生成版本节点（4d-2 补强）
+# ---------------------------------------------------------------------------
+
+def test_train_failure_creates_version_node(tmp_networks, monkeypatch):
+    """训练脚本失败 → 除 run_record(failed) 外，版本树里还要有一条「训练失败 <task_id>」版本节点
+    （run_summary.status="failed"、错误摘要非空、无 metrics）；同一用例再跑一次成功训练，
+    证明成功路径口径不变（提交信息仍为「训练运行 <task_id>」、status=success、metrics 齐备）。"""
+    client, tmp_path = tmp_networks
+    original_id, project_id, dataset_id = _prepare_train(client, tmp_path)
+
+    from app.services import knowledge_service as ks, network_service, proc_util, version_service
+
+    async def failing_run(cmd, *, cwd, timeout):
+        return 1, "Traceback: boom"
+
+    monkeypatch.setattr(proc_util, "run_command", failing_run)
+
+    params = _train_params(project_id, dataset_id, original_id)
+    task_id = "task-net-fail-ver"
+    _insert_running_task(task_id, project_id, params)
+
+    # 原始训练失败原因原样抛出：版本提交与否都不改变任务结果
+    with pytest.raises(RuntimeError, match="退出码 1"):
+        asyncio.run(network_service._run_train(params, task_id))
+
+    # 既有口径保持：失败记录可检索
+    assert [r["task_id"] for r in ks.list_runs(project_id, "train", status="failed")] == [task_id]
+
+    # 新增：失败也生成版本节点（提交信息 + run_summary 形状）
+    tree = version_service.version_tree(project_id)
+    head = tree["versions"][0]
+    assert head["message"] == f"训练失败 {task_id}"
+    assert tree["current"] == head["short"]
+    summary = head["meta"]["run_summary"]
+    assert summary["status"] == "failed"
+    assert summary["task_id"] == task_id
+    assert summary["error"] and "退出码 1" in summary["error"]
+    assert "metrics" not in summary
+    # 线性演化：失败版本节点的父提交即下一个版本（与既有版本树口径一致）
+    assert head["parents"] == [tree["versions"][1]["commit"]]
+
+    # 成功路径不受影响：同样的链路成功时仍是「训练运行 …」+ status=success + metrics
+    monkeypatch.setattr(proc_util, "run_command", _fake_ok_run)
+    ok_task = "task-net-ok-ver"
+    _insert_running_task(ok_task, project_id, params)
+    asyncio.run(network_service._run_train(params, ok_task))
+
+    tree2 = version_service.version_tree(project_id)
+    ok_head = tree2["versions"][0]
+    assert ok_head["message"] == f"训练运行 {ok_task}"
+    assert ok_head["meta"]["run_summary"]["status"] == "success"
+    assert ok_head["meta"]["run_summary"]["metrics"] == {"loss": 0.1, "accuracy": 0.95}
+    # 失败版本节点仍留在树上（两个任务各一版）；成功列表不被失败版本污染
+    assert any(v["message"] == f"训练失败 {task_id}" for v in tree2["versions"])
+    runs = client.get(f"/api/networks/{project_id}/runs").json()
+    assert [r["task_id"] for r in runs] == [ok_task]
+
+
+def test_train_failure_version_commit_error_does_not_mask_failure(tmp_networks, monkeypatch):
+    """版本提交本身失败时：原始训练失败原因照旧抛出、run_record(failed) 照旧落库（不掩盖、不连坐）。"""
+    client, tmp_path = tmp_networks
+    original_id, project_id, dataset_id = _prepare_train(client, tmp_path)
+
+    from app.services import knowledge_service as ks, network_service, proc_util, version_service
+
+    async def failing_run(cmd, *, cwd, timeout):
+        return 1, "Traceback: boom"
+
+    def broken_commit_run(*_args, **_kwargs):
+        raise RuntimeError("git commit 失败（模拟）")
+
+    monkeypatch.setattr(proc_util, "run_command", failing_run)
+    monkeypatch.setattr(version_service, "commit_run", broken_commit_run)
+
+    params = _train_params(project_id, dataset_id, original_id)
+    task_id = "task-net-fail-vc"
+    _insert_running_task(task_id, project_id, params)
+
+    with pytest.raises(RuntimeError, match="退出码 1"):  # 原始失败原因，不是版本提交错误
+        asyncio.run(network_service._run_train(params, task_id))
+
+    failed = ks.list_runs(project_id, "train", status="failed")
+    assert [r["task_id"] for r in failed] == [task_id]
+    assert "退出码 1" in (failed[0]["error"] or "")
+    # 版本节点确实没生成（提交失败），但这件事只体现在日志里，不改任务结论
+    assert all("训练失败" not in v["message"]
+               for v in version_service.version_tree(project_id)["versions"])

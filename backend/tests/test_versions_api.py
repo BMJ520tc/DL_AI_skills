@@ -278,6 +278,12 @@ def test_version_tree_evolution(tmp_versions):
     for v, parent in zip(body["versions"], body["versions"][1:]):
         assert v["parents"] == [parent["commit"]]
     assert body["versions"][-1]["parents"] == []  # 根版本
+    # 拓扑序（--topo-order）：父提交必须排在它所有子提交之后——同秒连提时默认日志序不保证
+    # 这一点，界面会把线性历史误画成分叉（4d-2 补强）
+    index = {v["commit"]: i for i, v in enumerate(body["versions"])}
+    for v in body["versions"]:
+        for p in v["parents"]:
+            assert index[p] > index[v["commit"]], f"{v['short']} 的父提交排在了它前面"
     # 元数据摘要随版本变化
     assert body["versions"][0]["message"].startswith("训练运行")
     assert body["versions"][0]["meta"]["run_summary"]["task_id"] == "task-tree"
