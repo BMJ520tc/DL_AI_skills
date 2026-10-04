@@ -1009,18 +1009,162 @@ def record_knowledge(k: dict) -> str:
     return knowledge_id
 
 
-def confirm_knowledge(knowledge_id: str) -> bool:
-    """蒸馏知识确认：draft → confirmed（数据设计六.3）。"""
+def confirm_knowledge(knowledge_id: str, supersede_conflicts: bool = False) -> bool:
+    """蒸馏知识确认：draft → confirmed（数据设计六.3）。
+
+    `supersede_conflicts=True`（状态机 draft→confirmed→superseded，六.3）时，确认一条新结论的同时
+    把它在**同类型、适用范围相容**维度上推翻的旧 confirmed 条目置为 superseded（保留记录，检索不再返回）。
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT type, scope FROM knowledge WHERE knowledge_id = ? AND status = 'draft'",
+            (knowledge_id,),
+        ).fetchone()
+        cur = conn.execute(
+            "UPDATE knowledge SET status = 'confirmed', updated_at = ? WHERE knowledge_id = ? AND status = 'draft'",
+            (_now(), knowledge_id),
+        )
+        if cur.rowcount > 0 and supersede_conflicts and row is not None:
+            for old_id in _conflict_ids(conn, knowledge_id, row["type"], _as_dict(row["scope"])):
+                conn.execute(
+                    "UPDATE knowledge SET status = 'superseded', updated_at = ? WHERE knowledge_id = ?",
+                    (_now(), old_id),
+                )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# 适用范围维度（数据设计六.2 scope）：用于冲突判定
+_SCOPE_KEYS = ("task_type", "model", "dataset")
+
+
+def _scopes_compatible(a: dict, b: dict) -> bool:
+    """两个 scope 是否相容：任一维度上「都给了值且不等」才算不相容（一方缺省视为更宽，相容）。"""
+    for key in _SCOPE_KEYS:
+        av, bv = a.get(key), b.get(key)
+        if av and bv and av != bv:
+            return False
+    return True
+
+
+def _conflict_ids(conn, knowledge_id: str, type_: Optional[str], scope: dict) -> list[str]:
+    """在给定连接里找同类型、scope 相容的**已确认**条目 id（排除自身）。"""
+    rows = conn.execute(
+        "SELECT knowledge_id, type, scope FROM knowledge WHERE status = 'confirmed' AND knowledge_id != ?",
+        (knowledge_id,),
+    ).fetchall()
+    return [
+        r["knowledge_id"] for r in rows
+        if r["type"] == type_ and _scopes_compatible(scope, _as_dict(r["scope"]))
+    ]
+
+
+def find_conflicts(knowledge_id: str) -> list[dict]:
+    """某条草稿的潜在冲突：同类型 + scope 相容的**已确认**知识（排除自身，数据设计六.3）。"""
+    target = get_item("knowledge", knowledge_id)
+    if target is None:
+        return []
+    conn = get_connection()
+    try:
+        ids = _conflict_ids(conn, knowledge_id, target.get("type"), _as_dict(target.get("scope")))
+        if not ids:
+            return []
+        rows = conn.execute(
+            f"SELECT * FROM knowledge WHERE knowledge_id IN ({','.join('?' for _ in ids)})", ids
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def supersede_knowledge(knowledge_id: str) -> bool:
+    """把已确认知识置为 superseded（被后续运行推翻，数据设计六.3）。"""
     conn = get_connection()
     try:
         cur = conn.execute(
-            "UPDATE knowledge SET status = 'confirmed', updated_at = ? WHERE knowledge_id = ? AND status = 'draft'",
+            "UPDATE knowledge SET status = 'superseded', updated_at = ? WHERE knowledge_id = ? AND status = 'confirmed'",
             (_now(), knowledge_id),
         )
         conn.commit()
         return cur.rowcount > 0
     finally:
         conn.close()
+
+
+def list_knowledge(status: Optional[str] = None, type_: Optional[str] = None,
+                   limit: int = 100, offset: int = 0) -> list[dict]:
+    """蒸馏知识列表，可按 status（draft/confirmed/superseded）与 type 过滤（草稿确认界面用）。"""
+    sql = "SELECT * FROM knowledge WHERE 1=1"
+    args: list = []
+    if status:
+        sql += " AND status = ?"
+        args.append(status)
+    if type_:
+        sql += " AND type = ?"
+        args.append(type_)
+    sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    args.extend([limit, offset])
+    conn = get_connection()
+    try:
+        rows = conn.execute(sql, args).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_run_for_task(task_id: str) -> Optional[dict]:
+    """按 task_id 取最近一条 run_record（任务后蒸馏的素材来源，数据设计五.4）。"""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM run_record WHERE task_id = ? ORDER BY rowid DESC LIMIT 1", (task_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+def knowledge_for_task_exists(task_id: str) -> bool:
+    """该任务是否已起草过蒸馏知识（按 structured.source_task_id 判定）。
+
+    专用起草路径（环境依赖冲突、模块三使用建议）与通用蒸馏通道都以 source_task_id 标记来源，
+    据此避免同一任务被起草两遍（同一条结论出现两条草稿）。
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM knowledge WHERE structured LIKE ? LIMIT 1",
+            (f'%"source_task_id": "{task_id}"%',),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None
+
+
+def knowledge_for_paper_exists(paper_id: str) -> bool:
+    """该论文是否已起草过蒸馏知识（按 structured.source_paper_id 判定，避免重复蒸馏）。"""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM knowledge WHERE structured LIKE ? LIMIT 1",
+            (f'%"source_paper_id": "{paper_id}"%',),
+        ).fetchone()
+    finally:
+        conn.close()
+    return row is not None
+
+
+def list_paper_ids() -> list[str]:
+    """全部论文 id（论文蒸馏的「全量」来源）。"""
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT paper_id FROM paper ORDER BY created_at").fetchall()
+    finally:
+        conn.close()
+    return [r["paper_id"] for r in rows]
 
 
 def _delete_paper_children(conn, paper_id: str) -> None:
@@ -1122,3 +1266,22 @@ def bring_knowledge(
             others.append(item)
 
     return {"param_advice": param_advice, "dependency_conflict": dependency_conflict, "others": others}
+
+
+def bring_advice_summary(
+    task_type: Optional[str] = None,
+    model: Optional[str] = None,
+    dataset: Optional[str] = None,
+) -> dict:
+    """任务前带入的紧凑视图（模块详细设计 8.2）：只保留**可操作**的两类——参数建议与冲突预警。
+
+    供各触发点（模块一/三/五/四）在任务开始时塞进任务进度或面板，作为「默认建议、用户可改」；
+    无命中返回 `{}`，调用方据此静默跳过（8.2 异常边界「无命中知识 → 静默跳过，不打扰」）。
+    使用建议/复现不一致等其余类型不进此视图（避免把长文本噪音塞进每处任务）。
+    """
+    brought = bring_knowledge(task_type, model, dataset)
+    focused = {
+        "param_advice": brought.get("param_advice") or [],
+        "dependency_conflict": brought.get("dependency_conflict") or [],
+    }
+    return focused if (focused["param_advice"] or focused["dependency_conflict"]) else {}

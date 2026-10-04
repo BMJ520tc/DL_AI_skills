@@ -70,6 +70,67 @@ def test_knowledge_read_endpoints(app_client):
     assert r.status_code == 400
 
 
+def test_knowledge_ingest_module_compound_ref(app_client):
+    """ingest 分发 module（模块详细设计 2.6、数据设计十）：复合主键条目经统一入口入库，
+    未给版本时按下一版分配，返回复合 ref_id 且该 ref_id 可取回详情。"""
+    r = app_client.post("/api/knowledge/ingest", json={
+        "data_type": "module",
+        "data": {"module_id": "mod-ingest-1", "name": "IngestModule", "task_type": "classification"},
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["data_type"] == "module"
+    assert body["ref_id"] == "mod-ingest-1:v1"
+
+    # 统一索引里可检索到（types=module）
+    hits = app_client.get("/api/knowledge/search", params={"types": "module", "q": "IngestModule"}).json()
+    assert [h["ref_id"] for h in hits] == ["mod-ingest-1:v1"]
+
+    # 复合 ref 经 get_item 特判（3.5）可读
+    detail = app_client.get("/api/knowledge/items/module/mod-ingest-1:v1")
+    assert detail.status_code == 200
+    assert detail.json()["name"] == "IngestModule"
+
+    # 第二个同名模块自动进 v2（不与 v1 冲突）
+    r2 = app_client.post("/api/knowledge/ingest", json={
+        "data_type": "module",
+        "data": {"module_id": "mod-ingest-1", "name": "IngestModule2"},
+    })
+    assert r2.json()["ref_id"] == "mod-ingest-1:v2"
+
+
+def test_knowledge_draft_confirm_supersede_endpoints(app_client):
+    """草稿确认 + 冲突可见 + supersede 端点（模块详细设计 8.3、数据设计六.3）。"""
+    from app.services import knowledge_service as ks
+
+    old = ks.record_knowledge({"type": "param_advice", "title": "old", "content": "lr=1e-2",
+                               "scope": {"task_type": "classification"}, "status": "confirmed"})
+    new = ks.record_knowledge({"type": "param_advice", "title": "new", "content": "lr=1e-3",
+                               "scope": {"task_type": "classification"}})
+
+    # 草稿列表按 status 过滤
+    drafts = app_client.get("/api/knowledge/list", params={"data_type": "knowledge", "status": "draft"}).json()
+    assert [d["knowledge_id"] for d in drafts] == [new]
+
+    # 冲突可见
+    conflicts = app_client.get(f"/api/knowledge/conflicts/{new}").json()
+    assert [c["knowledge_id"] for c in conflicts] == [old]
+
+    # 确认并推翻旧结论
+    r = app_client.post(f"/api/knowledge/confirm/{new}", params={"supersede": True})
+    assert r.status_code == 200
+    assert ks.get_item("knowledge", old)["status"] == "superseded"
+
+    # 已确认条目可显式 supersede；重复操作 404
+    r = app_client.post(f"/api/knowledge/supersede/{new}")
+    assert r.status_code == 200
+    assert ks.get_item("knowledge", new)["status"] == "superseded"
+    assert app_client.post(f"/api/knowledge/supersede/{new}").status_code == 404
+
+    # 未知草稿：conflicts 404
+    assert app_client.get("/api/knowledge/conflicts/nope").status_code == 404
+
+
 def test_task_endpoints(app_client):
     r = app_client.get("/api/tasks", params={"limit": 10})
     assert r.status_code == 200 and r.json() == []

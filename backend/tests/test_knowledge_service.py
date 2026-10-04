@@ -81,6 +81,65 @@ def test_unknown_data_type_rejected(isolated_db):
         raise AssertionError("未知 data_type 应抛 ValueError")
 
 
+def test_bring_advice_summary_only_actionable_and_empty_when_none(isolated_db):
+    """带入紧凑视图（8.2）：只保留参数建议与冲突预警，其余类型不进；无命中返回 {}。"""
+    assert ks.bring_advice_summary() == {}          # 空库 → 静默跳过
+
+    # 未确认的使用建议不进带入；已确认的参数建议进
+    ks.record_knowledge({"type": "usage_guidance", "title": "U", "content": "u", "status": "confirmed"})
+    assert ks.bring_advice_summary() == {}
+
+    kid = ks.record_knowledge({"type": "param_advice", "title": "P", "content": "use lr=1e-3",
+                               "scope": {"task_type": "classification"}, "status": "confirmed"})
+    summary = ks.bring_advice_summary(task_type="classification")
+    assert [i["knowledge_id"] for i in summary["param_advice"]] == [kid]
+    assert summary["dependency_conflict"] == []
+    # 维度不匹配 → 静默跳过
+    assert ks.bring_advice_summary(task_type="regression") == {}
+
+
+def test_conflict_detection_and_supersede_on_confirm(isolated_db):
+    """冲突检测与 superseded 状态机（数据设计六.3）：同类型 + scope 相容才冲突；确认时推翻旧结论。"""
+    old = ks.record_knowledge({"type": "param_advice", "title": "old", "content": "lr=1e-2",
+                               "scope": {"task_type": "classification"}, "status": "confirmed"})
+    new = ks.record_knowledge({"type": "param_advice", "title": "new", "content": "lr=1e-3",
+                               "scope": {"task_type": "classification"}})
+    assert [c["knowledge_id"] for c in ks.find_conflicts(new)] == [old]
+
+    # 不相容 scope（regression）不算冲突
+    other = ks.record_knowledge({"type": "param_advice", "title": "r", "content": "lr=1e-4",
+                                 "scope": {"task_type": "regression"}})
+    assert ks.find_conflicts(other) == []
+    # 不同类型不算冲突
+    diff_type = ks.record_knowledge({"type": "usage_guidance", "title": "u", "content": "x",
+                                     "scope": {"task_type": "classification"}})
+    assert ks.find_conflicts(diff_type) == []
+
+    assert ks.confirm_knowledge(new, supersede_conflicts=True) is True
+    assert ks.get_item("knowledge", new)["status"] == "confirmed"
+    assert ks.get_item("knowledge", old)["status"] == "superseded"   # 被推翻
+
+
+def test_supersede_and_list_by_status(isolated_db):
+    kid = ks.record_knowledge({"type": "usage_guidance", "title": "t", "content": "c",
+                               "status": "confirmed"})
+    assert ks.supersede_knowledge(kid) is True
+    assert ks.get_item("knowledge", kid)["status"] == "superseded"
+    assert ks.supersede_knowledge(kid) is False          # 仅 confirmed → superseded
+
+    ks.record_knowledge({"type": "param_advice", "title": "d", "content": "x"})  # draft
+    assert [k["status"] for k in ks.list_knowledge(status="draft")] == ["draft"]
+    assert len(ks.list_knowledge(status="superseded")) == 1
+
+
+def test_knowledge_for_task_exists(isolated_db):
+    assert ks.knowledge_for_task_exists("t1") is False
+    ks.record_knowledge({"type": "dependency_conflict", "title": "x", "content": "c",
+                         "structured": {"source_task_id": "t1"}})
+    assert ks.knowledge_for_task_exists("t1") is True
+    assert ks.knowledge_for_task_exists("t2") is False
+
+
 def test_test_fixture_never_touches_real_db(isolated_db):
     """隔离自检：夹具生效时索引表应为空，且不指向仓库 data/index.db。"""
     from app.db import connection
