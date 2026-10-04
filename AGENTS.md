@@ -96,7 +96,7 @@ backend/.venv/Scripts/python.exe scripts/m3_acceptance.py --mode all --source ex
 # 启动后端（改完代码记得重启；下载依赖建议走国内镜像源）
 cd backend; $env:PIP_INDEX_URL="https://mirrors.cloud.tencent.com/pypi/simple"; .venv/Scripts/python.exe -m uvicorn app.main:app --port 8000
 
-# 一键启动（阶段6 便携形态 start.bat：自检 Python/前端产物/端口 → 后端同源服务前端 → 开浏览器）
+# 一键启动（阶段6 便携形态 start.bat：自检 Python（优先 backend/.venv）/后端依赖/前端产物/端口 → 后端同源服务前端 → 开浏览器）
 start.bat
 ```
 
