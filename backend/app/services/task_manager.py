@@ -40,6 +40,8 @@ TASK_TIMEOUTS: dict[str, float] = {
     "decompose_verify": 2400,  # 脚本 1800s + 余量
     "module_ingest": 600,
     "network_train": 3600,  # 训练脚本 1800s + 余量
+    "multi_model": 900,     # 多模型综合分析（含分歧归因 agent）
+    "paper_distill": 3600,  # 论文蒸馏（逐篇 agent 起草，多篇可能耗时）
 }
 
 
@@ -50,6 +52,32 @@ def _now() -> str:
 def register_handler(task_type: str, handler: Handler) -> None:
     """注册某类任务的后台执行函数。"""
     _handlers[task_type] = handler
+
+
+# 任务终态钩子（success/failed 后触发）：供「任务后蒸馏入库」等旁路使用（模块详细设计 8.3）。
+_finish_hooks: list[Callable[[str, str], Awaitable[None]]] = []
+
+
+def register_on_finish(hook: Callable[[str, str], Awaitable[None]]) -> None:
+    """注册终态钩子：签名 (task_id, status) -> Awaitable[None]，status ∈ {success, failed}。"""
+    _finish_hooks.append(hook)
+
+
+def _schedule_finish_hooks(task_id: str, status: str) -> None:
+    """调度终态钩子（fire-and-forget）：不阻塞 worker 处理下一个任务，钩子自身异常只吞掉。
+
+    蒸馏是旁路——它慢（要跑 agent），绝不能拖住任务队列，也不能因它失败而影响主任务状态。
+    """
+    for hook in _finish_hooks:
+        async def _run(h=hook):
+            try:
+                await h(task_id, status)
+            except Exception:  # noqa: BLE001 —— 旁路失败不影响主流程
+                pass
+        try:
+            asyncio.create_task(_run())
+        except RuntimeError:  # 无运行事件循环（同步调用场景）→ 跳过
+            pass
 
 
 def create_task(task_type: str, project_id: Optional[str] = None, params: Optional[dict] = None) -> str:
@@ -225,6 +253,7 @@ async def _execute(task_id: str) -> None:
     handler = _handlers.get(task["task_type"])
     if handler is None:
         _set_status(task_id, "failed", error=f"no handler for task_type={task['task_type']}")
+        _schedule_finish_hooks(task_id, "failed")
         return
 
     try:
@@ -241,6 +270,7 @@ async def _execute(task_id: str) -> None:
             # 否则 worker 立刻处理 retry 入队的新任务，会与尚未退出的旧执行并发写同一环境。
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await t
+            _schedule_finish_hooks(task_id, "failed")
             return
         except asyncio.CancelledError:
             # 被 cancel_task 取消（协作式）：同样等收尾后再返回（不重新抛出以免传播到 worker）
@@ -251,8 +281,10 @@ async def _execute(task_id: str) -> None:
         finally:
             _running_tasks.pop(task_id, None)
         _set_status(task_id, "success")
+        _schedule_finish_hooks(task_id, "success")
     except asyncio.CancelledError:
         _set_status(task_id, "cancelled")
         return
     except Exception as e:  # noqa: BLE001 —— 任务级异常需落库并继续
         _set_status(task_id, "failed", error=str(e))
+        _schedule_finish_hooks(task_id, "failed")
