@@ -2,6 +2,8 @@ export interface TraceRequest {
     graph: unknown; // GraphIR snapshot sent to backend
     inputShapes: Array<number[]>; // e.g., [[1, 3, 224, 224]]
     code?: string; // optional generated PyTorch code (frontend codegen)
+    /** 追踪虚拟输入使用的随机种子（工具栏「种子」下拉/自定义输入；未选择时不带该字段）。 */
+    seed?: number;
 }
 
 export interface TraceEntry {

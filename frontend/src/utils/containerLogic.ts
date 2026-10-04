@@ -111,6 +111,24 @@ export function findBestParent(node: Node, currentNodes: Node[], config: Contain
         return areaA - areaB; // Ascending sort: Smallest area first
     })[0];
 }
+/** 与 `graphIR.applyGraphIR` 同口径的层级 zIndex：根=10，每深一层 +10（子节点恒在祖先之上）。
+ *  新建/拖入/改父的节点必须一并带上——否则 React Flow 按 0 算，新节点会压在所有已载入
+ *  节点（z≥10）之下，看起来就是「刚拖进来就在最底层」。 */
+function depthZIndex(parentId: string | undefined, all: Node[]): number {
+    const byId = new Map(all.map(n => [n.id, n]));
+    let depth = 0;
+    let cur = parentId;
+    const seen = new Set<string>();
+    while (cur && !seen.has(cur)) {
+        seen.add(cur);
+        const parent = byId.get(cur);
+        if (!parent) break;
+        depth += 1;
+        cur = parent.parentId;
+    }
+    return 10 + depth * 10;
+}
+
 export function assignParent(
     node: Node,
     currentNodes: Node[],
@@ -132,6 +150,7 @@ export function assignParent(
                 parentId: undefined,
                 extent: undefined,
                 position: nodeAbs,
+                zIndex: depthZIndex(undefined, currentNodes),
                 // Position is already absolute for new drops
             };
         }
@@ -149,10 +168,18 @@ export function assignParent(
                 x: nodeAbs.x - parentAbs.x,
                 y: nodeAbs.y - parentAbs.y,
             },
+            zIndex: depthZIndex(targetParent.id, currentNodes),
         };
     }
     const nodeAbs = node.parentId ? getAbsolutePosition(node, currentNodes) : node.position;
-    return { ...node, parentId: undefined, extent: undefined, position: nodeAbs };
+    // 拖出容器的节点回到根层级，zIndex 同步回到根档（否则会带着较深的值浮在其他根节点之上）
+    return {
+        ...node,
+        parentId: undefined,
+        extent: undefined,
+        position: nodeAbs,
+        zIndex: depthZIndex(undefined, currentNodes),
+    };
 }
 export function syncContainerData(
     nodes: Node[],

@@ -46,7 +46,12 @@ export default function CanvasProjectView({ projectId, onBack }: CanvasProjectVi
         async (edited: GraphIR) => {
             // 先取服务端权威 graph，再 merge（保留后端字段），避免全量重建覆盖
             const server = await getGraph(projectId);
-            await putGraph(projectId, mergeGraphIR(server, edited));
+            const saved = await putGraph(projectId, mergeGraphIR(server, edited));
+            // 版本提交失败不连坐保存本身（后端把原因放在 version_error）：必须带回给画布，
+            // 让界面显示「已保存到项目，但版本节点未生成：<原因>」，而不是一律「已保存 ✓」。
+            const versionError =
+                typeof saved.version_error === "string" && saved.version_error.trim() ? saved.version_error : null;
+            return { versionError };
         },
         [projectId]
     );
@@ -86,6 +91,7 @@ export default function CanvasProjectView({ projectId, onBack }: CanvasProjectVi
                     borderBottom: "1px solid #1f2937",
                     padding: "6px 12px",
                     fontSize: 12,
+                    position: "relative",   // zIndex 对 static 元素无效，补上定位才生效
                     zIndex: 20,
                 }}
             >

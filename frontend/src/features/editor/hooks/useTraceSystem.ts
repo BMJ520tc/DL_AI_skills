@@ -5,20 +5,50 @@ import { runTorchLensTrace, TRACE_UNAVAILABLE_REASON } from "../../../utils/trac
 import { buildShapeComparisons, compareTraceShapes } from "../../../utils/traceAnalysis";
 import { LAYER_REGISTRY } from "../../../types/nodeTypes";
 import { verifyShapes, type ShapeFailure, type ShapeResult } from "../../../utils/shape_verifier";
+import { verifyIRShapes } from "../../../utils/irShapeVerifier";
 import type { TraceResponse } from "../../../types/trace";
 import { getModule } from "../../../utils/moduleRegistry";
 
 // Move comparison logic here or keep in utils?
 // FlowEditor line 140: buildShapeComparisons(traceData, shapeResult ...)
 
+/**
+ * 解析工具栏选择的追踪种子：预设值直接用；选「自定义」时用输入框内容。
+ * 非法/空/NaN → undefined（请求体不带 seed 字段，交给后端默认值）。
+ * 纯函数，供界面与自检脚本共用口径。
+ */
+export function resolveTraceSeed(preset: string, custom: string): number | undefined {
+    const raw = preset === "custom" ? custom : preset;
+    if (raw === null || raw === undefined) return undefined;
+    const trimmed = String(raw).trim();
+    if (!trimmed) return undefined;
+    const value = Number(trimmed);
+    return Number.isFinite(value) ? value : undefined;
+}
+
 type UseTraceSystemProps = {
+    /** 代码生成/沙盒追踪用的节点与边（外部画布模式下为空图，避免对 ir 节点出码）。 */
     nodes: Node[];
     edges: Edge[];
     setNodes: React.Dispatch<React.SetStateAction<Node[]>>;
     generatedCode: string;
+    /** 结构化画布（IR 图）模式：形状校验改用 IR 形状字段判据（verifyIRShapes）。 */
+    irShapeMode?: boolean;
+    /** 形状校验/追踪真正使用的节点与边。外部画布下 nodes/edges 是空图（仅让前端出码空转），
+     *  形状校验与追踪必须吃真实节点/边，否则 verifyShapes([], []) 恒通过（需求五.1）。 */
+    shapeNodes?: Node[];
+    shapeEdges?: Edge[];
 };
 
-export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTraceSystemProps) {
+export function useTraceSystem({
+    nodes,
+    edges,
+    setNodes,
+    generatedCode,
+    irShapeMode = false,
+    shapeNodes,
+    shapeEdges,
+}: UseTraceSystemProps) {
     const { fitView } = useReactFlow();
     const [showTrace, setShowTrace] = useState(false);
     const [traceData, setTraceData] = useState<TraceResponse | null>(null);
@@ -29,13 +59,27 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
     const [traceSeedPreset, setTraceSeedPreset] = useState("42");
     const [traceSeedCustom, setTraceSeedCustom] = useState("");
 
+    // 形状校验/追踪的数据源：默认为传入的 nodes/edges（沙盒编辑器行为不变），
+    // 外部画布模式由 FlowEditor 显式传入真实节点/边。
+    const graphNodes = shapeNodes ?? nodes;
+    const graphEdges = shapeEdges ?? edges;
+
     // Shape Verification Logic
     const [shapeResult, setShapeResult] = useState<ShapeResult | null>(null);
-    const verificationResult = useMemo(() => {
-        return verifyShapes(nodes, edges, LAYER_REGISTRY);
-    }, [nodes, edges]);
+    // IR 图（结构化画布）：按 __out_shape ↔ __in_shape 判连线一致性；缺形状只计数不算失败。
+    const irVerification = useMemo(
+        () => (irShapeMode ? verifyIRShapes(graphNodes, graphEdges) : null),
+        [irShapeMode, graphNodes, graphEdges],
+    );
+    const layerVerification = useMemo(
+        () => (irShapeMode ? null : verifyShapes(graphNodes, graphEdges, LAYER_REGISTRY)),
+        [irShapeMode, graphNodes, graphEdges],
+    );
+    const verificationResult: ShapeResult | null = irVerification ?? layerVerification;
+    const shapeMissing = useMemo(() => irVerification?.missingShapes ?? [], [irVerification]);
 
     useEffect(() => {
+        if (!verificationResult) return;
         setShapeResult(prev => {
             const prevStr = JSON.stringify(prev);
             const nextStr = JSON.stringify(verificationResult);
@@ -61,7 +105,7 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
         };
 
         const shapes: number[][] = [];
-        const inputNodes = nodes.filter(n => n.type === "input_layer");
+        const inputNodes = graphNodes.filter(n => n.type === "input_layer");
         for (const node of inputNodes) {
             const data: Record<string, unknown> = (node.data && typeof node.data === "object") ? node.data : {};
             const shape = readDimsFromData(data);
@@ -77,10 +121,10 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
 
         // If no root Input nodes, infer from root-level nodes (e.g., module_ref).
         const incomingCount = new Map<string, number>();
-        edges.forEach(e => {
+        graphEdges.forEach(e => {
             incomingCount.set(e.target, (incomingCount.get(e.target) || 0) + 1);
         });
-        const rootNodes = nodes.filter(n => (incomingCount.get(n.id) || 0) === 0);
+        const rootNodes = graphNodes.filter(n => (incomingCount.get(n.id) || 0) === 0);
         for (const node of rootNodes) {
             if (node.type === "input_layer") {
                 const shape = readDimsFromData(node.data);
@@ -106,7 +150,7 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
         }
 
         return shapes.length ? shapes : [[1, 3, 224, 224]];
-    }, [nodes, edges, shapeResult]);
+    }, [graphNodes, graphEdges, shapeResult]);
 
     // Apply calculated shapes to nodes
     const shapeResultRef = useRef<string>("");
@@ -161,17 +205,21 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
         setTraceError(null);
         setTraceNotice(null);
         try {
-            const graph = buildGraphIR(nodes, edges);
+            const graph = buildGraphIR(graphNodes, graphEdges);
+            // 种子：工具栏选择必须进请求体（需求五.1 种子控件不能是死控件）；
+            // 非法/未选择时 resolveTraceSeed 返回 undefined，此时不带该字段。
+            const seed = resolveTraceSeed(traceSeedPreset, traceSeedCustom);
             const resp = await runTorchLensTrace({
                 graph,
                 inputShapes: getTraceInputShapes(),
                 code: generatedCode,
+                ...(seed === undefined ? {} : { seed }),
             });
             // 端点缺失 / 独立 runner 不可用：给出可见提示，但不阻断画布其它功能
             if (resp.unavailable) {
                 setTraceNotice(resp.unavailableReason ?? TRACE_UNAVAILABLE_REASON);
             }
-            const shapeWarnings = compareTraceShapes(resp, shapeResult, edges, nodes, LAYER_REGISTRY);
+            const shapeWarnings = compareTraceShapes(resp, shapeResult, graphEdges, graphNodes, LAYER_REGISTRY);
             setTraceData({
                 ...resp,
                 warnings: [...(resp.warnings || []), ...shapeWarnings],
@@ -184,11 +232,11 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
         } finally {
             setTraceLoading(false);
         }
-    }, [nodes, edges, generatedCode, shapeResult, getTraceInputShapes]);
+    }, [graphNodes, graphEdges, generatedCode, shapeResult, getTraceInputShapes, traceSeedPreset, traceSeedCustom]);
 
     const shapeComparisons = useMemo(
-        () => (traceData ? buildShapeComparisons(traceData, shapeResult, edges, nodes, LAYER_REGISTRY) : []),
-        [traceData, shapeResult, edges, nodes]
+        () => (traceData ? buildShapeComparisons(traceData, shapeResult, graphEdges, graphNodes, LAYER_REGISTRY) : []),
+        [traceData, shapeResult, graphEdges, graphNodes]
     );
 
     // Error Decoration on Edges
@@ -252,17 +300,17 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
     const focusFailure = useCallback(
         (failure: ShapeFailure, setHighlightNodes: (s: Set<string>) => void, setHighlightEdges: (s: Set<string>) => void) => {
             const upstream = failure.upstream || [];
-            const edgeIds = edges
+            const edgeIds = graphEdges
                 .filter(e => upstream.includes(e.source) && e.target === failure.nodeId)
                 .map(e => e.id);
             setHighlightNodes(new Set([failure.nodeId, ...upstream]));
             setHighlightEdges(new Set(edgeIds));
-            const target = nodes.find(n => n.id === failure.nodeId);
+            const target = graphNodes.find(n => n.id === failure.nodeId);
             if (target) {
                 void fitView({ nodes: [target], padding: 0.4 });
             }
         },
-        [edges, nodes, fitView]
+        [graphEdges, graphNodes, fitView]
     );
 
     return {
@@ -274,6 +322,8 @@ export function useTraceSystem({ nodes, edges, setNodes, generatedCode }: UseTra
         traceSeedPreset, setTraceSeedPreset,
         traceSeedCustom, setTraceSeedCustom,
         shapeResult,
+        /** 缺形状的节点 id（IR 图口径：非 op 节点 in/out 任缺其一）；沙盒模式恒为空。 */
+        shapeMissing,
         handleTrace,
         shapeComparisons,
         getDecoratedEdges,

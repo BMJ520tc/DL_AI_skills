@@ -169,7 +169,8 @@ export default function DiagramView({
               display: "flex",
               alignItems: "center",
               justifyContent: "center",
-              zIndex: 20,
+              // 明确高于画布右侧面板（20）：原来同值，只靠 DOM 顺序才压得住，顺序一变就被盖
+              zIndex: 24,
               padding: 20,
           }
         : {

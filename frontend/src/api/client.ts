@@ -196,8 +196,19 @@ export const createProject = (body: {
 // 结构化项目画布快照（模块四 6.5/7.1）
 export const getGraph = (projectId: string) => request<GraphIR>(`/api/projects/${projectId}/graph`);
 
+/** PUT graph 的响应（backend/app/api/projects.py:put_graph）。
+ *  版本提交失败不连坐保存本身：图已落盘，失败原因在 version_error 透出——
+ *  界面必须据此显示「已保存到项目，但版本节点未生成」，不能一律报成功。 */
+export interface PutGraphResponse {
+    status: string;
+    /** version_service.commit_graph 的返回值（{commit: 短提交号}）；老后端可能只给字符串。 */
+    version?: { commit?: string } | string | null;
+    /** 非空即表示「图已保存但版本提交失败」，内容是失败原因。 */
+    version_error?: string | null;
+}
+
 export const putGraph = (projectId: string, graph: GraphIR) =>
-    request<{ status: string }>(`/api/projects/${projectId}/graph`, {
+    request<PutGraphResponse>(`/api/projects/${projectId}/graph`, {
         method: "PUT",
         body: JSON.stringify(graph),
     });

@@ -10,7 +10,80 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GraphIR } from "../../../types/graph";
 import { applyGraphIR, buildGraphIR } from "../../../utils/graphIR";
 import { graphIRToFlow } from "../../../utils/irAdapter";
-import { syncIdFromNodes } from "../utils/idUtils";
+import { getId, syncIdFromNodes } from "../utils/idUtils";
+
+// ---------------------------------------------------------------------------
+// 节点复制（需求五.1「在节点上直接编辑：改参数、复制、删除、成组」）
+// 纯函数放在 hook 外部：不依赖 React 状态，便于自检脚本直接核对边重映射。
+// ---------------------------------------------------------------------------
+
+/** data/边数据的深拷贝：数组与纯对象递归复制，基本类型与函数按引用保留。 */
+export function deepCopyValue<T>(value: T): T {
+    if (Array.isArray(value)) {
+        return value.map(item => deepCopyValue(item)) as unknown as T;
+    }
+    if (value && typeof value === "object") {
+        const out: Record<string, unknown> = {};
+        for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+            out[key] = deepCopyValue(item);
+        }
+        return out as T;
+    }
+    return value;
+}
+
+export type DuplicateResult = { nodes: Node[]; edges: Edge[]; newIds: string[] };
+
+/**
+ * 复制选中节点的纯函数实现（新 id 由调用方注入，便于自检）：
+ *   - 只复制 selectedIds 中的节点；空选区返回 null（调用方据此禁用/不动作）；
+ *   - 新 id 一律由 newId() 生成，位置在原节点基础上偏移 offset（默认 +40/+40）；
+ *   - data 深拷贝，复制节点与原节点不共享参数对象；
+ *   - 连线只在两端都被复制时一并复制；跨出选区的边不复制；
+ *   - 复制后选中新节点（新节点 selected=true，原节点取消选中）。
+ */
+export function duplicateSelection(
+    nodes: Node[],
+    edges: Edge[],
+    selectedIds: Iterable<string>,
+    newId: () => string,
+    offset: { x: number; y: number } = { x: 40, y: 40 },
+): DuplicateResult | null {
+    const selected = new Set(selectedIds);
+    const originals = nodes.filter(n => selected.has(n.id));
+    if (!originals.length) return null;
+
+    const idMap = new Map<string, string>();
+    const copies: Node[] = originals.map(node => {
+        const id = newId();
+        idMap.set(node.id, id);
+        const position = node.position ?? { x: 0, y: 0 };
+        return {
+            ...node,
+            id,
+            position: { x: position.x + offset.x, y: position.y + offset.y },
+            selected: true,
+            data: deepCopyValue(node.data ?? {}),
+        };
+    });
+
+    const copiedEdges: Edge[] = edges
+        .filter(edge => idMap.has(edge.source) && idMap.has(edge.target))
+        .map(edge => ({
+            ...edge,
+            id: newId(),
+            source: idMap.get(edge.source)!,
+            target: idMap.get(edge.target)!,
+            selected: false,
+            data: deepCopyValue(edge.data ?? {}),
+        }));
+
+    return {
+        nodes: [...nodes.map(n => (selected.has(n.id) ? { ...n, selected: false } : n)), ...copies],
+        edges: [...edges, ...copiedEdges],
+        newIds: copies.map(c => c.id),
+    };
+}
 
 /** initialGraph 传入时进入外部画布模式（模块四 B3）：从 GraphIR 快照初始化、
  *  不再读写 localStorage（避免结构化项目画布污染沙盒编辑器的本地存档）。 */
@@ -86,6 +159,17 @@ export function useGraphState(initialGraph?: GraphIR | null) {
         changes => setEdges(eds => applyEdgeChanges(changes, eds)),
         [setEdges]
     );
+
+    /** 复制当前选中的节点（工具栏「复制」按钮 / Ctrl+D 共用）；无选中返回 false。
+     *  与其它编辑动作一样走 setNodes/setEdges，历史快照/撤销因此照常工作。 */
+    const duplicateSelected = useCallback((): boolean => {
+        const selectedIds = nodes.filter(n => n.selected).map(n => n.id);
+        const result = duplicateSelection(nodes, edges, selectedIds, getId);
+        if (!result) return false;
+        setNodes(result.nodes);
+        setEdges(result.edges);
+        return true;
+    }, [nodes, edges, setNodes, setEdges]);
 
     const deleteEdgeById = useCallback((edgeId: string) => {
         setEdges(eds => eds.filter(e => e.id !== edgeId));
@@ -206,6 +290,7 @@ export function useGraphState(initialGraph?: GraphIR | null) {
         canRedo,
         handleUndo,
         handleRedo,
+        duplicateSelected,
         edgesWithHandlers
     };
 }

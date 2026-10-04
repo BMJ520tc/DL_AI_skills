@@ -658,6 +658,9 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                       .filter(n => !hiddenNodeIds.has(n.id))
                       .map(n => ({
                           ...n,
+                          // 选中态自己下发：这个只读画布没传 onNodesChange，库发的 select 变更会被丢弃，
+                          // 于是点节点永远不高亮（ViewerNode 的 selected 恒为 false）
+                          selected: n.id === selectedNodeId,
                           data: {
                               ...(n.data || {}),
                               __showShape: showShapes,
@@ -667,7 +670,7 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                           },
                       }))
                 : [],
-        [flow, showShapes, hiddenNodeIds, childCount, collapsedContainers, toggleContainer]
+        [flow, showShapes, hiddenNodeIds, childCount, collapsedContainers, toggleContainer, selectedNodeId]
     );
 
     const step = (
@@ -886,6 +889,9 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                             onPaneClick={() => setSelectedNodeId(null)}
                             nodesDraggable={false}
                             nodesConnectable={false}
+                            // 关掉「选中即抬高」：它会把 zIndex 改成 1000、取消选中又设回 0，
+                            // 冲掉按层级深度算好的 zIndex，点过再点别处就会掉到容器之下。
+                            elevateNodesOnSelect={false}
                             fitView
                             proOptions={{ hideAttribution: true }}
                         >

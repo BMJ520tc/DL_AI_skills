@@ -4,6 +4,9 @@ type Props = {
     canUndo: boolean;
     canRedo: boolean;
     canSaveModule: boolean;
+    /** 是否可复制选中节点（结构化画布/沙盒画布通用：无选中则为 false）。 */
+    canDuplicate: boolean;
+    onDuplicate: () => void;
     traceLoading: boolean;
     traceSeedOptions: string[];
     traceSeedPreset: string;
@@ -34,12 +37,18 @@ type Props = {
     hideTrace?: boolean;
     statusSlot?: ReactNode;
     selectionSummary?: ReactNode;
+    /** 可选：画布自身的动作按钮（保存到项目 / 导出代码 / 运行训练 / 版本）。
+     *  渲染在头部右侧组的最后一行——放在头部流式布局里，避免用绝对定位浮在
+     *  「知识库 / 查看计算量」等按钮之上把后者挡住。 */
+    rightSlot?: ReactNode;
 };
 
 export default function EditorHeader({
     canUndo,
     canRedo,
     canSaveModule,
+    canDuplicate,
+    onDuplicate,
     traceLoading,
     traceSeedOptions,
     traceSeedPreset,
@@ -68,6 +77,7 @@ export default function EditorHeader({
     hideTrace = false,
     statusSlot,
     selectionSummary,
+    rightSlot,
 }: Props) {
     return (
         <div
@@ -200,6 +210,30 @@ export default function EditorHeader({
                 </div>
                 <div style={{ height: 26, width: 1, background: "#2a2a2a" }} />
                 </>)}
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <span style={{ color: "#6b7280", fontSize: 10, letterSpacing: "0.08em", textTransform: "uppercase" }}>
+                        编辑
+                    </span>
+                    <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                        <button
+                            className="nodrag"
+                            onClick={onDuplicate}
+                            disabled={!canDuplicate}
+                            style={{
+                                padding: "6px 10px",
+                                background: canDuplicate ? "#335" : "#222",
+                                color: canDuplicate ? "#fff" : "#666",
+                                border: "1px solid #444",
+                                borderRadius: 6,
+                                cursor: canDuplicate ? "pointer" : "not-allowed",
+                            }}
+                            title="复制选中节点（含选区内部连线）；快捷键 Ctrl/Cmd+D"
+                        >
+                            复制
+                        </button>
+                    </div>
+                </div>
+                <div style={{ height: 26, width: 1, background: "#2a2a2a" }} />
                 <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                     <span style={{ color: "#6b7280", fontSize: 10, letterSpacing: "0.08em", textTransform: "uppercase" }}>
                         模块
@@ -421,6 +455,11 @@ export default function EditorHeader({
                         }}
                     >
                         {selectionSummary}
+                    </div>
+                ) : null}
+                {rightSlot ? (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "nowrap" }}>
+                        {rightSlot}
                     </div>
                 ) : null}
             </div>

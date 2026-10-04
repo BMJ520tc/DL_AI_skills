@@ -238,9 +238,13 @@ export function ModuleEditorOverlay({
                     <div style={{ flex: 1, position: "relative" }}>
                         <ReactFlowProvider>
                             <ReactFlow
-                                key={`module-editor-${openModule.module.id}-${openModule.module.updatedAt || ""}`}
+                                // key 只用模块 id：带上 updatedAt 会让「保存后」重挂载整棵树，
+                                // 丢掉视口与选中态（保存通常紧接关面板，所以以前没被注意到）
+                                key={`module-editor-${openModule.module.id}`}
                                 nodes={openModule.nodes}
                                 edges={openModule.edges}
+                                // 同 EditorCanvas：关掉「选中即抬高」，否则会冲掉按层级深度算的 zIndex
+                                elevateNodesOnSelect={false}
                                 onNodeDragStart={onNodeDragStart}
                                 onNodeDragStop={onNodeDragStop}
                                 onInit={instance => {

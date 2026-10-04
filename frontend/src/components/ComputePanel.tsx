@@ -30,7 +30,9 @@ export default function ComputePanel({ summary, onSelect, onHover, onClose }: Pr
         <div
             style={{
                 position: "absolute",
-                top: 12,
+                // 56 与运行/版本面板同起点：12 会压在 sticky 头部带（zIndex:5）上，
+                // 把头部右侧整排按钮盖住点不到（实测命中测试全部 covered）。
+                top: 56,
                 right: 12,
                 width: 360,
                 maxHeight: "70vh",

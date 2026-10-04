@@ -1,8 +1,9 @@
-import { ReactFlowProvider } from "@xyflow/react";
+import { ReactFlowProvider, type Connection, type Edge } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import React, { useCallback, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GraphIR } from "./types/graph";
 import { buildGraphIR } from "./utils/graphIR";
+import { isIrConnectionCompatible } from "./utils/irShapeVerifier";
 
 // Components
 import DiagramView from "./components/DiagramView";
@@ -40,11 +41,15 @@ const TRACE_SEED_PRESETS = [42, 1337, 1234, 2020, 2021];
 export type FlowEditorProps = {
     /** 外部画布模式（模块四 B3）：以 GraphIR 快照初始化且不读写 localStorage。 */
     initialGraph?: GraphIR | null;
-    /** 保存回调（结构化项目画布 → PUT /api/projects/{id}/graph）。 */
-    onSave?: (graph: GraphIR) => Promise<void>;
+    /** 保存回调（结构化项目画布 → PUT /api/projects/{id}/graph）。
+     *  返回值 versionError 非空 = 图已保存但版本节点未生成，界面必须显示成非成功。 */
+    onSave?: (graph: GraphIR) => Promise<CanvasSaveFeedback | void>;
     /** 结构化项目 id：画布网络的「导出代码 / 运行训练」入口（阶段4 4c，模块详细设计 7.5）。 */
     projectId?: string;
 };
+
+/** 保存回调的反馈：versionError 非空表示版本提交失败（图本身已落盘）。 */
+export type CanvasSaveFeedback = { versionError?: string | null };
 
 function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
     // 1. Core Graph State
@@ -53,14 +58,24 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
         edges, setEdges,
         onNodesChange, onEdgesChange,
         canUndo, canRedo, handleUndo, handleRedo,
+        duplicateSelected,
         edgesWithHandlers
     } = useGraphState(initialGraph);
 
-    // 外部画布模式（结构化项目画布）：画布代码生成/形状追踪对 ir 节点不生效（阶段3实施方案 3.8）。
-    // 传空数组使两个系统空转；hook 调用顺序保持无条件，仅数据源按 props 切换。
+    // 外部画布模式（结构化项目画布）：画布代码生成对 ir 节点不生效（阶段3实施方案 3.8）。
+    // codeNodes/codeEdges 仍传空数组让「前端出码」空转；形状校验/追踪改吃真实 nodes/edges
+    // （见 useTraceSystem 的 shapeNodes/shapeEdges），否则 verifyShapes([], []) 恒通过
+    // —— 需求五.1 明文要求这张工作台画布也要做连线形状校验。
     const isExternal = !!initialGraph;
     const codeNodes = useMemo(() => (isExternal ? [] : nodes), [isExternal, nodes]);
     const codeEdges = useMemo(() => (isExternal ? [] : edges), [isExternal, edges]);
+
+    // 连线形状校验（口径见 utils/irShapeVerifier：两端形状都已知且不一致才拒绝；
+    // 任一端缺形状 → 放行，不拦正常连线）。只作用于结构化画布，沙盒编辑器行为不变。
+    const isConnectionValid = useCallback(
+        (connection: Connection | Edge) => (isExternal ? isIrConnectionCompatible(nodes, connection) : true),
+        [isExternal, nodes]
+    );
 
     // 2. Code Generation
     const { generated, generatedCode, onDownloadCode } = useCodeGeneration(codeNodes, codeEdges);
@@ -72,6 +87,10 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
     const trace = useTraceSystem({
         nodes: codeNodes,
         edges: codeEdges,
+        // 形状校验与追踪的数据源：沙盒模式下与 nodes/edges 相同，外部画布模式是真实 IR 图。
+        shapeNodes: nodes,
+        shapeEdges: edges,
+        irShapeMode: isExternal,
         setNodes,
         generatedCode
     });
@@ -91,7 +110,9 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
         setNodes,
         setEdges,
         moduleStack: modSys.moduleStack,
-        setModuleStack: modSys.setModuleStack
+        setModuleStack: modSys.setModuleStack,
+        // 兜底守卫：ReactFlow 的 isValidConnection 已在交互层拦下非法连线，这里再防一层。
+        isConnectionValid: isExternal ? isConnectionValid : undefined
     });
 
     const {
@@ -166,12 +187,21 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
     const [showKnowledge, setShowKnowledge] = useState(false);
 
     // 画布保存（模块四 B3 结构化项目最小闭环：全量 GraphIR v2 快照覆盖）
-    const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+    const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "warned" | "error">("idle");
+    // 版本提交失败原因（图已保存）：必须显示成非成功，不能再一律报「已保存 ✓」（4d-1 版本失败不静默）。
+    const [saveWarning, setSaveWarning] = useState<string | null>(null);
     const handleSaveGraph = async () => {
         if (!onSave || saveState === "saving") return;
         setSaveState("saving");
+        setSaveWarning(null);
         try {
-            await onSave(buildGraphIR(nodes, edges));
+            const feedback = await onSave(buildGraphIR(nodes, edges));
+            const versionError = feedback && typeof feedback === "object" ? feedback.versionError : null;
+            if (versionError) {
+                setSaveState("warned");
+                setSaveWarning(`已保存到项目，但版本节点未生成：${versionError}`);
+                return;
+            }
             setSaveState("saved");
             setTimeout(() => setSaveState("idle"), 2000);
         } catch (err) {
@@ -220,7 +250,31 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
         setNodes(restored.nodes);
         setEdges(restored.edges);
         setSaveState("idle");
+        setSaveWarning(null);
     }, [setNodes, setEdges]);
+
+    // 节点复制（需求五.1「在节点上直接编辑：改参数、复制、删除、成组」）：
+    // 工具栏「复制」按钮与 Ctrl/Cmd+D 共用同一入口；无选中时 duplicateSelected 返回 false 不动作。
+    const handleDuplicate = useCallback(() => {
+        duplicateSelected();
+    }, [duplicateSelected]);
+
+    // Ctrl/Cmd+D 复制选中节点。焦点在 input/textarea/select/可编辑区域时不抢快捷键
+    // （编辑节点参数时 Ctrl+D 不该复制节点）。
+    useEffect(() => {
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (!(event.ctrlKey || event.metaKey) || event.shiftKey || event.altKey) return;
+            if (event.key.toLowerCase() !== "d") return;
+            const target = event.target as HTMLElement | null;
+            const tag = target?.tagName?.toLowerCase();
+            if (tag === "input" || tag === "textarea" || tag === "select" || target?.isContentEditable) return;
+            if (!nodes.some(n => n.selected)) return;
+            event.preventDefault();
+            handleDuplicate();
+        };
+        window.addEventListener("keydown", onKeyDown);
+        return () => window.removeEventListener("keydown", onKeyDown);
+    }, [handleDuplicate, nodes]);
 
     // File Upload (ref needed)
     const uploadInputRef = useRef<HTMLInputElement>(null);
@@ -278,6 +332,8 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                     canUndo={canUndo}
                     canRedo={canRedo}
                     canSaveModule={selectedNodeIds.length > 0}
+                    canDuplicate={selectedNodeIds.length > 0}
+                    onDuplicate={handleDuplicate}
                     traceLoading={trace.traceLoading}
                     traceSeedOptions={[...TRACE_SEED_PRESETS.map(String), "custom"]}
                     traceSeedPreset={trace.traceSeedPreset}
@@ -308,12 +364,45 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                     showDiagnostics={layout.showDiagnostics}
                     showComputePanel={layout.showComputePanel}
                     failureCount={trace.shapeResult?.failures?.length ?? 0}
-                    onToggleDiagnostics={() => layout.setShowDiagnostics(v => !v)}
-                    onToggleComputePanel={() => layout.setShowComputePanel(v => !v)}
+                    // 右侧四个面板（运行训练 / 版本 / 查看诊断 / 查看计算量）互斥：
+                    // 它们同起点（top:56 右对齐），不互斥就会互相盖住（此前「查看计算量」
+                    // 还能盖住头部整排按钮）
+                    onToggleDiagnostics={() => {
+                        const next = !layout.showDiagnostics;
+                        if (next) {
+                            layout.setShowComputePanel(false);
+                            setShowRunPanel(false);
+                            setShowVersionPanel(false);
+                        }
+                        layout.setShowDiagnostics(next);
+                    }}
+                    onToggleComputePanel={() => {
+                        const next = !layout.showComputePanel;
+                        if (next) {
+                            layout.setShowDiagnostics(false);
+                            setShowRunPanel(false);
+                            setShowVersionPanel(false);
+                        }
+                        layout.setShowComputePanel(next);
+                    }}
                     onOpenKnowledge={() => setShowKnowledge(true)}
-                    hideTrace={isExternal}
                     statusSlot={
-                        isExternal ? null : trace.shapeResult && trace.shapeResult.ok ? (
+                        trace.shapeResult &&
+                        (trace.shapeResult.failures.length > 0 || trace.shapeMissing.length > 0) ? (
+                            <div style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                                {trace.shapeResult.failures.length > 0 ? (
+                                    <span style={{ color: "#f97316", fontWeight: 600 }}>
+                                        {trace.shapeResult.failures.length} issue(s) detected
+                                    </span>
+                                ) : null}
+                                {trace.shapeMissing.length > 0 ? (
+                                    // 缺形状不是错误（不刷诊断面板），但必须让用户知道有多少节点没回填形状
+                                    <span style={{ color: "#fbbf24", fontWeight: 600 }}>
+                                        {trace.shapeMissing.length} 个节点缺形状
+                                    </span>
+                                ) : null}
+                            </div>
+                        ) : trace.shapeResult && trace.shapeResult.ok ? (
                             <div
                                 style={{
                                     display: "inline-flex",
@@ -336,11 +425,109 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                                     ({Object.keys(trace.shapeResult.shapes).length} nodes)
                                 </span>
                             </div>
-                        ) : trace.shapeResult && !trace.shapeResult.ok ? (
-                            <span style={{ color: "#f97316", fontWeight: 600 }}>{trace.shapeResult.failures.length} issue(s) detected</span>
                         ) : null
                     }
                     selectionSummary={null}
+                    rightSlot={
+                        onSave ? (
+                            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                {projectId && (
+                                    <>
+                                        <button
+                                            onClick={() => void handleExportCode()}
+                                            disabled={exportState === "busy"}
+                                            style={{
+                                                border: "1px solid #1f2a2f",
+                                                borderRadius: 8,
+                                                padding: "6px 14px",
+                                                fontWeight: 600,
+                                                fontSize: 12,
+                                                cursor: exportState === "busy" ? "wait" : "pointer",
+                                                background: exportState === "error" ? "#7f1d1d" : "#1e293b",
+                                                color: "#e2e8f0",
+                                            }}
+                                        >
+                                            {exportState === "busy"
+                                                ? "导出中…"
+                                                : exportState === "error"
+                                                  ? "导出失败，点击重试"
+                                                  : "导出代码"}
+                                        </button>
+                                        <button
+                                            onClick={() => {
+                                                setShowVersionPanel(false);
+                                                layout.setShowDiagnostics(false);
+                                                layout.setShowComputePanel(false);
+                                                setShowRunPanel(v => !v);
+                                            }}
+                                            style={{
+                                                border: "1px solid #1f2a2f",
+                                                borderRadius: 8,
+                                                padding: "6px 14px",
+                                                fontWeight: 600,
+                                                fontSize: 12,
+                                                cursor: "pointer",
+                                                background: showRunPanel ? "#6d28d9" : "#7c3aed",
+                                                color: "#e2e8f0",
+                                            }}
+                                        >
+                                            运行训练
+                                        </button>
+                                        <button
+                                            onClick={() => {
+                                                setShowRunPanel(false);
+                                                layout.setShowDiagnostics(false);
+                                                layout.setShowComputePanel(false);
+                                                setShowVersionPanel(v => !v);
+                                            }}
+                                            style={{
+                                                border: "1px solid #1f2a2f",
+                                                borderRadius: 8,
+                                                padding: "6px 14px",
+                                                fontWeight: 600,
+                                                fontSize: 12,
+                                                cursor: "pointer",
+                                                background: showVersionPanel ? "#1d4ed8" : "#2563eb",
+                                                color: "#e2e8f0",
+                                            }}
+                                        >
+                                            版本
+                                        </button>
+                                    </>
+                                )}
+                                <button
+                                    onClick={handleSaveGraph}
+                                    disabled={saveState === "saving"}
+                                    title={saveState === "warned" && saveWarning ? saveWarning : undefined}
+                                    style={{
+                                        border: "1px solid #1f2a2f",
+                                        borderRadius: 8,
+                                        padding: "6px 14px",
+                                        fontWeight: 600,
+                                        fontSize: 12,
+                                        cursor: saveState === "saving" ? "wait" : "pointer",
+                                        background:
+                                            saveState === "error"
+                                                ? "#7f1d1d"
+                                                : saveState === "warned"
+                                                  ? "#b45309"
+                                                  : "#0f766e",
+                                        color: "#e2e8f0",
+                                    }}
+                                >
+                                    {saveState === "saving"
+                                        ? "保存中…"
+                                        : saveState === "saved"
+                                          ? "已保存 ✓"
+                                          : saveState === "warned"
+                                            ? "版本节点未生成 ⚠"
+                                            : saveState === "error"
+                                              ? "保存失败，点击重试"
+                                              : "保存到项目"}
+                                </button>
+                            </div>
+                        ) : null
+                    }
                 />
 
                 <EditorCanvas
@@ -356,16 +543,67 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                     onSelectionChange={onSelectionChange}
                     clearSelection={clearSelection}
                     setMainFlowRef={(rf) => { mainFlowRef.current = rf; }}
+                    // 连线形状校验（仅结构化画布）：形状不一致时 ReactFlow 直接拒绝落线
+                    isValidConnection={isExternal ? isConnectionValid : undefined}
                 />
 
-                {/* 形状追踪不可用提示（需求五.2）：端点缺失/runner 未起时可见，不静默失败 */}
-                {!isExternal && trace.traceNotice && (
+                {/* 保存成功但版本节点未生成（4d-1「版本提交失败不静默」）：明确的非成功提示。
+                    图已落盘，但版本树里没有新节点，必须让用户看到原因，而不是「已保存 ✓」。 */}
+                {saveWarning && (
                     <div
                         style={{
                             position: "absolute",
                             top: 56,
                             left: 12,
-                            right: 12,
+                            right: "auto",
+                            maxWidth: "calc(100% - 452px)",
+                            zIndex: 10,
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 10,
+                            background: "#3f2d0f",
+                            border: "1px solid #d97706",
+                            color: "#fde68a",
+                            borderRadius: 8,
+                            padding: "8px 12px",
+                            fontSize: 12,
+                            boxShadow: "0 8px 20px rgba(0,0,0,0.35)",
+                        }}
+                    >
+                        <span>⚠ {saveWarning}</span>
+                        <button
+                            onClick={() => {
+                                setSaveWarning(null);
+                                setSaveState("idle");
+                            }}
+                            style={{
+                                marginLeft: "auto",
+                                border: "1px solid #d97706",
+                                background: "transparent",
+                                color: "#fde68a",
+                                borderRadius: 6,
+                                padding: "2px 10px",
+                                fontSize: 12,
+                                cursor: "pointer",
+                            }}
+                        >
+                            关闭
+                        </button>
+                    </div>
+                )}
+
+                {/* 形状追踪不可用提示（需求五.2）：端点缺失/runner 未起时可见，不静默失败。
+                    结构化画布同样可见（外部画布不再 hideTrace），但绝不伪造追踪结果。 */}
+                {trace.traceNotice && (
+                    <div
+                        style={{
+                            position: "absolute",
+                            top: saveWarning ? 104 : 56,
+                            left: 12,
+                            // 右端让出右侧面板列（版本面板最宽 420 + 边距）：提示条原来铺满整宽，
+                            // 右段（含「关闭」按钮）会被 top:56 的面板压住，提示关不掉。
+                            right: "auto",
+                            maxWidth: "calc(100% - 452px)",
                             zIndex: 9,
                             display: "flex",
                             alignItems: "center",
@@ -398,101 +636,6 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                     </div>
                 )}
 
-                {onSave && (
-                    <div
-                        style={{
-                            position: "absolute",
-                            top: 12,
-                            right: 12,
-                            zIndex: 10,
-                            display: "flex",
-                            gap: 8,
-                        }}
-                    >
-                        {projectId && (
-                            <>
-                                <button
-                                    onClick={() => void handleExportCode()}
-                                    disabled={exportState === "busy"}
-                                    style={{
-                                        border: "1px solid #1f2a2f",
-                                        borderRadius: 8,
-                                        padding: "6px 14px",
-                                        fontWeight: 600,
-                                        fontSize: 12,
-                                        cursor: exportState === "busy" ? "wait" : "pointer",
-                                        background: exportState === "error" ? "#7f1d1d" : "#1e293b",
-                                        color: "#e2e8f0",
-                                    }}
-                                >
-                                    {exportState === "busy"
-                                        ? "导出中…"
-                                        : exportState === "error"
-                                          ? "导出失败，点击重试"
-                                          : "导出代码"}
-                                </button>
-                                <button
-                                    onClick={() => {
-                                        setShowVersionPanel(false);
-                                        setShowRunPanel(v => !v);
-                                    }}
-                                    style={{
-                                        border: "1px solid #1f2a2f",
-                                        borderRadius: 8,
-                                        padding: "6px 14px",
-                                        fontWeight: 600,
-                                        fontSize: 12,
-                                        cursor: "pointer",
-                                        background: showRunPanel ? "#6d28d9" : "#7c3aed",
-                                        color: "#e2e8f0",
-                                    }}
-                                >
-                                    运行训练
-                                </button>
-                                <button
-                                    onClick={() => {
-                                        setShowRunPanel(false);
-                                        setShowVersionPanel(v => !v);
-                                    }}
-                                    style={{
-                                        border: "1px solid #1f2a2f",
-                                        borderRadius: 8,
-                                        padding: "6px 14px",
-                                        fontWeight: 600,
-                                        fontSize: 12,
-                                        cursor: "pointer",
-                                        background: showVersionPanel ? "#1d4ed8" : "#2563eb",
-                                        color: "#e2e8f0",
-                                    }}
-                                >
-                                    版本
-                                </button>
-                            </>
-                        )}
-                        <button
-                            onClick={handleSaveGraph}
-                            disabled={saveState === "saving"}
-                            style={{
-                                border: "1px solid #1f2a2f",
-                                borderRadius: 8,
-                                padding: "6px 14px",
-                                fontWeight: 600,
-                                fontSize: 12,
-                                cursor: saveState === "saving" ? "wait" : "pointer",
-                                background: saveState === "error" ? "#7f1d1d" : "#0f766e",
-                                color: "#e2e8f0",
-                            }}
-                        >
-                            {saveState === "saving"
-                                ? "保存中…"
-                                : saveState === "saved"
-                                  ? "已保存 ✓"
-                                  : saveState === "error"
-                                    ? "保存失败，点击重试"
-                                    : "保存到项目"}
-                        </button>
-                    </div>
-                )}
 
                 {projectId && onSave && showRunPanel && (
                     <NetworkRunPanel

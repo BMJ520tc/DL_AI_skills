@@ -1,4 +1,4 @@
-import { addEdge, useReactFlow, type Edge, type Node, type OnConnect, type ReactFlowInstance } from "@xyflow/react";
+import { addEdge, useReactFlow, type Connection, type Edge, type Node, type OnConnect, type ReactFlowInstance } from "@xyflow/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FieldSpec } from "../../../node_gen/BaseClass";
 import {
@@ -19,6 +19,10 @@ type UseGraphInteractionProps = {
     setEdges: React.Dispatch<React.SetStateAction<Edge[]>>;
     moduleStack: OpenModule[];
     setModuleStack: React.Dispatch<React.SetStateAction<OpenModule[]>>;
+    /** 可选：连线的形状校验（结构化画布传 IR 形状判据；沙盒编辑器不传 → 行为不变）。
+     *  ReactFlow 的 isValidConnection 已经在交互层拦下非法连线，这里再兜一层，
+     *  防止别的调用路径绕过（口径：两端形状都已知且不一致才拒绝，未知一律放行）。 */
+    isConnectionValid?: (connection: Connection) => boolean;
 };
 function getInitialNodeData(type: string, targetModuleId?: string): Record<string, unknown> {
     const initialData: Record<string, unknown> = {};
@@ -102,6 +106,7 @@ export function useGraphInteraction({
     setEdges,
     moduleStack,
     setModuleStack,
+    isConnectionValid,
 }: UseGraphInteractionProps) {
     const { getNodes } = useReactFlow();
 
@@ -171,6 +176,11 @@ export function useGraphInteraction({
     }, [moduleStack, setModuleStack]);
     const onConnect: OnConnect = useCallback(
         connection => {
+            // 形状校验兜底（口径同 isValidConnection）：两端形状都已知且不一致 → 拒绝连线。
+            if (isConnectionValid && !isConnectionValid(connection)) {
+                console.warn("拒绝连线：两端形状不一致", connection);
+                return;
+            }
             setEdges(eds => {
                 // const sameSource = eds.filter(
                 //     e => e.source === connection.source && e.sourceHandle === connection.sourceHandle,
@@ -191,7 +201,7 @@ export function useGraphInteraction({
                 );
             });
         },
-        [setEdges],
+        [setEdges, isConnectionValid],
     );
     const onDragOver = useCallback((event: React.DragEvent) => {
         event.preventDefault();

@@ -11,7 +11,8 @@ export default function DiagnosticsPanel({ failures, onSelect, onClose }: Props)
         <div
             style={{
                 position: "absolute",
-                top: 12,
+                // 同 ComputePanel：12 会盖住 sticky 头部带（zIndex:5）上的按钮，改 56
+                top: 56,
                 right: 12,
                 width: 360,
                 maxHeight: "70vh",

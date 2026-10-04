@@ -457,6 +457,7 @@ export function EditorSidebar({
                     cursor: "col-resize",
                     background: dragSidebar ? THEME.accent : "transparent",
                     transition: "background 0.2s",
+                    position: "relative",   // zIndex 对 static 元素无效，补上定位才生效
                     zIndex: 10
                 }}
                 onMouseEnter={e => (e.currentTarget.style.background = "rgba(255,255,255,0.1)")}
