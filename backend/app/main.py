@@ -13,11 +13,11 @@ from app.db.connection import init_db
 from app.services import (
     task_manager, agent_service, env_manager, analysis_service,
     preprocess_service, baseline_service, dataset_service, compare_service, download_service,
-    paper_service, decompose_service, network_service,
+    paper_service, decompose_service, network_service, distill_service, multi_model_service,
 )
 from app.api import (
     tasks, projects, knowledge, agents, environments, search, analysis, preprocess, datasets, papers,
-    decompose, modules, networks, versions,
+    decompose, modules, networks, versions, multi_model,
 )
 
 
@@ -37,6 +37,8 @@ async def lifespan(app: FastAPI):
     paper_service.register()
     decompose_service.register()
     network_service.register()
+    distill_service.register()
+    multi_model_service.register()
     await task_manager.start()
     yield
     await task_manager.stop()
@@ -83,6 +85,7 @@ app.include_router(decompose.ir_router)
 app.include_router(modules.router)
 app.include_router(networks.router)
 app.include_router(versions.router)
+app.include_router(multi_model.router)
 
 
 @app.post("/api/torchlens")
