@@ -1,6 +1,11 @@
 # 动态行为补充分析 agent prompt 模板
 
-对应《模块详细设计》3.7：对静态扫描无法确定的动态行为（动态构建的模块、条件分支等），由 agent 阅读代码补充判断。
+对应《模块详细设计》3.7：对静态扫描无法确定的动态行为（动态构建的模块、条件分支等），
+由 agent 阅读代码补充判断。
+
+本文件是这段提示词的**单一事实来源**（《阶段1实施方案》第 162 行的落位约定）：
+`backend/app/services/analysis_service.py` 的 `_dynamic_supplement` 读取本文件，再在末尾追加
+「运行期上下文」（uncertain 项列表与项目目录）与「本次结构化输出 Schema」。
 
 ## 角色
 
@@ -8,8 +13,11 @@
 
 ## 输入
 
-- 项目代码目录（可读，不要修改任何代码）
-- 静态扫描产出的 `uncertain` 项列表（每项含文件与原因，如 `getattr`、`eval`、条件分支构建模块）
+运行期由调用方追加，见文末「运行期上下文」：
+
+- 项目代码目录 `{{PROJECT_DIR}}`（可读，**不要修改任何代码**）
+- 静态扫描产出的 `uncertain` 项列表 `{{UNCERTAIN_ITEMS}}`（每项含文件与原因，如 `getattr`、
+  `eval`、条件分支构建模块）
 
 ## 任务
 
@@ -19,31 +27,35 @@
 2. 判断该动态行为实际做了什么（例如：动态构建了哪个模块、条件分支实际走哪条路径）。
 3. 给出静态等价描述，并标注仍存在的不确定性。
 
+**每个 uncertain 项都要落到结果里一条**（`supplements` 数组的元素），不要遗漏、不要合并项。
+
 ## 约束
 
 - 只读代码，不修改任何文件。
 - 每条判断必须引用代码位置（文件 + 行号/函数名），保证可复核（对应 N3 溯源）。
 - 无法确定时明确说「无法静态确定」，不要臆造。
+- `supplements` 为必需字段；确实一项都判不出时返回空数组，不要用空对象顶替。
 
-## 输出 JSON Schema
+## 输出字段
 
-```json
-{
-  "type": "object",
-  "properties": {
-    "supplements": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "file": {"type": "string", "description": "代码文件路径"},
-          "reason": {"type": "string", "description": "对应的 uncertain 原因"},
-          "judgement": {"type": "string", "description": "判断结论，含代码位置"}
-        },
-        "required": ["file", "reason", "judgement"]
-      }
-    }
-  },
-  "required": ["supplements"]
-}
-```
+`supplements`：数组，每项含三个字段——
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `file` | 字符串 | 代码文件路径（相对项目根） |
+| `reason` | 字符串 | 对应的 uncertain 原因（与输入项对齐） |
+| `judgement` | 字符串 | 判断结论，含代码位置（文件 + 行号/函数名） |
+
+字段的机器可读 JSON Schema 由调用方在运行期追加（见文末），**以代码提供的 schema 为准**，
+本文件不复制一份，避免模板与 schema 两边漂移。
+
+## 运行期上下文（由调用方拼接）
+
+- 「项目代码目录」：对应上面的 `{{PROJECT_DIR}}`
+- 「静态扫描的 uncertain 项」：对应上面的 `{{UNCERTAIN_ITEMS}}`
+- 「本次结构化输出 Schema」：代码提供的 `supplements` 定义
+
+## 维护说明（给维护者，不是任务要求）
+
+- 改字段定义要改 `analysis_service.DYNAMIC_SCHEMA`，不要只改本文件。
+- agent 端点不支持结构化输出时，`agent_service.run_sync` 会自动追加「把结果写入结果文件」的指令。
