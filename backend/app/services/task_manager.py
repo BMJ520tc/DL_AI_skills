@@ -42,6 +42,8 @@ TASK_TIMEOUTS: dict[str, float] = {
     "network_train": 3600,  # 训练脚本 1800s + 余量
     "multi_model": 900,     # 多模型综合分析（含分歧归因 agent）
     "paper_distill": 3600,  # 论文蒸馏（逐篇 agent 起草，多篇可能耗时）
+    "knowledge_distill": 600,  # 任务后蒸馏（单次 agent 起草）
+    "network_autotune": 3600,  # 自动调参（逐候选训练，每个训练上限见 TRAIN_TIMEOUT_S）
 }
 
 

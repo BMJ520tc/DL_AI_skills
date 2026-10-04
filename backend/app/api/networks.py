@@ -23,6 +23,16 @@ class RunBody(BaseModel):
     learning_rate: float = 0.001
 
 
+class AutotuneBody(BaseModel):
+    """自动调参（B，扩范围）：基础超参 + 可选显式候选；会给「带入的知识建议」留位。"""
+    dataset_id: str
+    environment_project_id: str | None = None
+    epochs: int = 8
+    batch_size: int = 32
+    learning_rate: float = 0.01
+    candidates: list[dict] | None = None
+
+
 def _project_error(e: Exception) -> HTTPException:
     """项目查不到 404 / 类型不对 400，统一映射（7.7-1：网络入口权限口径与 2.2 一致 = 400）。"""
     if isinstance(e, PermissionError):
@@ -63,6 +73,18 @@ def run(project_id: str, body: RunBody) -> dict:
     """发起训练。校验失败（数据集/环境/超参）→ 400 并说明引导路径，不静默。"""
     try:
         task_id = network_service.start_run(project_id, body.model_dump())
+    except (LookupError, PermissionError) as e:
+        raise _project_error(e)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"task_id": task_id, "status": "queued"}
+
+
+@router.post("/{project_id}/autotune")
+def autotune(project_id: str, body: AutotuneBody) -> dict:
+    """自动调参（B，扩范围）：带入知识 → 候选超参逐个训练 → 按主指标选优 → 蒸馏回写。"""
+    try:
+        task_id = network_service.start_autotune(project_id, body.model_dump())
     except (LookupError, PermissionError) as e:
         raise _project_error(e)
     except ValueError as e:

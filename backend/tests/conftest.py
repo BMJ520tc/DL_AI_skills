@@ -26,6 +26,7 @@ def _reset_task_manager() -> None:
     task_manager._worker_task = None
     task_manager._running_tasks.clear()
     task_manager._handlers.clear()
+    task_manager._finish_hooks.clear()   # 终态钩子也是进程级全局态，漏清会跨用例重复注册/触发
 
 
 @pytest.fixture()
@@ -48,4 +49,9 @@ def app_client(isolated_db):
     from app.main import app
 
     with TestClient(app) as client:
+        # lifespan 会把**真实的蒸馏终态钩子**注册进来；app_client 用例会驱动真实 worker 跑任务
+        # （如 network_train 落 run_record）→ 钩子会去**真调大模型**（180s 超时），把测试拖死。
+        # 测试绝不触发真实蒸馏：进 client 后清掉注册进来的钩子。
+        from app.services import task_manager
+        task_manager._finish_hooks.clear()
         yield client

@@ -144,6 +144,24 @@ def test_alignment_label_merge_unifies_before_comparison(isolated_db, tmp_path, 
     assert len(report["consistent"]) == 1 and report["disagreements"] == []   # 归并后一致
 
 
+def test_duplicate_model_names_disambiguated(isolated_db, tmp_path, monkeypatch):
+    """不同 run 同名（实测真实库 eval 全是 'fixture-rule'）→ 用 run_id 消歧，
+    避免 metrics_before 按名字做键把多个模型塌成一个。"""
+    monkeypatch.setattr(multi_model_service, "MULTI_MODEL_DIR", tmp_path / "mm")
+    a = _write_run(tmp_path, "dupA123456", "same", [{"id": "i1", "y_true": "A", "y_pred": "A"}])
+    b = _write_run(tmp_path, "dupB654321", "same", [{"id": "i1", "y_true": "A", "y_pred": "B"}])
+
+    async def fake(*a, **k):
+        return {"structured_output": []}
+
+    monkeypatch.setattr(multi_model_service.agent_service, "run_sync", fake)
+    report = asyncio.run(multi_model_service._analyze({"run_ids": [a, b], "task_type": "classification"}, "t"))
+
+    names = [m["name"] for m in report["models"]]
+    assert len(set(names)) == 2 and all("#" in n for n in names)
+    assert len(report["metrics_before"]) == 2          # 两个模型各自一行，不塌成一
+
+
 def test_multi_model_endpoints_validation(app_client):
     assert app_client.post("/api/multi-model", json={"run_ids": ["only-one"]}).status_code == 400
     assert app_client.post("/api/multi-model", json={"run_ids": ["a", "b"], "fusion": "bogus"}).status_code == 400

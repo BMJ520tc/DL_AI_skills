@@ -1006,3 +1006,77 @@ def test_train_failure_version_commit_error_does_not_mask_failure(tmp_networks, 
     # 版本节点确实没生成（提交失败），但这件事只体现在日志里，不改任务结论
     assert all("训练失败" not in v["message"]
                for v in version_service.version_tree(project_id)["versions"])
+
+
+# ---------------------------------------------------------------- 自动调参（B，扩范围）
+
+def test_build_candidates_dedup_cap_and_advice():
+    """候选集：含 base、含带入建议、围绕 base 的小网格；去重且不超上限。"""
+    from app.services import network_service as ns
+
+    base = {"epochs": 5, "batch_size": 8, "learning_rate": 0.01}
+    advice = {"param_advice": [{"structured": {"params": {"epochs": 5, "batch_size": 8, "learning_rate": 0.1}}}]}
+    cands = ns._build_candidates(base, advice, None)
+    keys = [(c["epochs"], c["batch_size"], c["learning_rate"]) for c in cands]
+    assert (5, 8, 0.01) in keys          # base
+    assert (5, 8, 0.1) in keys           # 带入建议
+    assert len(keys) == len(set(keys))   # 去重
+    assert len(cands) <= ns._AUTOTUNE_MAX_CANDIDATES
+
+    dup = ns._build_candidates(base, {}, [dict(base), {"learning_rate": 0.01}])
+    k2 = [(c["epochs"], c["batch_size"], c["learning_rate"]) for c in dup]
+    assert len(k2) == len(set(k2))
+
+
+def test_autotune_selects_best_and_distills(tmp_networks, monkeypatch):
+    """自动调参全链路：候选逐个训练 → 按 accuracy 选优 → run_record(autotune) + 蒸馏回写。"""
+    client, tmp_path = tmp_networks
+    original_id = _create_original(client)
+    project_id = _create_structured(client, original_id)
+    _fake_env_python(original_id, tmp_path)
+    dataset_id = _record_dataset(tmp_path)
+    _record_module_ref(tmp_path)
+
+    from app.services import knowledge_service as ks, network_service, proc_util
+
+    async def fake_run(cmd, *, cwd, timeout):
+        from pathlib import Path
+        lr = float(cmd[5])
+        acc = 0.9 if abs(lr - 0.1) < 1e-9 else 0.5   # 只有 lr=0.1 表现好
+        Path(cmd[6]).write_text(json.dumps({"metrics": {"loss": 0.1, "accuracy": acc}}), encoding="utf-8")
+        return 0, "[epoch 1/1] loss=0.1"
+
+    monkeypatch.setattr(proc_util, "run_command", fake_run)
+
+    body = {"nodes": [{"id": "m1", "type": "module_ref", "data": {
+        "moduleId": "mod_ref_0001:v1", "handles": {"inputs": ["in"], "outputs": ["out"]}}}], "edges": []}
+    assert client.put(f"/api/projects/{project_id}/graph", json=body).status_code == 200
+
+    params = {"project_id": project_id, "dataset_id": dataset_id, "environment_project_id": original_id,
+              "base": {"epochs": 3, "batch_size": 8, "learning_rate": 0.01}, "candidates": None}
+    asyncio.run(network_service._run_autotune(params, "task-at-001"))
+
+    # run_record(run_type=autotune)：winner 是 lr=0.1，指标为最优
+    rows = ks.list_runs(project_id, "autotune")
+    assert len(rows) == 1 and rows[0]["status"] == "success"
+    assert abs(json.loads(rows[0]["params"])["winner"]["learning_rate"] - 0.1) < 1e-9
+    assert json.loads(rows[0]["metrics"])["accuracy"] == 0.9
+
+    # 闭环回写：把最优超参蒸馏为 param_advice 草稿
+    drafts = [k for k in ks.list_knowledge(status="draft") if k["type"] == "param_advice"]
+    assert drafts and "最优超参" in (drafts[0]["title"] or "")
+
+
+def test_autotune_endpoint_validates(tmp_networks):
+    """POST autotune：缺数据集/环境 → 400；正常 → 入队。"""
+    client, tmp_path = tmp_networks
+    original_id = _create_original(client)
+    project_id = _create_structured(client, original_id)
+    _fake_env_python(original_id, tmp_path)
+    dataset_id = _record_dataset(tmp_path)
+
+    r = client.post(f"/api/networks/{project_id}/autotune", json={"dataset_id": "missing"})
+    assert r.status_code == 400
+    r2 = client.post(f"/api/networks/{project_id}/autotune",
+                     json={"dataset_id": dataset_id, "environment_project_id": original_id})
+    assert r2.status_code == 200 and r2.json()["status"] == "queued"

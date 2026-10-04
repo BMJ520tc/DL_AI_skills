@@ -8,7 +8,8 @@
 两者都以 `structured.source_task_id` 标记来源；通用通道在起草前检查该任务是否已有蒸馏知识
 （`knowledge_service.knowledge_for_task_exists`），有则跳过——避免同一任务被起草两遍。
 
-本模块以 task_manager 的终态钩子方式接入（fire-and-forget），不阻塞任务队列，也不改变任务结果。
+本模块以 task_manager 的终态钩子方式接入：钩子**只入队**蒸馏任务（不在钩子里跑 agent），
+既不阻塞任务队列、也不改变主任务结果，且起草可持久化/可重试。
 """
 from __future__ import annotations
 
@@ -44,6 +45,30 @@ _TYPE_ALIASES = {
     "discrepancy": "reproduction_discrepancy", "reproduction": "reproduction_discrepancy",
     "inconsistency": "reproduction_discrepancy", "fusion": "fusion_insight",
 }
+
+
+_CONF_ALIASES = {
+    "medium-high": "medium", "mid-high": "medium", "high-medium": "medium",
+    "low-medium": "low", "medium-low": "low", "very high": "high", "very low": "low",
+}
+
+
+def _normalize_confidence(raw) -> str:
+    """confidence 归一到 {high, medium, low}（数据设计六.2）。
+
+    实测模型写过 `medium-high` 这类超出枚举的值；先查显式别名、再按词根兜底，未知/缺失归 `low`
+    （蒸馏默认保守）。
+    """
+    c = (raw or "").strip().lower()
+    if c in ("high", "medium", "low"):
+        return c
+    if c in _CONF_ALIASES:
+        return _CONF_ALIASES[c]
+    if "high" in c and "low" not in c:
+        return "high"
+    if "low" in c and "high" not in c:
+        return "low"
+    return "medium" if c else "low"
 
 
 def _normalize_type(raw, allowed: Optional[tuple] = None) -> str:
@@ -135,23 +160,45 @@ def _prompt(run: dict, related: dict) -> str:
         "## 要求\n"
         "1) 只提炼**可复用**的结论——参数建议(param_advice)、依赖冲突(dependency_conflict)、"
         "复现不一致(reproduction_discrepancy)、使用建议(usage_guidance)；不要复述流水账；\n"
-        "2) 每条给出 type/title/content 与 confidence，必要时给 scope(task_type/model/dataset) 与 structured；\n"
-        "3) 没有值得入库的结论时返回**空数组**（不要硬凑）。"
+        "2) 每条给出 type/title/content 与 confidence，必要时给 structured；\n"
+        "3) **scope 尽量填**：能从材料推断出 task_type / model / dataset 就务必写入 scope，"
+        "确实推断不出时才留空（scope 决定这条知识在后续任务里能否被精准带出）；\n"
+        "4) 没有值得入库的结论时返回**空数组**（不要硬凑）。"
     )
 
 
-async def on_task_finished(task_id: str, status: str) -> None:
-    """任务终态钩子：白名单任务结束后起草蒸馏知识（draft）。失败静默，不改变任务结果。"""
-    task = task_manager.get_task(task_id)
-    if not task or task.get("task_type") not in DISTILL_TASK_TYPES:
-        return
-    # 专用路径已为该任务起草（环境依赖冲突、模块三使用建议）→ 不重复起草
-    if knowledge_service.knowledge_for_task_exists(task_id):
-        return
-    run = knowledge_service.get_run_for_task(task_id)
-    if run is None:
-        return
+KNOWLEDGE_DISTILL_TASK_TYPE = "knowledge_distill"
 
+# 「论文数据」来源的自动触发点：论文结论任务结束 → 触发该论文的蒸馏（需求六.1）
+PAPER_DISTILL_TRIGGERS = {"conclusion"}
+
+
+async def on_task_finished(task_id: str, status: str) -> None:
+    """任务终态钩子：**只入队**蒸馏任务，不在钩子里跑 agent。
+
+    为什么改成入队：钩子是 fire-and-forget（`asyncio.create_task`，不等待）——若在钩子里直接跑 agent
+    起草，服务重启/关停时正在进行的起草会**整条丢失、无重试、无留痕**。改为入队一个持久化任务后，
+    任务落在 task 表：崩溃丢的只是「入队」这一步的极小窗口，已入队的任务重启后按既有收敛逻辑可重试。
+    钩子自身异常仍静默（不改变主任务结果）。
+
+    触发规则：白名单任务 → 入队 `knowledge_distill`（从 run_record 蒸馏）；
+    论文结论任务 → 入队 `paper_distill`（从论文实验条目/结论蒸馏）。
+    """
+    task = task_manager.get_task(task_id)
+    if not task:
+        return
+    task_type = task.get("task_type")
+    if task_type in DISTILL_TASK_TYPES and not knowledge_service.knowledge_for_task_exists(task_id):
+        task_manager.create_task(KNOWLEDGE_DISTILL_TASK_TYPE, project_id=task.get("project_id"),
+                                 params={"source_task_id": task_id})
+    if task_type in PAPER_DISTILL_TRIGGERS:
+        paper_id = knowledge_service._as_dict(task.get("params")).get("paper_id")
+        if paper_id and not knowledge_service.knowledge_for_paper_exists(paper_id):
+            task_manager.create_task(PAPER_DISTILL_TASK_TYPE, params={"paper_ids": [paper_id]})
+
+
+async def _draft_from_run(run: dict, source_task_id: str) -> list[str]:
+    """从一条运行记录起草蒸馏知识（draft）；返回新建的 knowledge_id 列表。"""
     params = knowledge_service._as_dict(run.get("params"))
     try:
         related = knowledge_service.bring_advice_summary(
@@ -160,29 +207,47 @@ async def on_task_finished(task_id: str, status: str) -> None:
         related = {}
 
     result = await agent_service.run_sync(_prompt(run, related), output_schema=DISTILL_SCHEMA, timeout_s=180)
-    items = _knowledge_items(result.get("structured_output"))
-    for item in items:
+    ids: list[str] = []
+    for item in _knowledge_items(result.get("structured_output")):
         if not (item.get("content") or "").strip():
             continue  # 空结论不落条目（8.3 异常边界）
         structured = dict(item.get("structured") or {})
         structured.setdefault("run_id", run.get("run_id"))
-        structured["source_task_id"] = task_id
+        structured["source_task_id"] = source_task_id
         kid = knowledge_service.record_knowledge({
             "type": _normalize_type(item.get("type")),
             "title": item.get("title") or f"{run.get('run_type')} 蒸馏结论",
             "content": item.get("content"),
             "structured": structured,
             "sources": [{"type": "run_record", "ref": run.get("run_id")}],
-            "confidence": item.get("confidence") or "low",
+            "confidence": _normalize_confidence(item.get("confidence")),
             "scope": item.get("scope") or {},
             "status": "draft",
         })
-        logger.info("蒸馏起草 %s（task=%s run=%s type=%s）", kid, task_id, run.get("run_id"), item.get("type"))
+        ids.append(kid)
+        logger.info("蒸馏起草 %s（task=%s run=%s type=%s）", kid, source_task_id, run.get("run_id"), item.get("type"))
+    return ids
+
+
+async def _run_knowledge_distill(params: dict, task_id: str) -> None:
+    """knowledge_distill 任务：从 source_task_id 的运行记录起草蒸馏知识。"""
+    source_task_id = params.get("source_task_id")
+    if not source_task_id:
+        raise RuntimeError("knowledge_distill 缺少 source_task_id")
+    if knowledge_service.knowledge_for_task_exists(source_task_id):
+        return   # 专用路径或前次已起草 → 幂等跳过
+    run = knowledge_service.get_run_for_task(source_task_id)
+    if run is None:
+        return   # 无运行记录 → 无素材
+    task_manager.update_progress(task_id, {"stage": "蒸馏起草"})
+    ids = await _draft_from_run(run, source_task_id)
+    task_manager.update_progress(task_id, {"stage": "完成", "knowledge_ids": ids})
 
 
 def register() -> None:
-    """注册终态钩子 + 论文蒸馏任务 handler（main lifespan 调用）。"""
+    """注册终态钩子 + 蒸馏任务 handler（main lifespan 调用）。"""
     task_manager.register_on_finish(on_task_finished)
+    task_manager.register_handler(KNOWLEDGE_DISTILL_TASK_TYPE, _run_knowledge_distill)
     task_manager.register_handler(PAPER_DISTILL_TASK_TYPE, _run_paper_distill)
 
 
@@ -235,8 +300,9 @@ def _paper_prompt(digest: dict) -> str:
         "## 要求\n"
         "1) 只提炼可复用结论——`usage_guidance`（方法/使用建议）、`param_advice`（参数/设置建议）、"
         "`reproduction_discrepancy`（本环境复现不一致，仅在确有 reproduction/credibility 证据时）；\n"
-        "2) 每条给 type/title/content 与 confidence，必要时给 scope(dataset/model) 与 structured；\n"
-        "3) 不要复述论文流水账；材料不足或无可复用结论时返回**空数组**。"
+        "2) 每条给 type/title/content 与 confidence，必要时给 structured；\n"
+        "3) **scope 尽量填**：能推断出 model（如该论文提出的方法名）/ dataset / task_type 就写入 scope；\n"
+        "4) 不要复述论文流水账；材料不足或无可复用结论时返回**空数组**。"
     )
 
 
@@ -262,7 +328,7 @@ async def distill_paper(paper_id: str) -> list[str]:
             "content": item.get("content"),
             "structured": structured,
             "sources": [{"type": "paper", "ref": paper_id}],
-            "confidence": item.get("confidence") or "low",
+            "confidence": _normalize_confidence(item.get("confidence")),
             "scope": item.get("scope") or {},
             "status": "draft",
         })

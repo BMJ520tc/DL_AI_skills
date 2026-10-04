@@ -182,6 +182,15 @@ async def _analyze(params: dict, task_id: str) -> dict:
         name = rparams.get("model") or run.get("run_type") or rid[:8]
         raw_runs.append({"run_id": rid, "name": name, "params": rparams, "preds": preds})
 
+    # 模型名消歧：不同 run 可能同名（如都取 runtime 的 model）、甚至同一模型在不同数据集上——
+    # 名字重复时按 run_id 加后缀，避免 metrics_before 按名字做键时把多个模型塌成一个。
+    _name_count: dict = {}
+    for r in raw_runs:
+        _name_count[r["name"]] = _name_count.get(r["name"], 0) + 1
+    for r in raw_runs:
+        if _name_count[r["name"]] > 1:
+            r["name"] = f"{r['name']}#{r['run_id'][:6]}"
+
     # ① 同口径统一：标签体系按数据集的已确认 alignment.label_merge 归并（数据设计八.2）
     dataset_id = _resolve_dataset_id(params, raw_runs)
     label_merge, alignment_info = _load_label_merge(dataset_id)

@@ -967,9 +967,38 @@ def get_module(module_id: str, module_version: Optional[str] = None) -> Optional
     return dict(row) if row else None
 
 
+def _normalize_scope(raw) -> dict:
+    """把 scope 归一成数据设计约定的三维（task_type/model/dataset），别名键合并、剔除未知键。
+
+    蒸馏草稿的 scope 由大模型给，实测会出现别名键（`task`）、无关键（`conditioning`/`n_measurements`）
+    与列表值；入库时统一收敛，避免脏键进入库、也避免列表值干扰后续匹配（`_match_scope` 另有列表容错）。
+    """
+    aliases = {"task": "task_type", "task_type": "task_type",
+               "model": "model", "model_name": "model",
+               "dataset": "dataset", "dataset_name": "dataset", "dataset_id": "dataset"}
+    out: dict = {}
+    for key, val in _as_dict(raw).items():
+        canonical = aliases.get(str(key).strip().lower())
+        if not canonical:
+            continue
+        values = val if isinstance(val, list) else [val]
+        strings = [str(x).strip() for x in values if x is not None and str(x).strip()]
+        if not strings:
+            continue
+        merged = out.get(canonical)
+        if merged is None:
+            out[canonical] = strings
+        elif isinstance(merged, list):
+            merged.extend(v for v in strings if v not in merged)
+        else:  # pragma: no cover —— 首值已收敛为列表
+            out[canonical] = [merged, *strings]
+    return {k: (v[0] if len(v) == 1 else v) for k, v in out.items()}
+
+
 def record_knowledge(k: dict) -> str:
     """写入蒸馏知识并同步统一索引（数据设计六.2）。"""
     knowledge_id = k.get("knowledge_id") or uuid.uuid4().hex
+    scope = _normalize_scope(k.get("scope"))
     conn = get_connection()
     try:
         conn.execute(
@@ -986,7 +1015,7 @@ def record_knowledge(k: dict) -> str:
                 json.dumps(k.get("structured"), ensure_ascii=False) if k.get("structured") else None,
                 json.dumps(k.get("sources"), ensure_ascii=False) if k.get("sources") else None,
                 k.get("confidence"),
-                json.dumps(k.get("scope"), ensure_ascii=False) if k.get("scope") else None,
+                json.dumps(scope, ensure_ascii=False) if scope else None,
                 k.get("status", "draft"),
                 _now(),
                 _now(),
@@ -1001,7 +1030,7 @@ def record_knowledge(k: dict) -> str:
             tags=[k.get("type")] if k.get("type") else None,
             keywords=k.get("type"),
             # scope 通常带 task_type/model/dataset（对比建议等），按约定键抽取三维取值
-            **_derive_dimensions(k, _as_dict(k.get("scope"))),
+            **_derive_dimensions(k, scope),
         )
         conn.commit()
     finally:
@@ -1219,6 +1248,28 @@ def delete_item(data_type: str, ref_id: str) -> bool:
         conn.close()
 
 
+def _scope_dim_matches(scope_val, query_val) -> bool:
+    """某维度上 scope 取值与查询值是否相容：相等 / 互为子串（大小写不敏感）/ 列表任一命中。
+
+    为什么放宽：蒸馏草稿的 scope 由大模型给，实测会出现**列表值**（`["BioSNAP","BindingDB"]`）、
+    **别名键**（`task`）与**描述句**（`跨数据集通用（Norman…）`）。用严格字符串相等时，
+    只要该维度被查询就整条**被排除**（知识反而带不出来）——故列表任一命中 + 互为子串即可。
+    """
+    q = str(query_val).strip().lower()
+    if not q:
+        return True
+    values = scope_val if isinstance(scope_val, list) else [scope_val]
+    for v in values:
+        if v is None:
+            continue
+        s = str(v).strip().lower()
+        if not s:
+            continue
+        if s == q or (len(q) >= 2 and (q in s or s in q)):
+            return True
+    return False
+
+
 def _match_scope(k: dict, task_type: Optional[str], model: Optional[str], dataset: Optional[str]) -> bool:
     scope = k.get("scope")
     if not scope:
@@ -1227,8 +1278,12 @@ def _match_scope(k: dict, task_type: Optional[str], model: Optional[str], datase
         s = json.loads(scope)
     except (json.JSONDecodeError, TypeError):
         return True
-    for key, val in (("task_type", task_type), ("model", model), ("dataset", dataset)):
-        if val and s.get(key) and s[key] != val:
+    if not isinstance(s, dict):
+        return True
+    # 规范键 + 别名键（task → task_type）
+    for key, val in (("task_type", task_type), ("task", task_type),
+                     ("model", model), ("dataset", dataset)):
+        if val and s.get(key) and not _scope_dim_matches(s[key], val):
             return False
     return True
 

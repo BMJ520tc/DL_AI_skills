@@ -64,12 +64,14 @@ def write_artifact(tmp_dir: Path, run_id: str, preds: list[dict]) -> str:
 def start_backend(tmp_dir: Path):
     sys.path.insert(0, str(BACKEND))
     from app.db import connection
-    from app.services import project_manager
+    from app.services import multi_model_service, project_manager
 
     connection.DB_PATH = tmp_dir / "index.db"
     connection.init_db()
     project_manager.PROJECTS_DIR = tmp_dir / "projects"
     Path(project_manager.PROJECTS_DIR).mkdir(parents=True, exist_ok=True)
+    # 报告目录也指向临时目录——否则会写进真实 data/multi_model/（此前确实污染过）
+    multi_model_service.MULTI_MODEL_DIR = tmp_dir / "multi_model"
 
     import uvicorn
     from app.main import app

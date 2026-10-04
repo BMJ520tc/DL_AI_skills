@@ -140,6 +140,39 @@ def test_knowledge_for_task_exists(isolated_db):
     assert ks.knowledge_for_task_exists("t2") is False
 
 
+def test_scope_normalization_and_matching(isolated_db):
+    """scope 归一（别名/无关键/列表）+ 匹配容错（列表任一命中、互为子串）。
+
+    背景：蒸馏草稿的 scope 由大模型给，实测会出现别名键 `task`、无关键 `conditioning`、
+    列表值 `["BioSNAP"]`、描述句 `跨数据集通用（Norman…）`。用严格字符串相等时，只要该维度
+    被查询就整条被排除（知识反而带不出来）。
+    """
+    import json
+    kid = ks.record_knowledge({
+        "type": "usage_guidance", "title": "t", "content": "c", "status": "confirmed",
+        "scope": {"task": "classification", "conditioning": ["MD"],
+                  "dataset": ["BioSNAP", "BindingDB"], "model": "GEARS (SGC)"},
+    })
+    stored = json.loads(ks.get_item("knowledge", kid)["scope"])
+    # 别名 task→task_type；无关键 conditioning 剔除；列表保留；模型名（含后缀）保留
+    assert stored == {"task_type": "classification", "dataset": ["BioSNAP", "BindingDB"], "model": "GEARS (SGC)"}
+
+    def others(**kw):
+        return [x["knowledge_id"] for x in ks.bring_knowledge(**kw)["others"]]
+
+    assert kid in others(dataset="BioSNAP")          # 列表任一命中
+    assert kid in others(model="GEARS")              # 互为子串（"GEARS" ⊂ "GEARS (SGC)"）
+    assert kid in others(task_type="classification")  # 别名键已归一
+    assert kid not in others(dataset="OtherDS")      # 不相容 → 排除
+    assert kid not in others(task_type="regression")
+
+    # 旧式未归一行的兼容：裸 "task" 键也能匹配
+    assert ks._match_scope({"scope": json.dumps({"task": "classification"})}, "classification", None, None) is True
+    assert ks._match_scope({"scope": json.dumps({"task": "classification"})}, "regression", None, None) is False
+    # 列表值 + 字符串查询的兼容
+    assert ks._match_scope({"scope": json.dumps({"dataset": ["A", "B"]})}, None, None, "B") is True
+
+
 def test_test_fixture_never_touches_real_db(isolated_db):
     """隔离自检：夹具生效时索引表应为空，且不指向仓库 data/index.db。"""
     from app.db import connection
