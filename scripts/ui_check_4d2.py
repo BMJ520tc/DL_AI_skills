@@ -277,6 +277,14 @@ def main() -> int:
             print(f"FATAL: {what} 不存在：{path}")
             return 2
 
+    if BACKEND_PORT != 8000:
+        # 构建产物里的 API 基址是**编译期**注入的（默认 http://127.0.0.1:8000）。端口被真实后端
+        # 占用而用 UI_CHECK_BACKEND_PORT 换端口时，若不按临时后端地址重建，浏览器里的前端仍会打到
+        # :8000 —— 2026-10-04 实测把自检数据写进了真实库。故此处重建产物，确保打的是本次临时后端。
+        print(f"[info] 后端端口非默认，按 VITE_API_BASE_URL={BACKEND_URL} 重建构建产物")
+        subprocess.run(["npm.cmd", "run", "build"], cwd=str(FRONTEND),
+                       env={**os.environ, "VITE_API_BASE_URL": BACKEND_URL}, check=True)
+
     tmp_dir = Path(tempfile.mkdtemp(prefix="ui_check_4d2_"))
     print(f"临时目录：{tmp_dir}")
     server = None

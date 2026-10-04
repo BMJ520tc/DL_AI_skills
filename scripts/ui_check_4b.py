@@ -438,6 +438,13 @@ def main() -> int:
         print("FATAL: frontend/dist 不存在，先执行 npm run build")
         return 2
 
+    if BACKEND_PORT != 8000:
+        # 产物基址是编译期注入的（默认 :8000）：换端口必须按临时后端地址重建，否则浏览器会打到
+        # :8000 上别人的后端（2026-10-04 实测把自检数据写进真实库）。
+        print(f"[info] 后端端口非默认，按 VITE_API_BASE_URL={BACKEND_URL} 重建构建产物")
+        subprocess.run(["npm.cmd", "run", "build"], cwd=str(FRONTEND),
+                       env={**os.environ, "VITE_API_BASE_URL": BACKEND_URL}, check=True)
+
     tmp_dir = Path(tempfile.mkdtemp(prefix="ui_check_4b_"))
     print(f"临时目录：{tmp_dir}")
     server = None
