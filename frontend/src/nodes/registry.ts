@@ -114,7 +114,9 @@ export const NODE_GROUPS: Record<string, NodeGroup> = {
                 min_layer: MinNode,
                 argmax_layer: ArgMaxNode,
                 argmin_layer: ArgMinNode,
-                repeat_layer: RepeatNode,
+                // 张量 torch.repeat 算子：独立键 repeat_tensor。切勿改回 repeat_layer——
+                // 那是 control 组「重复块」容器节点的键，两者同名会被后写覆盖（张量算子拖不出来）。
+                repeat_tensor: RepeatNode,
             };
         })(),
     },
@@ -228,6 +230,8 @@ export const NODE_GROUPS: Record<string, NodeGroup> = {
     control: {
         label: "控制流",
         nodes: {
+            // 控制流「重复块」容器：键名 repeat_layer 保持不变（containerLogic 按此键识别容器），
+            // 张量 Repeat 算子在 torch_ops 组用 repeat_tensor。
             repeat_layer: RepeatLayerNode,
             module_list: ModuleListNode,
         },

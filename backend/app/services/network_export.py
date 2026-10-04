@@ -77,7 +77,9 @@ def _edge_var_name(edge: dict) -> str:
 # 每个节点类型一条：handles（连线句柄规格）、params（paramSchema 默认值表，供
 # get_param 回退）、init/forward（与前端该节点 getInitCode/getForwardCode 语义一致）。
 # 表由 scripts 侧对照 frontend/src/nodes/ 逐节点移植，修改前端节点时须同步。
-# 控制流节点（repeat_layer / module_list）含内部子图，不支持服务端导出，见 UNSUPPORTED。
+# 控制流节点（repeat_layer 重复块 / module_list）含内部子图，不支持服务端导出，见 UNSUPPORTED。
+# 注意：**张量** torch.repeat 算子是独立类型键 `repeat_tensor`（见 NODE_TABLE），与
+# `repeat_layer`（控制流重复块容器）不是同一个东西。
 
 # ---------------------------------------------------------------------------
 # 标准节点模板（逐节点移植 frontend/src/nodes/** 的 paramSchema / getInitCode /
@@ -224,6 +226,7 @@ _P_REDUCE = {"dim": {"type": "number", "defaultValue": -1}}
 _P_SOFTMAX = {"dim": {"type": "number", "defaultValue": -1}}
 _P_RESHAPE = {"target_shape": {"type": "text", "defaultValue": "-1"}}
 _P_TRANSPOSE = {"perm": {"type": "text", "defaultValue": "0,2,3,1"}}
+_P_REPEAT = {"repeats": {"type": "text", "defaultValue": "1,1"}}
 _P_CONST_TENSOR = {"shape": {"type": "text", "defaultValue": "1,1"}}
 _P_BATCHNORM = {
     "num_features": {"type": "number", "defaultValue": 32},
@@ -439,6 +442,20 @@ def _matmul_forward(data: dict, name: str, inputs: list[str], outputs: list[str]
     left = _at(inputs, 0, "x")
     right = _at(inputs, 1, "y")
     return f"{_out0(outputs)} = torch.matmul({left}, {right})"
+
+
+# 前端: nodes/pytorch_core/RepeatNode.tsx（**张量** torch.repeat 算子，键 repeat_tensor）
+# 控制流「重复块」是另一个类型键 repeat_layer（见 UNSUPPORTED_TYPES），两者互不相干。
+def _repeat_init(data: dict, name: str) -> str:
+    return "# repeat handled in forward"
+
+
+def _repeat_forward(data: dict, name: str, inputs: list[str], outputs: list[str]) -> str:
+    # 与前端 getForwardCode 同口径：`data.repeats || ""` 原样拼进 `.repeat(...)`。
+    # 前端该节点不读 paramSchema 默认值，故这里也用 `or ""`（不走 get_param，
+    # 否则缺参数时两端生成物会不一致）；重复次数由 shapeVerifier 保证为正整数。
+    reps = data.get("repeats") or ""
+    return f"{_out0(outputs)} = {_in0(inputs)}.repeat({reps})"
 
 
 # 前端: nodes/pytorch_core/ReductionNode.tsx（Sum/Mean/Prod 工厂）
@@ -823,6 +840,13 @@ NODE_TABLE: dict[str, dict] = {
     "min_layer": _extrema_entry("min", True),
     "argmax_layer": _extrema_entry("argmax", False),
     "argmin_layer": _extrema_entry("argmin", False),
+    # 前端: nodes/pytorch_core/RepeatNode.tsx（张量 torch.repeat；控制流重复块见 UNSUPPORTED_TYPES）
+    "repeat_tensor": {
+        "handles": _HANDLES_UNSPEC,
+        "params": _P_REPEAT,
+        "init": _repeat_init,
+        "forward": _repeat_forward,
+    },
     # ================= tensor_shape =================
     # 前端: nodes/pytorch_core/ReshapeNode.tsx
     "reshape_layer": {
@@ -988,6 +1012,7 @@ NODE_TABLE: dict[str, dict] = {
 
 
 UNSUPPORTED_TYPES: dict[str, str] = {
+    # 键 repeat_layer 只指控制流「重复块」容器；张量 torch.repeat 走 repeat_tensor（NODE_TABLE）。
     "repeat_layer": "控制流节点（重复块）暂不支持服务端导出",
     "module_list": "控制流节点（模块列表）暂不支持服务端导出",
 }

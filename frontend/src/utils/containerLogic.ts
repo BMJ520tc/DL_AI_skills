@@ -6,6 +6,9 @@ export type ContainerConfig = {
     capacities: Record<string, number>;
 };
 // Add any new control flow nodes here.
+// 注意：这里只收**容器**节点。`repeat_layer` 指控制流「重复块」容器
+// （nodes/control_flow/RepeatLayer.tsx）；张量 torch.repeat 算子是另一个键
+// `repeat_tensor`（nodes/pytorch_core/RepeatNode.tsx），**不是容器**，不要加进来。
 export const DEFAULT_CONTAINER_CONFIG: ContainerConfig = {
     types: new Set(["repeat_layer", "module_list"]),
     capacities: {

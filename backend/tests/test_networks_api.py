@@ -158,6 +158,54 @@ def test_export_standard_chain(tmp_networks):
     )
 
 
+def test_export_tensor_repeat_separate_from_control_flow_repeat(tmp_networks):
+    """张量 Repeat（键 repeat_tensor）可导出；控制流重复块（键 repeat_layer）仍拒绝导出。
+
+    基底遗留缺陷：两个节点曾共用类型键 `repeat_layer`，注册表后写覆盖前写——张量 Repeat
+    算子拖不出来，且导出被 `UNSUPPORTED_TYPES` 当作控制流拒绝。拆键后两者互不影响。
+    """
+    client, _ = tmp_networks
+    project_id = _create_structured(client, None)
+
+    # 1) 张量 torch.repeat 算子：按前端 nodes/pytorch_core/RepeatNode.tsx 语义
+    #    （forward `out = in.repeat(<repeats>)`，init 仅注释）导出。
+    body = {
+        "nodes": [
+            {"id": "a", "type": "input_layer", "data": {}},
+            {"id": "b", "type": "repeat_tensor", "data": {"repeats": "2,3"}},
+        ],
+        "edges": [
+            {"id": "e1", "source": "a", "target": "b", "targetHandle": "in-0",
+             "data": {"label": "out_a"}},
+        ],
+    }
+    assert client.put(f"/api/projects/{project_id}/graph", json=body).status_code == 200
+    r = client.get(f"/api/networks/{project_id}/export")
+    assert r.status_code == 200, r.text
+    code = r.json()["code"]
+    assert "# repeat handled in forward" in code
+    assert "out_b = out_a.repeat(2,3)" in code
+    assert "return out_b" in code
+
+    # 2) 控制流「重复块」容器（键名保持 repeat_layer）：既有边界不变，仍拒绝导出。
+    control_body = {
+        "nodes": [
+            {"id": "a", "type": "input_layer", "data": {}},
+            {"id": "loop", "type": "repeat_layer", "data": {"repetitions": 3}},
+        ],
+        "edges": [
+            {"id": "e1", "source": "a", "target": "loop", "targetHandle": "in-external",
+             "data": {"label": "out_a"}},
+        ],
+    }
+    assert client.put(f"/api/projects/{project_id}/graph", json=control_body).status_code == 200
+    rejected = client.get(f"/api/networks/{project_id}/export")
+    assert rejected.status_code == 400, rejected.text
+    detail = rejected.json()["detail"]
+    assert "repeat_layer" in detail
+    assert "控制流节点（重复块）" in detail
+
+
 def test_export_positional_encoding_is_executable(tmp_networks):
     """含位置编码层的导出代码必须可编译（阶段4：join 写死字面 '\\n' 会 SyntaxError）。"""
     import py_compile
