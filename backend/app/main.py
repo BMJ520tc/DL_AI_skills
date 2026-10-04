@@ -17,8 +17,9 @@ from app.services import (
 )
 from app.api import (
     tasks, projects, knowledge, agents, environments, search, analysis, preprocess, datasets, papers,
-    decompose, modules, networks, versions, multi_model,
+    decompose, modules, networks, versions, multi_model, settings, system,
 )
+from app.static_serve import mount_static
 
 
 @asynccontextmanager
@@ -86,6 +87,8 @@ app.include_router(modules.router)
 app.include_router(networks.router)
 app.include_router(versions.router)
 app.include_router(multi_model.router)
+app.include_router(settings.router)
+app.include_router(system.router)
 
 
 @app.post("/api/torchlens")
@@ -107,3 +110,8 @@ def torchlens_unavailable() -> dict:
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+# 一键封装：前端产物同源服务（须在所有 API 路由之后挂载，让路由优先匹配；
+# 开发默认关，`DL_AI_SERVE_STATIC=1` 或打包形态开启）。
+mount_static(app)

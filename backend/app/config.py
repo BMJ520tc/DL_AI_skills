@@ -4,6 +4,7 @@
 对齐《系统架构设计》六.1 monorepo 布局与《知识库与数据设计》二.3 数据目录。
 """
 import os
+import sys
 from pathlib import Path
 
 # 关闭 Claude Code CLI 自动更新（架构八.1 依赖管理），钉住内置 CLI 版本由 SDK 锁版保证
@@ -12,7 +13,25 @@ os.environ.setdefault("DISABLE_AUTOUPDATER", "1")
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 PROJECT_ROOT = BACKEND_DIR.parent
 
-DATA_DIR = PROJECT_ROOT / "data"
+# 打包形态（PyInstaller 冻结，一键封装 6.6）：数据目录默认挪到用户目录，静态产物从打包资源取。
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+
+
+def _resolve_data_dir() -> Path:
+    """数据目录解析：`DL_AI_DATA_DIR` 显式覆盖 > 打包缺省（用户数据目录）> 项目根 data/。
+
+    打包产物解压目录可能只读/升级即被整体替换，数据必须与程序目录分离（探索稿 P4）。
+    """
+    env = os.getenv("DL_AI_DATA_DIR")
+    if env:
+        return Path(env)
+    if IS_FROZEN:
+        base = os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")
+        return Path(base) / "DL-AI-skills" / "data"
+    return PROJECT_ROOT / "data"
+
+
+DATA_DIR = _resolve_data_dir()
 DB_PATH = DATA_DIR / "index.db"
 PAPERS_DIR = DATA_DIR / "papers"
 PROJECTS_DIR = DATA_DIR / "projects"
@@ -88,6 +107,17 @@ PIP_FALLBACK_INDEX = os.getenv("PIP_FALLBACK_INDEX", "https://pypi.org/simple")
 # venv 环境创建所用的解释器：默认后端自身解释器；ENV_VENV_PYTHON 指定其他版本
 # （真实项目常把依赖钉在旧 Python 上，用后端解释器会因无对应 wheel 而失败）。
 ENV_VENV_PYTHON = os.getenv("ENV_VENV_PYTHON")
+
+# 前端产物由后端同源服务（一键封装 P1）：开发默认关（沿用 vite dev/preview），
+# `DL_AI_SERVE_STATIC=1` 显式开，打包形态（冻结）默认开。
+SERVE_STATIC = os.getenv("DL_AI_SERVE_STATIC") == "1" or IS_FROZEN
+# 静态产物目录：`DL_AI_DIST_DIR` 显式覆盖 > 打包资源（sys._MEIPASS/static）> 项目 frontend/dist。
+_dist_env = os.getenv("DL_AI_DIST_DIR")
+FRONTEND_DIST_DIR = (
+    Path(_dist_env)
+    if _dist_env
+    else (Path(sys._MEIPASS) / "static" if IS_FROZEN else PROJECT_ROOT / "frontend" / "dist")
+)
 
 
 def ensure_data_dirs() -> None:

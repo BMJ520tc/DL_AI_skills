@@ -253,6 +253,14 @@ async def _run(params: dict, task_id: str) -> None:
 
 async def _collect(prompt: str, options: ClaudeAgentOptions, timeout_s: int, retries: int = 2) -> dict:
     """执行一次 agent 会话，带指数退避重试（2.5 异常兜底：429 退避、超时重试）。"""
+    # 一键封装凭证页（K2）：凭证文件在配置时覆盖进程环境（SDK 的 CLI 子进程继承读取）；
+    # 文件里的模型名同时覆盖 options.model（显式保存是用户最新意图）。
+    from app import settings_store
+
+    cred = settings_store.apply_credentials_env()
+    if cred.get("model"):
+        options.model = cred["model"]
+
     outcome: dict = {}
     last_error: Optional[Exception] = None
 
