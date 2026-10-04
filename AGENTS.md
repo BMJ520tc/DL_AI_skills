@@ -55,21 +55,21 @@ Python 的 FastAPI）。`agents/prompts/` 里是交给大模型的任务提示�
 ## 四、常用命令
 
 ```powershell
-# 解释器：本仓库当前用 D:\python.exe（Python 3.13，后端依赖 + torch/uvicorn/websockets 齐全）；
-# 若换到带项目内虚拟环境的机器，把下文的 D:\python.exe 换成该环境里的解释器。
-#   后端自动化用例（当前 359 个，全部通过；用 `D:\python.exe -m pytest -o addopts="" -p no:cacheprovider` 可核对，
+# 解释器：backend/.venv/Scripts/python.exe（项目内虚拟环境，Python 3.14，后端依赖 + torch/uvicorn/websockets 齐全）；
+# 若换到带项目内虚拟环境的机器，把下文的 backend/.venv/Scripts/python.exe 换成该环境里的解释器。
+#   后端自动化用例（当前 359 个，全部通过；用 `backend/.venv/Scripts/python.exe -m pytest -o addopts="" -p no:cacheprovider` 可核对，
 #   注意 pytest.ini 里有 addopts=-q，命令行再给 -q 会变成 -qq 而不打印统计行）
-D:\python.exe scripts/run_tests.py
+backend/.venv/Scripts/python.exe scripts/run_tests.py
 
 # 前端：代码规范检查（当前 0 问题）与构建
 cd frontend; npm run lint; npm run build
 #   注意：构建完必须真的打开一次产物确认界面能出来（见第三节第 2 条）
 
 # 阶段4 起：构建产物无头浏览器自检（临时库后端 + vite preview + 无头 Edge，不动真实数据）
-D:\python.exe scripts/ui_check_4a.py
-D:\python.exe scripts/ui_check_4b.py
-D:\python.exe scripts/ui_check_4c.py
-D:\python.exe scripts/ui_check_4d2.py
+backend/.venv/Scripts/python.exe scripts/ui_check_4a.py
+backend/.venv/Scripts/python.exe scripts/ui_check_4b.py
+backend/.venv/Scripts/python.exe scripts/ui_check_4c.py
+backend/.venv/Scripts/python.exe scripts/ui_check_4d2.py
 #   4c 会真实跑一次 CPU 训练（smoke 环境 data/_acceptance/venv_smoke，目录联接挂进临时项目），约 4 分钟；
 #   4d2 覆盖 M5 三条（版本树/对比/回退），无训练链路、不需要 venv_smoke
 #   venv_smoke 可自建（venv + 装 torch），也可 `mklink /J` 指向任一带 torch 的项目独立环境；
@@ -79,22 +79,25 @@ D:\python.exe scripts/ui_check_4d2.py
 
 # M4/M5 脚本化验收（19/19 通过；严口径——用真实入库模块 + env_manager 真建环境，首跑含装 torch
 #   约 5～10 分钟；产物保留在 data/_acceptance/m4_acceptance/，其中项目 git 仓库 git log 即 M5 版本证据）
-D:\python.exe scripts/m4_acceptance.py
-D:\python.exe scripts/m4_acceptance.py --module mod_611e10504a9b0e61:v14    # 换真实模块
+backend/.venv/Scripts/python.exe scripts/m4_acceptance.py
+backend/.venv/Scripts/python.exe scripts/m4_acceptance.py --module mod_611e10504a9b0e61:v14    # 换真实模块
 
 # 导出两端逐字节比对（《模块详细设计》7.4/7.7-10 声明的机器化复核；需 node/npx）
-D:\python.exe scripts/export_parity.py
+backend/.venv/Scripts/python.exe scripts/export_parity.py
 
 # 不需要模型接口凭证的端到端自检：
 #   在项目自己的运行环境里「补形状 → 回填参数 → 再生成代码 → 结构比对 + 数值比对」，
 #   并附带一次「参数写法变了编号是否还一致」的回归。产物落在 data/_acceptance/ 下，不动项目数据。
-D:\python.exe scripts/decompose_e2e_check.py --project-id dc21142917844c05b196fac086b484dc --ab
+backend/.venv/Scripts/python.exe scripts/decompose_e2e_check.py --project-id dc21142917844c05b196fac086b484dc --ab
 
 # 模块四完整验收（需要模型接口凭证，会调用大模型）
-D:\python.exe scripts/m3_acceptance.py --mode all --source examples/m3_sample_repo
+backend/.venv/Scripts/python.exe scripts/m3_acceptance.py --mode all --source examples/m3_sample_repo
 
 # 启动后端（改完代码记得重启；下载依赖建议走国内镜像源）
-cd backend; $env:PIP_INDEX_URL="https://mirrors.cloud.tencent.com/pypi/simple"; D:\python.exe -m uvicorn app.main:app --port 8000
+cd backend; $env:PIP_INDEX_URL="https://mirrors.cloud.tencent.com/pypi/simple"; .venv/Scripts/python.exe -m uvicorn app.main:app --port 8000
+
+# 一键启动（阶段6 便携形态 start.bat：自检 Python/前端产物/端口 → 后端同源服务前端 → 开浏览器）
+start.bat
 ```
 
 ## 五、现在到哪一步了
