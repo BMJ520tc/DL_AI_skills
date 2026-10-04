@@ -53,19 +53,64 @@ SPLIT_DIR_NAMES = {
 
 MISSING = {"", "na", "n/a", "nan", "null", "none", "?", "-"}
 
-# 单位统一（5.1 步骤 2 的量纲部分）：识别列名中的单位后缀并换算到统一量纲
-# 统一目标：时间→秒，字节量→MB，比例→小数
+# 单位统一（5.1 步骤 2 的量纲部分）：识别列名中的单位后缀并换算到统一量纲。
+#
+# 统一基准（括号内为换算后列名后缀）：
+#   时间→s（ns/us/µs/ms/s/min/h…）、长度→m（nm/um/mm/cm/m/km）、
+#   数据量→mb（字节，**按 1024 进制**：1 MB = 1024 KB = 1048576 B；不使用 1000 进制的
+#   SI 口径，避免同一份数据因「1 KB 是 1000 还是 1024 字节」产生两种结果）、
+#   比特→mbit（1 Mb = 1024 Kb，比特与字节分属不同量纲，绝不互相折算）、
+#   比例→ratio（小数，% → 0.01、‰ → 0.001）、频率→hz、能量→j / wh、功率→w。
+#
+# 大小写敏感表优先命中：数据量里 Mb（兆比特）与 MB（兆字节）必须区分，
+# 混同会把 1 Mb 当成 1 MB（差 8 倍）；查表顺序为「大小写敏感 → 小写回退」，
+# 小写回退沿用既有口径（B/b 单字母都按字节处理；全小写 mb/gb 亦按字节）。
+_UNIT_TABLE_CS = {
+    "B": ("mb", 1 / 1048576), "b": ("mb", 1 / 1048576),
+    "kB": ("mb", 1 / 1024), "KB": ("mb", 1 / 1024),
+    "MB": ("mb", 1.0), "GB": ("mb", 1024.0), "TB": ("mb", 1048576.0),
+    "KiB": ("mb", 1 / 1024), "MiB": ("mb", 1.0), "GiB": ("mb", 1024.0), "TiB": ("mb", 1048576.0),
+    # 比特（小写 b 且带前缀）另立量纲 mbit
+    "Kb": ("mbit", 1 / 1024), "Mb": ("mbit", 1.0),
+    "Gb": ("mbit", 1024.0), "Tb": ("mbit", 1048576.0),
+}
+
 _UNIT_TABLE = {
-    "ns": ("s", 1e-9), "us": ("s", 1e-6), "µs": ("s", 1e-6), "ms": ("s", 1e-3),
-    "s": ("s", 1.0), "sec": ("s", 1.0), "secs": ("s", 1.0),
+    # 时间（基准 s）
+    "ns": ("s", 1e-9), "us": ("s", 1e-6), "µs": ("s", 1e-6), "μs": ("s", 1e-6),
+    "ms": ("s", 1e-3), "s": ("s", 1.0), "sec": ("s", 1.0), "secs": ("s", 1.0),
     "second": ("s", 1.0), "seconds": ("s", 1.0),
     "min": ("s", 60.0), "mins": ("s", 60.0), "minute": ("s", 60.0), "minutes": ("s", 60.0),
-    "h": ("s", 3600.0), "hr": ("s", 3600.0), "hour": ("s", 3600.0), "hours": ("s", 3600.0),
+    "h": ("s", 3600.0), "hr": ("s", 3600.0), "hrs": ("s", 3600.0),
+    "hour": ("s", 3600.0), "hours": ("s", 3600.0),
+    # 长度（基准 m）
+    "nm": ("m", 1e-9), "um": ("m", 1e-6), "µm": ("m", 1e-6), "μm": ("m", 1e-6),
+    "mm": ("m", 1e-3), "cm": ("m", 1e-2), "dm": ("m", 1e-1), "m": ("m", 1.0),
+    "km": ("m", 1000.0),
+    # 数据量（字节，基准 mb，1024 进制；全小写写法按字节处理）
+    "b": ("mb", 1 / 1048576), "kb": ("mb", 1 / 1024), "mb": ("mb", 1.0),
+    "gb": ("mb", 1024.0), "tb": ("mb", 1048576.0),
+    "kib": ("mb", 1 / 1024), "mib": ("mb", 1.0), "gib": ("mb", 1024.0), "tib": ("mb", 1048576.0),
+    # 比例（基准 ratio，小数）
     "%": ("ratio", 0.01), "pct": ("ratio", 0.01), "percent": ("ratio", 0.01),
-    "b": ("mb", 1 / 1048576), "kb": ("mb", 1 / 1024), "mb": ("mb", 1.0), "gb": ("mb", 1024.0),
+    "‰": ("ratio", 0.001), "permille": ("ratio", 0.001),
+    # 频率（基准 hz）
+    "hz": ("hz", 1.0), "khz": ("hz", 1e3), "mhz": ("hz", 1e6), "ghz": ("hz", 1e9),
+    # 能量 / 功率（基准 j / wh / w；MJ/mJ、MW/mW 兆与毫同形，故意不收录以免误换算）
+    "j": ("j", 1.0), "kj": ("j", 1e3),
+    "wh": ("wh", 1.0), "kwh": ("wh", 1e3),
+    "w": ("w", 1.0), "kw": ("w", 1e3),
 }
 # 要求单位前有分隔符（`latency_ms`、`duration(s)`），避免把 Mass/Address 这类词尾误判为单位
-_UNIT_RE = re.compile(r"[_\s(（\-]+([A-Za-zµ%]{1,7})[)）]?$")
+_UNIT_RE = re.compile(r"[_\s(（\-]+([A-Za-zµμ‰%]{1,8})[)）]?$")
+
+
+def _unit_lookup(token: str) -> tuple[str, float] | None:
+    """查单位表：先按原样（区分 Mb/MB、比特/字节），未命中再小写回退（沿用既有口径）。"""
+    exact = _UNIT_TABLE_CS.get(token)
+    if exact is not None:
+        return exact
+    return _UNIT_TABLE.get(token.lower())
 
 
 def _fail(fmt: str, message: str) -> dict:
@@ -436,10 +481,21 @@ def normalize_units(unified: list[dict], columns: list[str]) -> tuple[list[dict]
     """单位统一（5.1 步骤 2 的量纲部分）：列名带单位后缀的数值列换算到统一量纲并改名。
 
     返回 (统一行, 新列名列表, units 记录)。未命中任何单位时 units 为空。
+
+    - **同量纲多单位合并**：`latency_ms` 与 `latency_us` 同归 `latency_s`，各列都换算到
+      统一基准后合并进同一列（不再跳过）。每行取**列声明顺序**中第一个非空的来源列为准；
+      同一行有多个来源列同时非空时按行计数 conflicts，如实记入 units。
+      （注意：合并会抹平两列之间的差异，原本只靠这两列区分的行合并后可能变重复，
+      由后续 `clean()` 的去重按既有口径处理。）
+    - 目标列名与既有列（不参与本组合并者）重名时给出稳定消歧名 `<目标名>_2`、`_3`…，
+      并在 units 记录里写明 disambiguation。
+    - 保持既有行为：非数值列、非空值不足半数的列不换算（原因如实记 skipped，不静默）；
+      meta_ 前缀约定与列改名规则不变。
     """
     units: dict = {}
-    rename: dict = {}
-    claimed: dict[str, str] = {}  # 目标列名 -> 源列名（detect 同量纲多单位冲突）
+    groups: dict[str, dict] = {}  # 目标列名 -> {target, base, sources[]}
+    order: list[str] = []         # 目标列名的首次声明顺序
+
     for col in columns:
         if not col.startswith(META_PREFIX):
             continue
@@ -447,32 +503,93 @@ def normalize_units(unified: list[dict], columns: list[str]) -> tuple[list[dict]
         m = _UNIT_RE.search(orig)
         if not m:
             continue
-        token = m.group(1).lower()
-        if token not in _UNIT_TABLE:
+        token = m.group(1)
+        found = _unit_lookup(token)
+        if found is None:
             continue
-        base, factor = _UNIT_TABLE[token]
+        base, factor = found
         values = [_to_float(r.get(col)) for r in unified]
         present = [v for v in values if v is not None]
-        # 仅对数值列换算：非空值须过半且都能转成数字
+        # 仅对数值列换算：非空值须过半且都能转成数字（口径不变）；不换算的原因如实登记
         if not present or len(present) * 2 < len(unified):
-            continue
-        new_orig = f"{orig[:m.start()].rstrip('_ -')}_{base}"
-        new_col = META_PREFIX + new_orig
-        if new_col != col and (new_col in claimed or new_col in columns):
-            # 同量纲多单位（latency_ms 与 latency_us 都归到 latency_s）会互相覆盖并产生重名列：
-            # 保留原列名不做换算，并如实记录冲突，交人工决定如何合并
             units[orig] = {"column": orig, "from": token, "to": base, "factor": factor,
-                           "skipped": f"目标列名与 {claimed.get(new_col, new_col)} 冲突，未换算"}
+                           "skipped": "非数值列或非空值不足半数，未换算"}
             continue
+        target = f"{META_PREFIX}{orig[:m.start()].rstrip('_ -')}_{base}"
+        group = groups.get(target)
+        if group is None:
+            group = {"target": target, "base": base, "sources": []}
+            groups[target] = group
+            order.append(target)
+        group["sources"].append({"column": col, "orig": orig, "token": token, "factor": factor})
+
+    # 目标列名与既有列重名（且该列不属于本组）→ 稳定消歧，避免产出重名列
+    for target in list(order):
+        group = groups[target]
+        src_cols = {s["column"] for s in group["sources"]}
+        if target not in columns or target in src_cols:
+            continue
+        candidate, n = target, 2
+        while candidate in columns or candidate in groups:
+            candidate = f"{target}_{n}"
+            n += 1
+        group["disambiguation"] = {"requested": target, "used": candidate,
+                                   "reason": "目标列名与既有列重名，改用消歧名"}
+        del groups[target]
+        group["target"] = candidate
+        groups[candidate] = group
+        order[order.index(target)] = candidate
+
+    col_target: dict[str, str] = {}
+    for target in order:
+        group = groups[target]
+        sources = group["sources"]
+        src_cols = [s["column"] for s in sources]
+        merged_values: list = []
+        conflicts = 0
         for row in unified:
-            value = _to_float(row.get(col))
-            row[new_col] = round(value * factor, 10) if value is not None else row.get(col)
-            if new_col != col:  # 同名时不能 pop，否则刚写入的值会被删掉
-                row.pop(col, None)
-        rename[col] = new_col
-        claimed[new_col] = col
-        units[orig] = {"column": new_orig, "from": token, "to": base, "factor": factor}
-    return unified, [rename.get(c, c) for c in columns], units
+            value = None
+            non_null = 0
+            for src in sources:
+                num = _to_float(row.get(src["column"]))
+                if num is None:
+                    continue
+                if value is None:
+                    value = round(num * src["factor"], 10)  # 先声明者为准
+                non_null += 1
+            if non_null >= 2:
+                conflicts += 1
+            if value is None:
+                # 全部来源都不是数值：沿用既有口径保留首个来源的原始值（缺失标记交给 clean 处理）
+                value = row.get(src_cols[0])
+            merged_values.append(value)
+        for row, value in zip(unified, merged_values):
+            row[target] = value
+        for col in src_cols:
+            col_target[col] = target
+            if col != target:  # 同名（目标列本身就是来源列）时不能 pop，否则刚写入的值会被删掉
+                for row in unified:
+                    row.pop(col, None)
+        for src in sources:
+            record = {"column": target[len(META_PREFIX):], "from": src["token"],
+                      "to": group["base"], "factor": src["factor"]}
+            if len(sources) > 1:
+                record["merged_from"] = [s["orig"] for s in sources]
+                record["conflicts"] = conflicts
+            if "disambiguation" in group:
+                record["disambiguation"] = group["disambiguation"]
+            units[src["orig"]] = record
+
+    new_columns: list[str] = []
+    emitted: set[str] = set()
+    for col in columns:
+        target = col_target.get(col)
+        if target is None:
+            new_columns.append(col)
+        elif target not in emitted:
+            new_columns.append(target)  # 目标列落在首个来源列的位置
+            emitted.add(target)
+    return unified, new_columns, units
 
 
 def normalize_sequences(unified: list[dict]) -> tuple[list[dict], dict | None, int]:

@@ -53,8 +53,16 @@ def render(
     extra_html: str = "",
     degrade: str | None = None,
     meta: str = "",
+    body_html: str | None = None,
+    banner_html: str = "",
 ) -> None:
-    """写出自包含 HTML。degrade 非空时只输出降级提示与已有内容，不加载图表。"""
+    """写出自包含 HTML。
+
+    - `degrade` 非空时只输出降级提示与已有内容，不加载图表（整图降级）。
+    - `banner_html` 用于**部分降级**：仍有可绘内容时显示提示条但照常内联 ECharts 并画图。
+    - `body_html` 覆盖默认布局（默认是 `<div id="chart">` + extra_html），
+      供「一张图里多数据集多子图」自行排布容器。
+    """
     # 仅在有图表脚本时才内联 ECharts（纯表格类页面无需 1MB 的图表库）
     echarts_src = ""
     if degrade is not None:
@@ -67,8 +75,13 @@ def render(
             )
         echarts_src = ec.read_text(encoding="utf-8")
 
-    banner = f'<div class="banner">数据缺失，该图降级：{degrade}</div>' if degrade else ""
-    body = ('<div id="chart"></div>' if init_js else "") + extra_html
+    if banner_html:
+        banner = banner_html
+    elif degrade:
+        banner = f'<div class="banner">数据缺失，该图降级：{degrade}</div>'
+    else:
+        banner = ""
+    body = body_html if body_html is not None else ('<div id="chart"></div>' if init_js else "") + extra_html
 
     out_html.parent.mkdir(parents=True, exist_ok=True)
     out_html.write_text(
