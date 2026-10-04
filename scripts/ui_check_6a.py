@@ -12,6 +12,7 @@
   D. 凭证保存：磁盘落 credentials.json（临时目录）、响应只回掩码不回明文；清除删除文件
   E. 「稍后再说」写跳过标记：无凭证时刷新不再弹；清掉标记刷新又弹
   F. 「⚙ 设置」按钮手动打开；环境自检区块渲染 + 「重新检测」可点
+  G. 缺 git/python 模拟（受限 PATH 重启后端）：env-check 报缺、弹窗给安装指引链接
 """
 from __future__ import annotations
 
@@ -83,11 +84,12 @@ def start_backend(tmp_dir: Path):
 
     server = uvicorn.Server(uvicorn.Config(
         app, host="127.0.0.1", port=BACKEND_PORT, log_level="warning"))
-    threading.Thread(target=server.run, daemon=True).start()
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
     for _ in range(100):  # 等启动收敛
         try:
             urllib.request.urlopen(f"{BACKEND_URL}/api/health", timeout=2)
-            return server, data_dir
+            return server, thread, data_dir
         except Exception:
             time.sleep(0.2)
     raise RuntimeError("backend did not start")
@@ -248,7 +250,7 @@ def main() -> int:
     cdp: CDP | None = None
 
     try:
-        server, data_dir = start_backend(tmp_dir)
+        server, _, data_dir = start_backend(tmp_dir)
         check("后端启动（临时库 + SERVE_STATIC）", True, BACKEND_URL)
 
         # --- A. 静态服务与 SPA 回退 ---
@@ -330,6 +332,14 @@ def main() -> int:
             check("凭证文件落在临时数据目录", cred_file.is_file(), str(cred_file))
             check("凭证文件含密钥（本地可用）", TEST_KEY in cred_file.read_text(encoding="utf-8"))
 
+        # 表单口径「留空则保留现有密钥」：已配置后只改默认模型、密钥留空再保存
+        check("改默认模型输入框（留空密钥）", set_input_by_placeholder(cdp, "如 deepseek-chat", "model-v2"))
+        click_button(cdp, "保存", exact=True)
+        wait_for(cdp, "document.body.innerText.includes('当前已配置')", True, "留空密钥保存后仍已配置")
+        updated = http_json("/api/settings/credentials")
+        check("留空密钥保存：旧密钥保留且字段已更新",
+              updated.get("key_mask") == "***1234" and updated.get("model") == "model-v2")
+
         click_button(cdp, "清除凭证", exact=True)
         ok_cleared = wait_for(cdp, "document.body.innerText.includes('尚未配置模型接口凭证')", True, "清除后回到未配置")
         if ok_cleared:
@@ -367,7 +377,46 @@ def main() -> int:
             click_button(cdp, "完成", exact=True)
             wait_for(cdp, DIALOG_CLOSED, True, "「完成」关闭弹窗")
 
-        # --- console 错误收口 ---
+        # --- G. 缺 git/python 模拟（方案验收判据：「缺 git」下正确报缺并给指引） ---
+        # 说明：本段同进程停旧后端起新后端，停旧后端时 stderr 会出现一条
+        # 「Task exception was never retrieved … Queue is bound to a different event loop」
+        # ——uvicorn 生命周期结束后 task_manager 残留 worker 的 asyncio 噪声，仅在本脚本
+        # 这种「同进程二次启动后端」场景出现，真实运行（一次生命周期）不存在，不影响断言。
+        orig_path = os.environ.get("PATH", "")
+        try:
+            # 先让页面离开，避免「停旧后端 → 起新后端」窗口期页面发请求打出 ERR_CONNECTION_REFUSED
+            cdp.call("Page.navigate", {"url": "about:blank"})
+            server.should_exit = True  # 停第一个后端，释放端口再起受限 PATH 的新后端
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(0.5)
+                    if sock.connect_ex(("127.0.0.1", BACKEND_PORT)) != 0:
+                        break
+                time.sleep(0.3)
+            # 只留 System32：找不到 git / python / py launcher / conda（py.exe 在 C:\Windows 而非 System32）
+            os.environ["PATH"] = r"C:\Windows\System32"
+            server2, _, _ = start_backend(tmp_dir / "missing-tools")
+            check("缺工具模拟：后端重启（受限 PATH）", True, BACKEND_URL)
+            env2 = http_json("/api/system/env-check")
+            check("缺工具模拟：env-check 报 git 缺失", env2.get("git", {}).get("found") is False)
+            check("缺工具模拟：env-check 报 python 缺失", env2.get("python", {}).get("found") is False)
+            cdp.call("Page.navigate", {"url": BACKEND_URL + "/"})
+            wait_for(cdp, "document.body.innerText.includes('⚙ 设置')", True, "缺工具模拟：页面重新加载")
+            click_button(cdp, "⚙ 设置")
+            wait_for(cdp, DIALOG_OPEN, True, "缺工具模拟：打开设置弹窗")
+            # env-check 结果异步拉取，等 git 行渲染出指引链接再断言
+            wait_for(cdp, "document.body.innerText.includes('git-scm.com/downloads/win')", True,
+                     "缺工具模拟：git 行报缺并给安装指引")
+            check("缺工具模拟：python 行报缺并给安装指引",
+                  "python.org/downloads" in cdp.evaluate("document.body.innerText"))
+            click_button(cdp, "完成", exact=True)
+            wait_for(cdp, DIALOG_CLOSED, True, "缺工具模拟：关闭弹窗")
+            server2.should_exit = True
+        finally:
+            os.environ["PATH"] = orig_path
+
+        # --- console 错误收口（全程累积事件一次性检查） ---
         errors = console_errors(cdp)
         check("页面 console 无错误", not errors, "; ".join(errors[:5]) if errors else "干净")
 
