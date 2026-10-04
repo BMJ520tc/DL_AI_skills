@@ -285,3 +285,88 @@ def test_install_with_fix_applies_cpu_index_and_progress(tmp_path, monkeypatch, 
     assert ok is True
     assert captured["extra_index_url"] == env_manager.CPU_TORCH_INDEX
     assert captured["progress"][0]["env_cuda"]["action"] == "cpu_wheel"
+
+
+# --------------------------------------- ③ 任务前带入：依赖冲突预检（模块详细设计 8.2）
+
+
+def test_pins_from_conflicts_parses_both_shapes():
+    """可操作形状（设计 schema {pkg, resolution}/{pkg, version_b}）产出钉；非可操作形状不产出。"""
+    conflicts = [
+        {"structured": {"pkg": "torch", "resolution": "torch==2.1.2"}},
+        {"structured": '{"pkg": "numpy", "resolution": "==1.26.4"}'},   # JSON 文本 + 纯版本式
+        {"structured": {"pkg": "scanpy", "version_b": "1.9.0"}},
+        {"structured": {"project_id": "p1", "stage": "创建(venv)", "error": "boom"}},  # 无 pkg → 跳过
+        {"structured": None},
+    ]
+    pins = env_manager._pins_from_conflicts(conflicts)
+    assert pins == {"torch": "torch==2.1.2", "numpy": "numpy==1.26.4", "scanpy": "scanpy==1.9.0"}
+
+
+def test_apply_known_pins_rewrites_only_matching_lines(tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("torch==1.0.0\nnumpy>=1.0\n# torch comment\npandas\n", encoding="utf-8")
+    out = env_manager._apply_known_pins(req, {"torch": "torch==2.1.2", "absent": "absent==9"})
+
+    assert out is not None
+    assert out["applied"] == [{"pkg": "torch", "line": "torch==2.1.2"}]
+    text = Path(out["path"]).read_text(encoding="utf-8")
+    assert "torch==2.1.2" in text
+    assert "numpy>=1.0" in text and "# torch comment" in text   # 非目标行与注释不动
+    assert out["path"] != str(req)                               # 原清单不被改写
+
+
+def test_apply_known_pins_noop_when_nothing_matches(tmp_path):
+    req = tmp_path / "requirements.txt"
+    req.write_text("pandas\n", encoding="utf-8")
+    assert env_manager._apply_known_pins(req, {"torch": "torch==2.1.2"}) is None
+
+
+def test_dependency_precheck_surfaces_relevant_and_filters_foreign(isolated_db):
+    """预检把「通用 / 本项目」的已确认冲突预警出来，其它项目的专属冲突不外泄；未确认的不算。"""
+    ks = knowledge_service
+    ks.record_knowledge({"type": "dependency_conflict", "title": "通用冲突",
+                         "content": "torch 与 numpy 版本互斥", "structured": {"pkg": "torch", "resolution": "torch==2.1.2"},
+                         "status": "confirmed"})
+    ks.record_knowledge({"type": "dependency_conflict", "title": "别家冲突",
+                         "content": "x", "structured": {"project_id": "other"}, "status": "confirmed"})
+    ks.record_knowledge({"type": "dependency_conflict", "title": "本项目草稿", "content": "y",
+                         "structured": {"project_id": "pid"}, "status": "draft"})  # 未确认 → 不算
+
+    hits = env_manager._dependency_precheck("pid")
+
+    titles = [h["title"] for h in hits]
+    assert "通用冲突" in titles
+    assert "别家冲突" not in titles          # 其它项目专属不外泄
+    assert "本项目草稿" not in titles        # 未确认不算
+
+
+def test_install_with_fix_preapplies_known_pins(tmp_path, monkeypatch, isolated_db):
+    """预应用：已确认冲突的版本钉在任何安装尝试前改写依赖清单，预警与应用合并进任务进度。"""
+    source = _src(tmp_path, "pre_src", {"requirements.txt": "torch==1.0.0\n"})
+    knowledge_service.record_knowledge({
+        "type": "dependency_conflict", "title": "torch 冲突", "content": "改用 2.1.2",
+        "structured": {"pkg": "torch", "resolution": "torch==2.1.2"}, "status": "confirmed",
+    })
+    used: dict = {}
+
+    async def fake_try_install(pip, req_file, index_url=None, extra_index_url=None):
+        used["req_file"] = req_file
+        return {"ok": True, "error": None, "command": "pip install", "index_url": index_url,
+                "extra_index_url": extra_index_url,
+                "started_at": env_manager._now(), "finished_at": env_manager._now()}
+
+    monkeypatch.setattr(env_manager, "_try_install", fake_try_install)
+    captured: list = []
+    monkeypatch.setattr(env_manager.task_manager, "update_progress",
+                        lambda task_id, progress: captured.append(progress))
+
+    ok = asyncio.run(env_manager._install_with_fix(
+        source, tmp_path / "envdir", "pid-pre", "task-pre", "venv"))
+
+    assert ok is True
+    # 实际安装用的是预应用后的清单副本（原 requirements.txt 未被改写）
+    assert Path(used["req_file"]).read_text(encoding="utf-8").strip() == "torch==2.1.2"
+    assert (source / "requirements.txt").read_text(encoding="utf-8").strip() == "torch==1.0.0"
+    # 预警与「已应用」在同一次进度写入里（避免 update_progress 覆盖丢键）
+    assert any(p.get("env_precheck") and p.get("env_precheck_applied") for p in captured)

@@ -196,6 +196,17 @@ async def _run(params: dict, task_id: str) -> None:
             "并 POST /api/projects/{id}/datasets/align"
         )
 
+    # 任务前知识带入（需求六.1、模块详细设计 8.2「模块三新数据集评估」触发点）：
+    # 按任务类型（基准参数里的 task_type）与模型名检索已确认蒸馏结论，作为默认建议进任务进度。
+    try:
+        advice = knowledge_service.bring_advice_summary(
+            task_type=(_load_json(baseline.get("params")) or {}).get("task_type"),
+            model=project.get("name"))
+    except Exception:  # noqa: BLE001 —— 带入失败不影响对比
+        advice = {}
+    if advice:
+        task_manager.update_progress(task_id, {"knowledge_bring": advice})
+
     # 跨数据集评估运行（run_type=eval）：先用已确认的 alignment 生成对齐副本，
     # 再把**对齐副本目录**交给 5.2 的 eval 入口——原始数据目录绝不直接用于跨数据集评估。
     evals = []
@@ -257,6 +268,7 @@ async def _run(params: dict, task_id: str) -> None:
             "differences": draft.get("differences") or [],
             "comparison": table,
             "common_metrics": sorted(common),
+            "source_task_id": task_id,
         },
         "sources": [baseline["run_id"]] + [item["run_id"] for item in evals],
         "confidence": "medium",

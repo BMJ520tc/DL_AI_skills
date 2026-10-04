@@ -11,6 +11,7 @@
 环境创建步骤与每次安装尝试写 run_record(env_install)，报错入 error 字段（供蒸馏知识提炼，需求六.1）。
 """
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -151,7 +152,7 @@ async def _run_env_create(params: dict, task_id: str) -> None:
              "started_at": created_at, "finished_at": _now()}
         )
         project_manager.update_status(project_id, "env_failed")
-        _draft_dependency_conflict(project_id, f"创建({env_type})", err)
+        _draft_dependency_conflict(project_id, task_id, f"创建({env_type})", err)
         raise RuntimeError(f"环境创建失败({env_type}): {err}")
 
     knowledge_service.record_run(
@@ -166,11 +167,11 @@ async def _run_env_create(params: dict, task_id: str) -> None:
         project_manager.update_status(project_id, "env_ready")
     else:
         project_manager.update_status(project_id, "env_failed")
-        _draft_dependency_conflict(project_id, "依赖安装（修正循环耗尽）", "")
+        _draft_dependency_conflict(project_id, task_id, "依赖安装（修正循环耗尽）", "")
         raise RuntimeError("环境安装失败（依赖修正循环耗尽）")
 
 
-def _draft_dependency_conflict(project_id: str, stage: str, err: str) -> None:
+def _draft_dependency_conflict(project_id: str, task_id: str, stage: str, err: str) -> None:
     """环境装不上 → 起草一条 dependency_conflict 蒸馏知识（需求六.1「任务结束提炼入库」）。
 
     只写 draft（待确认），失败绝不影响环境创建本身的报错路径。
@@ -188,7 +189,8 @@ def _draft_dependency_conflict(project_id: str, stage: str, err: str) -> None:
                 f"阶段：{stage}；失败详情（依赖修正循环耗尽后的原始报错）：{detail[:800]}。"
                 "后续同类项目遇到相同报错时，优先按此调整依赖版本或换环境类型。"
             ),
-            "structured": {"project_id": project_id, "stage": stage, "error": detail[:2000]},
+            "structured": {"project_id": project_id, "stage": stage, "error": detail[:2000],
+                           "source_task_id": task_id},
             "sources": sources,
             "confidence": "low",
             "scope": {"project_id": project_id},
@@ -260,10 +262,27 @@ async def _create_env_dir(env_type: str, source: Path, env_dir: Path, cmd: list[
 
 
 async def _install_with_fix(
-    source: Path, env_dir: Path, project_id: str, task_id: str, env_type: str
+    source: Path, env_dir: Path, project_id: str, task_id: str, env_type: str,
 ) -> bool:
     pip = _env_pip(env_dir)
     req_file = _find_requirements(source)
+    # 安装前预检（需求六.1、8.2「安装依赖前提示绕开方案」）：把已确认的 dependency_conflict
+    # 预警出来，并把可操作的版本钉**预应用**到依赖清单副本——已知冲突在任何安装尝试之前被绕开，
+    # 而不是等到装挂了再靠 agent 修正。预警与「已应用」合并成**一次**进度写入（update_progress 是整体覆盖）。
+    conflicts = _dependency_precheck(project_id)
+    applied = _apply_known_pins(req_file, _pins_from_conflicts(conflicts))
+    precheck_progress: dict = {}
+    if conflicts:
+        precheck_progress["env_precheck"] = {
+            "count": len(conflicts),
+            "items": [{"knowledge_id": c.get("knowledge_id"), "title": c.get("title"),
+                       "content": (c.get("content") or "")[:400]} for c in conflicts],
+        }
+    if applied:
+        precheck_progress["env_precheck_applied"] = applied["applied"]
+        req_file = Path(applied["path"])
+    if precheck_progress:
+        task_manager.update_progress(task_id, precheck_progress)
     versions = detect_versions(source, _env_python(env_dir))
     cuda_plan = versions.get("cuda_plan") or {}
     extra_index_url = None
@@ -932,6 +951,89 @@ def _apply_advice(req_file: Optional[Path], advice) -> Optional[Path]:
 def _pkg_name(line: str) -> str:
     m = re.match(r"^\s*([A-Za-z0-9_.\-]+)", line)
     return m.group(1).lower() if m else line.strip().lower()
+
+
+# ---- 任务前知识带入：依赖冲突预检（需求六.1、模块详细设计 8.2「安装依赖前提示绕开方案」） ----
+
+
+def _parse_conflict_structured(item: dict) -> dict:
+    """取蒸馏知识的 structured（可能是 dict 或 JSON 文本），非 dict 一律当空。"""
+    s = item.get("structured")
+    if isinstance(s, str):
+        try:
+            s = json.loads(s)
+        except (ValueError, TypeError):
+            return {}
+    return s if isinstance(s, dict) else {}
+
+
+def _pins_from_conflicts(conflicts: list[dict]) -> dict:
+    """从已确认冲突知识抽出可落地的版本钉 {包名: 完整 pip 行}。
+
+    兼容两种 structured 形状：设计 schema 的 {pkg, resolution}（resolution 可为
+    `torch==2.1.2`、`==2.1.2` 或 `2.1.2`）与 {pkg, version_b}（取 version_b 钉住）。
+    非可操作条目（无 pkg / 无版本线索，例如本仓库 historically 起草的 {project_id, stage, error}）
+    不产出钉——它们只作预警，不强行改写依赖。
+    """
+    pins: dict = {}
+    for c in conflicts or []:
+        s = _parse_conflict_structured(c)
+        pkg = (s.get("pkg") or s.get("package") or "").strip().lower()
+        if not pkg:
+            continue
+        res = s.get("resolution") or s.get("pin")
+        line: Optional[str] = None
+        if isinstance(res, str) and res.strip():
+            res = res.strip()
+            if _pkg_name(res) == pkg:                       # 已是 `torch==2.1.2` 形态
+                line = res
+            elif res.startswith(("=", ">", "<", "~", "!")):  # `==2.1.2` 形态
+                line = f"{pkg}{res}"
+            else:                                            # `2.1.2` 纯版本
+                line = f"{pkg}=={res}"
+        elif s.get("version_b"):
+            line = f"{pkg}=={s['version_b']}"
+        if line:
+            pins[pkg] = line
+    return pins
+
+
+def _apply_known_pins(req_file: Optional[Path], pins: dict) -> Optional[dict]:
+    """把已确认冲突的版本钉预应用到依赖清单，返回 {path, applied}；无可应用项返回 None。
+
+    不改动原清单（另存副本），与 `_apply_advice` 同口径；pyproject/setup.py 不按行改写。
+    """
+    if not pins or req_file is None or not req_file.exists() or req_file.name.lower() in _PROJECT_MANIFESTS:
+        return None
+    applied: list[dict] = []
+    out: list[str] = []
+    for line in req_file.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and _pkg_name(line) in pins:
+            newline = pins[_pkg_name(line)]
+            out.append(newline)
+            applied.append({"pkg": _pkg_name(line), "line": newline})
+        else:
+            out.append(line)
+    if not applied:
+        return None
+    new_file = req_file.parent / f"requirements_precheck_{uuid.uuid4().hex[:8]}.txt"
+    new_file.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return {"path": str(new_file), "applied": applied}
+
+
+def _dependency_precheck(project_id: str) -> list[dict]:
+    """安装依赖前预检（8.2）：返回「与本次项目相关」的已确认 dependency_conflict 条目。
+
+    只保留 struct 无 project_id（通用）或 project_id 恰为本项目者——其它项目的专属冲突不外泄
+    到本项目的预警里（避免噪音）。预检失败一律静默（返回空），绝不阻断环境创建。
+    进度写入由调用方合并（update_progress 是整体覆盖，避免冲掉同批写入的 env_precheck_applied）。
+    """
+    try:
+        conflicts = (knowledge_service.bring_knowledge() or {}).get("dependency_conflict") or []
+    except Exception:  # noqa: BLE001 —— 带入是旁路，失败不影响主流程
+        return []
+    return [c for c in conflicts if _parse_conflict_structured(c).get("project_id") in (None, "", project_id)]
 
 
 def register() -> None:

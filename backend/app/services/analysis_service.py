@@ -605,6 +605,15 @@ async def _run_analyze(params: dict, task_id: str) -> None:
     source = ws / "source"
     report_path = ws / "reports" / "structure_report.json"
 
+    # 任务前知识带入（需求六.1、模块详细设计 8.2「模块一加载新项目」触发点）：
+    # 以项目名作为模型维度检索已确认蒸馏结论，作为默认建议进任务进度（无命中静默跳过）。
+    try:
+        advice = knowledge_service.bring_advice_summary(model=project.get("name"))
+    except Exception:  # noqa: BLE001 —— 带入失败不影响分析
+        advice = {}
+    if advice:
+        task_manager.update_progress(task_id, {"knowledge_bring": advice})
+
     await asyncio.to_thread(
         subprocess.run,
         [sys.executable, str(SCAN_SCRIPT), str(source), str(report_path)],

@@ -272,6 +272,16 @@ async def _do_train(params: dict, task_id: str, ctx: dict) -> None:
     if not (data_dir / "preprocessed.csv").exists():
         raise RuntimeError(f"数据集预处理产物缺失：{data_dir / 'preprocessed.csv'}")
 
+    # 任务前知识带入（需求六.1、模块详细设计 8.2「模块五新模型运行」触发点）：
+    # 按模型名/数据集/任务类型检索已确认蒸馏结论，作为「默认建议」进任务进度，供运行面板展示。
+    try:
+        advice = knowledge_service.bring_advice_summary(
+            task_type=dataset.get("task_type"), model=project.get("name"), dataset=dataset.get("name"))
+    except Exception:  # noqa: BLE001 —— 带入失败不影响训练
+        advice = {}
+    if advice:
+        task_manager.update_progress(task_id, {"knowledge_bring": advice})
+
     env_project_id = params["environment_project_id"]
     env_project = project_manager.get_project(env_project_id)
     if env_project is None:
