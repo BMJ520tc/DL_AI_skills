@@ -5,6 +5,10 @@
 
 跨数据集的评估运行（run_type=eval）在本服务内触发：5.2 的 eval 入口契约对
 「自带数据」与「已对齐的公开数据」同样适用，文档未规定该运行的归属，故并入 5.4。
+
+对齐的应用（缺口二修复）：评估前必须先经 `alignment_apply.apply_alignment` 把已确认的
+alignment 落到目标数据集目录下的 `aligned/` 副本，**评估只吃这份副本**；运行记录与对比表
+都带上副本路径与映射/归并条目数，便于复核 alignment 确实生效。
 """
 import json
 from datetime import datetime, timezone
@@ -12,7 +16,8 @@ from pathlib import Path
 
 from app.contracts import ordered_metrics
 from app.services import (
-    agent_service, baseline_service, dataset_service, knowledge_service, project_manager, task_manager,
+    agent_service, alignment_apply, baseline_service, dataset_service,
+    knowledge_service, project_manager, task_manager,
 )
 
 TASK_TYPE = "compare"
@@ -111,10 +116,29 @@ def _build_table(baseline_metrics: dict, evals: list[dict]) -> dict:
         for item in evals:
             row[item["name"]] = (item["metrics"] or {}).get(metric)
         rows.append(row)
+    # 5.4 对比表须标明「本次跨数据集评估走的是对齐副本」（alignment 真正生效），
+    # 并给出映射/归并条目数，便于复核对齐规则确实作用到了输入数据上。
+    alignment_columns: dict = {}
+    for item in evals:
+        applied = item.get("aligned") or {}
+        alignment_columns[item["name"]] = {
+            "aligned": bool(applied),
+            "aligned_copy": applied.get("aligned_csv"),
+            "source_csv": applied.get("source_csv"),
+            "source_sha256": applied.get("source_sha256"),
+            "alignment_status": applied.get("alignment_status"),
+            "field_mapping_applied": applied.get("field_mapping_applied"),
+            "label_merge_applied": applied.get("label_merge_applied"),
+            "label_merge_entries": applied.get("label_merge_entries"),
+            "sequence": applied.get("sequence"),
+        }
     return {
         "metrics": ordered,
         "columns": ["baseline"] + [item["name"] for item in evals],
         "rows": rows,
+        "alignment_used": True,
+        "alignment_note": "本次跨数据集评估使用对齐副本（alignment 已生效）",
+        "alignment": alignment_columns,
     }
 
 
@@ -172,21 +196,38 @@ async def _run(params: dict, task_id: str) -> None:
             "并 POST /api/projects/{id}/datasets/align"
         )
 
-    # 跨数据集评估运行（run_type=eval），复用 5.2 的 eval 入口契约
+    # 跨数据集评估运行（run_type=eval）：先用已确认的 alignment 生成对齐副本，
+    # 再把**对齐副本目录**交给 5.2 的 eval 入口——原始数据目录绝不直接用于跨数据集评估。
     evals = []
     for ds in aligned:
-        data_dir = _data_dir_of(ds)
-        if data_dir is None or not data_dir.exists():
+        raw_dir = _data_dir_of(ds)
+        if raw_dir is None or not raw_dir.exists():
             continue
+        alignment = _parse_alignment(ds.get("alignment"))
+        name = ds.get("name") or ds["dataset_id"]
+        try:
+            applied = alignment_apply.apply_alignment(alignment, raw_dir)
+        except RuntimeError as exc:
+            raise RuntimeError(f"数据集「{name}」对齐应用失败，已中止对比：{exc}")
+        eval_dir = Path(applied["aligned_csv"]).parent
         run = await baseline_service.run_eval(
-            project_id, task_id, data_dir, run_type="eval",
-            dataset_label=ds.get("name") or ds["dataset_id"],
+            project_id, task_id, eval_dir, run_type="eval",
+            dataset_label=name,
+            extra_params={
+                "alignment_used": True,
+                "aligned_copy": applied["aligned_csv"],
+                "alignment_source_csv": applied["source_csv"],
+                "alignment_field_mapping_applied": applied["field_mapping_applied"],
+                "alignment_label_merge_applied": applied["label_merge_applied"],
+                "alignment_sequence": applied["sequence"],
+            },
         )
         evals.append({
-            "name": ds.get("name") or ds["dataset_id"],
+            "name": name,
             "dataset_id": ds["dataset_id"],
             "labels": ds.get("labels"),
-            "alignment": _parse_alignment(ds.get("alignment")),
+            "alignment": alignment,
+            "aligned": applied,
             "run_id": run["run_id"],
             "metrics": run["metrics"],
         })
