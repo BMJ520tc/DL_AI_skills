@@ -249,7 +249,20 @@ export function useGraphInteraction({
             const newNode = createNodeFromEvent(event, mainFlowRef.current);
             if (!newNode) return;
 
-            const finalNode = assignParent(newNode, getNodes());
+            // 混拼守卫：画布已含拆解 ir 节点时，不允许再拖入标准/模块节点。两类节点走**不同的
+            // 再生成引擎**（ir 走模块四 IR 链路、标准节点走画布引擎），混在一张图里导不出、也练不了
+            // （后端会明确 400，这里提前拦住，避免「保存成功却无法导出/训练」）。
+            const current = getNodes();
+            if (newNode.type !== "ir" && current.some(n => n.type === "ir")) {
+                window.alert(
+                    "这张画布已是「拆解图」（含 ir 节点），不能再拖入标准节点或模块节点。\n" +
+                    "两类节点走不同的再生成引擎，混在一张图里无法导出/训练。\n" +
+                    "如需搭建标准节点模型，请新建一张画布。",
+                );
+                return;
+            }
+
+            const finalNode = assignParent(newNode, current);
             setNodes(nds => [...nds, finalNode]);
         },
         [setNodes, getNodes, assignParent],

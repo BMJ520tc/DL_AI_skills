@@ -221,9 +221,26 @@ export function compileGraphToScript(
         outgoingEdges[n.id] = [];
     });
 
+    // 容器的**内部边界边**（容器与它自己的直接子节点之间那条 in-internal/out-internal 连线）
+    // 不能算作容器的输入/输出边：否则容器的 forward 末行会写成内部边的名字、整图找不到输出节点
+    // → 导出代码 `return x`（模型不接输入）。子节点一侧不受影响（它的子节点集合为空）。
+    const childrenOf = new Map<string, Set<string>>();
+    nodes.forEach(n => {
+        if (!n.parentId) return;
+        const set = childrenOf.get(n.parentId) ?? new Set<string>();
+        set.add(n.id);
+        childrenOf.set(n.parentId, set);
+    });
+    const isInternalBoundary = (edge: Edge, ownerId: string): boolean => {
+        const kids = childrenOf.get(ownerId);
+        if (!kids || kids.size === 0) return false;
+        const other = edge.target === ownerId ? edge.source : edge.target;
+        return kids.has(other);
+    };
+
     edges.forEach(e => {
-        incomingEdges[e.target]?.push(e);
-        outgoingEdges[e.source]?.push(e);
+        if (incomingEdges[e.target] && !isInternalBoundary(e, e.target)) incomingEdges[e.target].push(e);
+        if (outgoingEdges[e.source] && !isInternalBoundary(e, e.source)) outgoingEdges[e.source].push(e);
     });
 
     const getVarName = (base: string) => sanitizeIdent(`${variablePrefix}${base}`);

@@ -187,7 +187,7 @@ def test_export_tensor_repeat_separate_from_control_flow_repeat(tmp_networks):
     assert "out_b = out_a.repeat(2,3)" in code
     assert "return out_b" in code
 
-    # 2) 控制流「重复块」容器（键名保持 repeat_layer）：既有边界不变，仍拒绝导出。
+    # 2) 控制流「重复块」容器（键名保持 repeat_layer）：**空内部图**也能导出（`#Empty Loop` 直通）。
     control_body = {
         "nodes": [
             {"id": "a", "type": "input_layer", "data": {}},
@@ -199,11 +199,88 @@ def test_export_tensor_repeat_separate_from_control_flow_repeat(tmp_networks):
         ],
     }
     assert client.put(f"/api/projects/{project_id}/graph", json=control_body).status_code == 200
-    rejected = client.get(f"/api/networks/{project_id}/export")
-    assert rejected.status_code == 400, rejected.text
-    detail = rejected.json()["detail"]
-    assert "repeat_layer" in detail
-    assert "控制流节点（重复块）" in detail
+    empty_loop = client.get(f"/api/networks/{project_id}/export")
+    assert empty_loop.status_code == 200, empty_loop.text
+    loop_code = empty_loop.json()["code"]
+    assert "#Empty Loop" in loop_code
+    assert "out_loop = out_a # Empty Loop" in loop_code
+    assert "return out_loop" in loop_code
+
+
+def _control_flow_graph(kind: str) -> dict:
+    """控制流容器图（形状照真实画布：子节点同时在顶层 nodes 且带 parentId，边界边也在顶层 edges）。"""
+    child = {"id": "c1", "type": "linear_layer", "parentId": "ctr", "extent": "parent",
+             "position": {"x": 20, "y": 40},
+             "data": {"in_features": 4, "out_features": 4}}
+    internal_edges = [
+        {"id": "ie1", "source": "ctr", "sourceHandle": "in-internal", "target": "c1",
+         "targetHandle": "in-0", "data": {"label": "c1_in"}},
+        {"id": "ie2", "source": "c1", "target": "ctr", "targetHandle": "out-internal",
+         "data": {"label": "out_c1"}},
+    ]
+    return {
+        "nodes": [
+            {"id": "in1", "type": "input_layer", "position": {"x": 0, "y": 0}, "data": {}},
+            {"id": "ctr", "type": kind, "position": {"x": 200, "y": 0}, "data": {
+                "repetitions": 2, "internalNodes": [child], "internalEdges": internal_edges}},
+            child,
+        ],
+        "edges": [
+            {"id": "e1", "source": "in1", "target": "ctr",
+             "targetHandle": "in-external" if kind == "repeat_layer" else "in",
+             "data": {"label": "out_in1"}},
+            *internal_edges,
+        ],
+    }
+
+
+def test_export_control_flow_containers(tmp_networks):
+    """控制流容器（repeat_layer / module_list）可导出、可编译，且模型真的用上容器输出。
+
+    两条钉死口径（与前端逐字节一致所必需，见 scripts/export_parity.py）：
+    - `repeat_layer` 的子层 init **出现两次**（容器内联一份 + 外层平铺一份，幂等赘余）；
+    - `module_list` 的子层 init **只出现一次**（`encapsulatesChildInit`：子层只在 ModuleList 内）。
+    同时守住「容器的内部边界边不算它的输入/输出边」——否则 forward 末行会写成内部边名字、
+    整图找不到输出节点，导出代码变成 `return x`（模型不接输入）。
+    """
+    import py_compile
+
+    client, tmp_path = tmp_networks
+
+    for kind, expected_init_count, expected_ret in (
+        ("repeat_layer", 2, "return out_ctr"),
+        ("module_list", 0, "return out_ctr_out"),
+    ):
+        project_id = _create_structured(client, None)
+        graph = _control_flow_graph(kind)
+        assert client.put(f"/api/projects/{project_id}/graph", json=graph).status_code == 200
+        r = client.get(f"/api/networks/{project_id}/export")
+        assert r.status_code == 200, r.text
+        code = r.json()["code"]
+        assert code.count("self.c1_layer = nn.Linear") == expected_init_count, code
+        assert expected_ret in code, code
+        assert "\n        return x\n" not in code, code
+        p = tmp_path / f"{kind}.py"
+        p.write_text(code, encoding="utf-8")
+        py_compile.compile(str(p), doraise=True)
+
+
+def test_export_rejects_ir_standard_mix(tmp_networks):
+    """ir 节点与标准节点混拼 → 400，且文案说明「两类节点走不同引擎」。"""
+    client, _ = tmp_networks
+    project_id = _create_structured(client, None)
+    body = {
+        "nodes": [
+            {"id": "ir1", "type": "ir", "data": {"kind": "module"}},
+            {"id": "n1", "type": "relu_layer", "data": {}},
+        ],
+        "edges": [],
+    }
+    assert client.put(f"/api/projects/{project_id}/graph", json=body).status_code == 200
+    r = client.get(f"/api/networks/{project_id}/export")
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert "ir" in detail and "标准" in detail
 
 
 def test_export_positional_encoding_is_executable(tmp_networks):

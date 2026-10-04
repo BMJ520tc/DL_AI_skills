@@ -52,6 +52,48 @@ def _builtin_graph() -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+def _control_flow_graph(kind: str) -> dict:
+    """控制流容器图（`repeat_layer` / `module_list`），形状**照真实画布**：
+
+    - 容器节点的 `data.internalNodes/internalEdges` 是内部图的副本（画布侧由
+      `containerLogic.syncContainerData` 维护、`graphIR.buildGraphIR` 原样写进 graph.json）；
+    - 子节点**同时**出现在顶层 `nodes`（带 `parentId`）——React Flow 平铺渲染，画布上本来如此；
+    - 容器与子节点之间的 `in-internal` / `out-internal` 边界边也在顶层 `edges` 里。
+    """
+    child = {"id": "c1", "type": "linear_layer", "parentId": "ctr", "extent": "parent",
+             "position": {"x": 20, "y": 40},
+             "data": {"in_features": 4, "out_features": 4}}
+    internal_edges = [
+        {"id": "ie1", "source": "ctr", "sourceHandle": "in-internal", "target": "c1",
+         "targetHandle": "in-0", "data": {"label": "c1_in"}},
+        {"id": "ie2", "source": "c1", "target": "ctr", "targetHandle": "out-internal",
+         "data": {"label": "out_c1"}},
+    ]
+    return {
+        "nodes": [
+            {"id": "in1", "type": "input_layer", "position": {"x": 0, "y": 0}, "data": {}},
+            {"id": "ctr", "type": kind, "position": {"x": 200, "y": 0}, "data": {
+                "repetitions": 2, "internalNodes": [child], "internalEdges": internal_edges}},
+            child,
+        ],
+        "edges": [
+            {"id": "e1", "source": "in1", "target": "ctr",
+             "targetHandle": "in-external" if kind == "repeat_layer" else "in",
+             "data": {"label": "out_in1"}},
+            *internal_edges,
+        ],
+    }
+
+
+def _fixtures() -> list[tuple[str, dict]]:
+    """内置比对图：标准节点链 + 两种控制流容器（各覆盖一类此前被拒的图）。"""
+    return [
+        ("标准节点链（12 种节点）", _builtin_graph()),
+        ("repeat_layer 容器（含嵌套子节点）", _control_flow_graph("repeat_layer")),
+        ("module_list 容器（含嵌套子节点）", _control_flow_graph("module_list")),
+    ]
+
+
 def _frontend_code(graph: dict, work: Path) -> bytes:
     if shutil.which("npx") is None or shutil.which("node") is None:
         raise SystemExit("跳过：本机缺 node/npx，无法跑前端生成器")
@@ -98,38 +140,42 @@ def _undefined_node_refs(code: str) -> list[str]:
 
 
 def main() -> int:
-
     argv = sys.argv[1:]
-    graph_path = None
     if "--graph" in argv:
-        graph_path = Path(argv[argv.index("--graph") + 1])
-    graph = json.loads(graph_path.read_text(encoding="utf-8")) if graph_path else _builtin_graph()
+        path = Path(argv[argv.index("--graph") + 1])
+        fixtures = [(path.name, json.loads(path.read_text(encoding="utf-8")))]
+    else:
+        fixtures = _fixtures()
 
-    with tempfile.TemporaryDirectory() as td:
-        front = _frontend_code(graph, Path(td))
-    back = _backend_code(graph)
-
-    if front == back:
-        print(f"[PASS] 导出两端逐字节一致（{len(back)} 字节，节点数 {len(graph['nodes'])}）")
+    failed = 0
+    for name, graph in fixtures:
+        with tempfile.TemporaryDirectory() as td:
+            front = _frontend_code(graph, Path(td))
+        back = _backend_code(graph)
+        if front != back:
+            failed += 1
+            print(f"[FAIL] {name}：导出两端不一致（前端 {len(front)} / 后端 {len(back)} 字节）")
+            fl = front.decode("utf-8", "replace").split("\n")
+            bl = back.decode("utf-8", "replace").split("\n")
+            for i in range(max(len(fl), len(bl))):
+                f = fl[i] if i < len(fl) else "<缺行>"
+                b = bl[i] if i < len(bl) else "<缺行>"
+                if f != b:
+                    print(f"  首个差异 行{i + 1}:\n    前端: {f!r}\n    后端: {b!r}")
+                    break
+            continue
         undef = _undefined_node_refs(back.decode("utf-8", "replace"))
         if undef:
-            print(f"[FAIL] 导出的代码引用了未定义的节点输出变量：{undef}")
-            return 1
-        print("[PASS] 导出代码无未定义节点输出变量")
-        return 0
+            failed += 1
+            print(f"[FAIL] {name}：两端一致但引用了未定义变量 {undef}")
+            continue
+        print(f"[PASS] {name}：逐字节一致（{len(back)} 字节）且无未定义节点输出变量")
 
-    print(f"[FAIL] 导出两端不一致：前端 {len(front)} 字节 / 后端 {len(back)} 字节")
-    fl = front.decode("utf-8", "replace").split("\n")
-    bl = back.decode("utf-8", "replace").split("\n")
-    for i in range(max(len(fl), len(bl))):
-        f = fl[i] if i < len(fl) else "<缺行>"
-        b = bl[i] if i < len(bl) else "<缺行>"
-        if f != b:
-            print(f"  首个差异 行{i + 1}:")
-            print(f"    前端: {f!r}")
-            print(f"    后端: {b!r}")
-            break
-    return 1
+    if failed:
+        print(f"\n{len(fixtures) - failed}/{len(fixtures)} 张图通过")
+        return 1
+    print(f"\n{len(fixtures)}/{len(fixtures)} 张图全部通过")
+    return 0
 
 
 if __name__ == "__main__":

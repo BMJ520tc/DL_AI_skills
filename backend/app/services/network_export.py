@@ -14,7 +14,7 @@
 - 前端画布导出与训练运行共用本引擎——导出即所训，两端一致。
 
 纯函数、无 IO（module.py 读取除外）、无 subprocess；同图恒产出同代码。
-不支持的图（控制流节点 / 本地模块 / ir 与标准节点混拼）抛 `ExportError`，
+本地模块引用、以及 ir 与标准节点混拼的图抛 `ExportError`，
 message 面向用户，禁止静默产出错误代码。
 """
 from __future__ import annotations
@@ -77,7 +77,7 @@ def _edge_var_name(edge: dict) -> str:
 # 每个节点类型一条：handles（连线句柄规格）、params（paramSchema 默认值表，供
 # get_param 回退）、init/forward（与前端该节点 getInitCode/getForwardCode 语义一致）。
 # 表由 scripts 侧对照 frontend/src/nodes/ 逐节点移植，修改前端节点时须同步。
-# 控制流节点（repeat_layer 重复块 / module_list）含内部子图，不支持服务端导出，见 UNSUPPORTED。
+# 控制流容器（repeat_layer 重复块 / module_list）含内部子图，其 init/forward 见下方「控制流容器」小节。
 # 注意：**张量** torch.repeat 算子是独立类型键 `repeat_tensor`（见 NODE_TABLE），与
 # `repeat_layer`（控制流重复块容器）不是同一个东西。
 
@@ -202,6 +202,133 @@ def _module_forward(data: dict, name: str, inputs: list[str], outputs: list[str]
     """通用 forward：out = self.<name>(in)（绝大多数层节点共用）。"""
     return f"{_out0(outputs)} = self.{name}({_in0(inputs)})"
 
+
+# ---------------------------------------------------------------------------
+# 控制流容器（repeat_layer / module_list）
+# ---------------------------------------------------------------------------
+# 容器的 init/forward 由容器自己**递归编译内部图**（`data.internalNodes/internalEdges`，
+# 画布侧由 containerLogic.syncContainerData 维护、graphIR.buildGraphIR 原样写进 graph.json）。
+# 模板逐字符照抄 frontend/src/nodes/control_flow/{RepeatLayer,ModuleList}.tsx，
+# 以保证两端逐字节一致（scripts/export_parity.py 会核对）。
+
+# 「子节点的 init 由容器自己内联」的容器类型（前端 `static encapsulatesChildInit`）。
+ENCAPSULATES_CHILD_INIT = {"module_list"}
+
+
+def _js_interp(val: Any) -> str:
+    """JS 模板插值 `${x}`：`undefined` → 字面 "undefined"（其余与 `_val_str` 同）。"""
+    if val is None:
+        return "undefined"
+    return _val_str(val)
+
+
+def _container_internal(data: dict) -> tuple[list[dict], list[dict]]:
+    nodes = data.get("internalNodes")
+    edges = data.get("internalEdges")
+    return (nodes if isinstance(nodes, list) else [],
+            edges if isinstance(edges, list) else [])
+
+
+def _edge_label_of(edge: dict) -> Any:
+    inner = edge.get("data")
+    return inner.get("label") if isinstance(inner, dict) else None
+
+
+def _repeat_layer_init(data: dict, _name: str, class_renames=None) -> str:
+    """frontend RepeatLayer.getInitCode：把内部图各层的 init 内联（与外层平铺那份**重复**，
+    前端既有行为，照抄以保持两端一致）。"""
+    internal_nodes, internal_edges = _container_internal(data)
+    if not internal_nodes:
+        return "#Empty Loop"
+    init_lines, _, _ = compile_graph(internal_nodes, internal_edges, class_renames)
+    if not init_lines:
+        return "pass # Loop contains no trainable layers"
+    return "\n        ".join(line.strip() for line in init_lines)
+
+
+def _repeat_layer_forward(data: dict, _name: str, inputs: list[str], outputs: list[str],
+                          class_renames=None) -> str:
+    """frontend RepeatLayer.getForwardCode：`for _ in range(N)` + `_loop_state` 状态传递。"""
+    input_var = _in0(inputs)
+    output_var = _out0(outputs)
+    n = data.get("repetitions") or 1
+    internal_nodes, internal_edges = _container_internal(data)
+    if not internal_nodes:
+        return f"{output_var} = {input_var} # Empty Loop"
+
+    injections = []
+    for edge in internal_edges:
+        if edge.get("sourceHandle") != "in-internal":
+            continue
+        label = _edge_label_of(edge)
+        name = str(label).replace("-", "_") if label else "x"
+        injections.append(f"{name} = _loop_state")
+    injection_code = "\n            ".join(injections) or "x = _loop_state"
+
+    # 注意：compile_graph 返回 (init 行, forward 行, 返回变量)——这里要的是**第 2 个**
+    _, forward_lines, default_return = compile_graph(internal_nodes, internal_edges, class_renames)
+    end_edge = next(
+        (e for e in internal_edges if e.get("targetHandle") == "out-internal"), None)
+    end_label = _edge_label_of(end_edge) if end_edge else None
+    return_var = str(end_label).replace("-", "_") if end_label else default_return
+    loop_body = "\n        ".join(f"    {line.strip()}" for line in forward_lines)
+    return (
+        f"# Repeat Block ({n} iterations)\n"
+        f"        _loop_state = {input_var}\n"
+        f"        for _ in range({n}):\n"
+        f"            # Inject state into subgraph input\n"
+        f"            {injection_code}\n"
+        f"        {loop_body}\n"
+        f"            _loop_state = {return_var} # Update state with subgraph output\n"
+        f"        {output_var} = _loop_state"
+    )
+
+
+def _module_list_init(data: dict, name: str, class_renames=None) -> str:
+    """frontend ModuleList.getInitCode：把内部图折成 `nn.ModuleList([...])`。"""
+    internal_nodes, internal_edges = _container_internal(data)
+    if not internal_nodes:
+        return f"self.{name} = nn.ModuleList()"
+    init_lines, _, _ = compile_graph(internal_nodes, internal_edges, class_renames)
+    if not init_lines:
+        return "pass"
+
+    layer_defs: list[str] = []
+    for line in init_lines:
+        text = line.strip()
+        if "=" in text:
+            layer_defs.append(text.split("=", 1)[1].strip())
+
+    n = data.get("repetitions") or 1
+    if len(layer_defs) == 1:
+        body = f"            {layer_defs[0]} "
+    else:
+        sequential = "nn.Sequential(\n" + ",\n".join(
+            f"                {d}" for d in layer_defs) + "\n            )"
+        body = f"            {sequential} "
+    return (
+        f"self.{name} = nn.ModuleList([\n"
+        f"{body}\n"
+        f"            for _ in range((dict(repetitions={n})[\"repetitions\"]))\n"
+        f"        ])"
+    )
+
+
+def _module_list_forward(data: dict, name: str, inputs: list[str], outputs: list[str],
+                         class_renames=None) -> str:
+    """frontend ModuleList.getForwardCode：`for block in self.<name>: _h = block(_h)`。"""
+    input_var = _in0(inputs)
+    output_var = _out0(outputs)
+    internal_nodes, _edges = _container_internal(data)
+    if not internal_nodes:
+        return f"{output_var} = {input_var}"
+    return (
+        f"# Stack ({_js_interp(data.get('repetitions'))})\n"
+        f"        _h = {input_var}\n"
+        f"        for block in self.{name}:\n"
+        f"            _h = block(_h)\n"
+        f"        {output_var} = _h"
+    )
 
 # 前端 handles 常量：targets 仅记录渲染句柄；sources 为静态 handles 的 sources。
 _HANDLES_UNARY = {"targets": ["in-0"], "sources": ["out-0"]}
@@ -445,7 +572,7 @@ def _matmul_forward(data: dict, name: str, inputs: list[str], outputs: list[str]
 
 
 # 前端: nodes/pytorch_core/RepeatNode.tsx（**张量** torch.repeat 算子，键 repeat_tensor）
-# 控制流「重复块」是另一个类型键 repeat_layer（见 UNSUPPORTED_TYPES），两者互不相干。
+# 控制流「重复块」是另一个类型键 repeat_layer，两者互不相干。
 def _repeat_init(data: dict, name: str) -> str:
     return "# repeat handled in forward"
 
@@ -840,7 +967,7 @@ NODE_TABLE: dict[str, dict] = {
     "min_layer": _extrema_entry("min", True),
     "argmax_layer": _extrema_entry("argmax", False),
     "argmin_layer": _extrema_entry("argmin", False),
-    # 前端: nodes/pytorch_core/RepeatNode.tsx（张量 torch.repeat；控制流重复块见 UNSUPPORTED_TYPES）
+    # 前端: nodes/pytorch_core/RepeatNode.tsx（张量 torch.repeat；控制流重复块是 repeat_layer）
     "repeat_tensor": {
         "handles": _HANDLES_UNSPEC,
         "params": _P_REPEAT,
@@ -1008,14 +1135,26 @@ NODE_TABLE: dict[str, dict] = {
         "init": _accuracy_init,
         "forward": _accuracy_forward,
     },
+    # 控制流容器（模板见上方「控制流容器」小节；逐字符对齐前端）
+    # repeat_layer：前端该类**没有**静态 handles → sources 必须为空（输出名逐个取出边 label）
+    "repeat_layer": {
+        "handles": {"targets": [], "sources": []},
+        "params": {"repetitions": {"type": "number", "defaultValue": 1}},
+        "recursive": True,   # init/forward 需多接一个 class_renames（内部图递归编译要用）
+        "init": _repeat_layer_init,
+        "forward": _repeat_layer_forward,
+    },
+    # module_list：后端唯一「子节点 init 由容器内联」的类型（前端 static encapsulatesChildInit = true）
+    "module_list": {
+        "handles": {"targets": ["in"], "sources": ["out"]},
+        "params": {"repetitions": {"type": "number", "defaultValue": 2}},
+        "encapsulates_child_init": True,
+        "recursive": True,
+        "init": _module_list_init,
+        "forward": _module_list_forward,
+    },
 }
 
-
-UNSUPPORTED_TYPES: dict[str, str] = {
-    # 键 repeat_layer 只指控制流「重复块」容器；张量 torch.repeat 走 repeat_tensor（NODE_TABLE）。
-    "repeat_layer": "控制流节点（重复块）暂不支持服务端导出",
-    "module_list": "控制流节点（模块列表）暂不支持服务端导出",
-}
 
 # ---------------------------------------------------------------------------
 # module_ref：内联模块包代码
@@ -1215,20 +1354,41 @@ def compile_graph(
     sorted_ids += [n["id"] for n in nodes if n["id"] not in sorted_ids]
     node_map = {n["id"]: n for n in nodes}
 
+    # 容器的**内部边界边**（容器与它自己的直接子节点之间的 in-internal / out-internal 连线）
+    # 不算容器的输入/输出边——否则容器 forward 的末行会写成内部边的名字、整图找不到输出节点，
+    # 导出代码会 `return x`（模型不接输入）。子节点一侧不受影响（其子集合为空）。
+    # 与前端 codeCompile.ts 的 isInternalBoundary 同口径。
+    children_of: dict[str, set[str]] = {}
+    for n in nodes:
+        pid = n.get("parentId")
+        if pid:
+            children_of.setdefault(pid, set()).add(n["id"])
+
+    def _is_internal_boundary(edge: dict, owner_id: str) -> bool:
+        kids = children_of.get(owner_id)
+        if not kids:
+            return False
+        other = edge.get("source") if edge.get("target") == owner_id else edge.get("target")
+        return other in kids
+
     incoming: dict[str, list[dict]] = {n["id"]: [] for n in nodes}
     outgoing: dict[str, list[dict]] = {n["id"]: [] for n in nodes}
     for e in edges:
-        if e.get("target") in incoming:
+        if e.get("target") in incoming and not _is_internal_boundary(e, e["target"]):
             incoming[e["target"]].append(e)
-        if e.get("source") in outgoing:
+        if e.get("source") in outgoing and not _is_internal_boundary(e, e["source"]):
             outgoing[e["source"]].append(e)
 
     # 3. 种子行：无入边节点的每条出边 ← 模块输入 x
+    #    子节点（父在本图内）不铺种子——与前端 `parentIsPresent` 同口径，交给容器
     seed_lines: list[str] = []
     for n in nodes:
-        if not incoming[n["id"]]:
-            for e in outgoing[n["id"]]:
-                seed_lines.append(f"        {_edge_var_name(e)} = x  # input passthrough")
+        if incoming[n["id"]]:
+            continue
+        if n.get("parentId") in node_map:
+            continue
+        for e in outgoing[n["id"]]:
+            seed_lines.append(f"        {_edge_var_name(e)} = x  # input passthrough")
 
     # 4. init / forward 行
     init_lines: list[str] = []
@@ -1240,36 +1400,43 @@ def compile_graph(
         node_type = node.get("type")
         data = node.get("data") if isinstance(node.get("data"), dict) else {}
 
-        if node.get("parentId"):
-            raise ExportError(
-                f"节点 {nid}：嵌套子节点（容器内部图）暂不支持服务端导出"
-            )
-        if node_type in UNSUPPORTED_TYPES:
-            raise ExportError(
-                f"节点 {nid}：{UNSUPPORTED_TYPES[node_type]}（类型 {node_type}）"
-            )
+        # 子节点（父节点在本图内）：init 照常在外层生成（除非父声明 encapsulates_child_init），
+        # forward 一律不生成、也不写 node_output_map —— 与前端 compileGraphToScript 同口径。
+        parent_node = node_map.get(node.get("parentId")) if node.get("parentId") else None
+        parent_type = parent_node.get("type") if parent_node else None
+        parent_encapsulates = bool(
+            parent_type in NODE_TABLE and NODE_TABLE[parent_type].get("encapsulates_child_init"))
+        should_init = parent_node is None or not parent_encapsulates
+        should_forward = parent_node is None
 
         if node_type == "module_ref":
-            init_lines.append(f"        {_module_ref_init(nid, data, class_renames)}")
-            forward_lines.append(
-                _forward_line(node_type, data, nid, layer_name, incoming, outgoing, node_output_map)
-            )
+            if should_init:
+                init_lines.append(f"        {_module_ref_init(nid, data, class_renames)}")
         elif node_type in NODE_TABLE:
-            init_lines.append(f"        {NODE_TABLE[node_type]['init'](data, layer_name)}")
-            forward_lines.append(
-                _forward_line(node_type, data, nid, layer_name, incoming, outgoing, node_output_map)
-            )
+            if should_init:
+                init_fn = NODE_TABLE[node_type]["init"]
+                if NODE_TABLE[node_type].get("recursive"):
+                    init_lines.append(f"        {init_fn(data, layer_name, class_renames)}")
+                else:
+                    init_lines.append(f"        {init_fn(data, layer_name)}")
         else:
             raise ExportError(
                 f"节点 {nid} 的类型 {node_type} 暂不支持导出代码"
                 "（拆解 ir 图由 generate() 分派到模块四 IR 再生成链路，不经本引擎）"
             )
+        if should_forward:
+            forward_lines.append(
+                _forward_line(node_type, data, nid, layer_name, incoming, outgoing, node_output_map)
+            )
 
     # 5. 返回变量：顶层无出边节点的输出（单输出直接返回，多输出返回元组）
     terminal_outputs: list[str] = []
     for nid in sorted_ids:
-        if not outgoing[nid]:
-            terminal_outputs.extend(node_output_map.get(nid, []))
+        if outgoing[nid]:
+            continue
+        if node_map[nid].get("parentId") in node_map:
+            continue  # 子节点不算顶层输出（与前端 terminal 判定同口径）
+        terminal_outputs.extend(node_output_map.get(nid, []))
     if len(terminal_outputs) == 1:
         return_var = terminal_outputs[0]
     elif len(terminal_outputs) > 1:
@@ -1336,6 +1503,25 @@ def is_ir_graph(graph: dict) -> bool:
     )
 
 
+def _all_nodes_deep(nodes: list) -> list[dict]:
+    """深度遍历：顶层节点 + 各容器 `data.internalNodes` 里的节点（容器可嵌套）。
+
+    模块内联块必须把容器内部图里的 `module_ref` 一并收集——否则生成的代码会引用
+    一个没有被内联出来的类（容器支持前不存在这个问题，因为整类图都被拒了）。
+    """
+    out: list[dict] = []
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        out.append(n)
+        data = n.get("data")
+        if isinstance(data, dict):
+            inner = data.get("internalNodes")
+            if isinstance(inner, list):
+                out.extend(_all_nodes_deep(inner))
+    return out
+
+
 def generate(graph: dict) -> str:
     """GraphIR v2 → 自包含 PyTorch 代码（class GeneratedModel）。
 
@@ -1366,7 +1552,7 @@ def generate(graph: dict) -> str:
     seen: set[str] = set()
     used_classes: set[str] = set()
     class_renames: dict[str, dict[str, str]] = {}
-    for n in nodes:
+    for n in _all_nodes_deep(nodes):
         if n.get("type") != "module_ref":
             continue
         data = n.get("data") if isinstance(n.get("data"), dict) else {}
