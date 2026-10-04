@@ -527,10 +527,23 @@ def main() -> int:
                  "种入本地模块后重载（项目列表）")
         check("本地同名模块已种入 localStorage", True, LOCAL_MODULE_ID)
 
+        # 先等按钮**元素**真的渲染出来再点：新建模型流程（父项目下拉）会多发一次项目列表请求，
+        # 直接点击会撞上竞态（2026-10-04 实测：4a 紧接 4b 跑时按钮尚未出现就点，导致误判失败）。
+        wait_for(cdp,
+                 "[...document.querySelectorAll('button')]"
+                 ".some(x => (x.textContent || '').includes('＋ 新建模型'))",
+                 True, "项目列表出现「＋ 新建模型」按钮")
         if click_button(cdp, "＋ 新建模型"):
             wait_for(cdp, "document.body.innerText.includes('保存到项目')", True,
                      "新建模型后进入画布视图")
         structured = http_json("/api/projects?project_type=structured")
+        if not structured:
+            # 明确报因，不要抛 max() 的 traceback（最常见原因：预览产物没按本次临时后端地址重建，
+            # 浏览器打到了别的后端；其次是「＋ 新建模型」的交互/文案变化）。
+            print("FATAL: 临时库中没有结构化项目——「＋ 新建模型」没有真的在本脚本的后端建项目。"
+                  "请确认预览产物已按 VITE_API_BASE_URL=<本次临时后端> 重建（非默认端口时脚本会自动重建），"
+                  "以及「＋ 新建模型」的交互是否仍能一次点通。")
+            return 2
         newest = max(structured, key=lambda p: p["created_at"])
         StubHandler.project = newest
         check("画布新建模型进入（结构化项目 ready）", True, newest["project_id"])

@@ -415,6 +415,11 @@ def main() -> int:
             check("新建模型可选父项目（父项目下拉存在）", bool(parent_option), str(parent_option))
 
         # --- 新建模型 → 画布 ---
+        # 先等按钮**元素**真的渲染出来再点（新建模型流程会多发一次项目列表请求，直接点会撞竞态）
+        wait_for(cdp,
+                 "[...document.querySelectorAll('button')]"
+                 ".some(x => (x.textContent || '').includes('＋ 新建模型'))",
+                 True, "项目列表出现「＋ 新建模型」按钮")
         if click_button(cdp, "＋ 新建模型"):
             ok_canvas = wait_for(cdp, "document.body.innerText.includes('保存到项目')", True,
                                  "新建模型后进入画布视图")
@@ -425,6 +430,13 @@ def main() -> int:
                       "画布加载失败" not in body and "尚无画布快照" not in body,
                       f"react-flow 容器={'有' if has_rf else '无'}")
                 structured = http_json("/api/projects?project_type=structured")
+                if not structured:
+                    # 明确报因，不要抛 max() 的 traceback：最常见原因是预览产物没按本次临时后端地址重建
+                    # （浏览器打到了别的后端，项目建在别处），其次是「＋ 新建模型」的交互/文案变了。
+                    print("FATAL: 临时库中没有结构化项目——「＋ 新建模型」没有真的在本脚本的后端建项目。"
+                          "请确认预览产物已按 VITE_API_BASE_URL=<本次临时后端> 重建（非默认端口时脚本会自动重建），"
+                          "以及「＋ 新建模型」的交互是否仍能一次点通。")
+                    return 2
                 newest = max(structured, key=lambda p: p["created_at"])
                 graph = http_json(f"/api/projects/{newest['project_id']}/graph")
                 check("新项目 graph.json 初始为空",
