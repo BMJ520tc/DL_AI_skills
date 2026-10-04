@@ -535,6 +535,33 @@ def _infer_missing_shapes(ir: dict) -> int:
     return filled
 
 
+def _fill_edge_shapes(ir: dict) -> int:
+    """把边上流动的张量形状写入 `edges[].tensor_shape`。
+
+    背景：IR schema 早就有 `tensor_shape` 字段、`ir_to_graphir` 也在消费它（`_edge_kind` 附近），
+    但此前**没有任何写入方**——节点形状有 forward hook 捕获与 op 兜底，边形状一直是 null，
+    画布/查看器拿不到「这条线上流的是什么形状」。
+
+    口径：边上流过的就是**源节点的输出**，取源节点 `output_shape`；缺失时退回 `input_shape`；
+    两者都未知就保持 null（不猜、不臆造）。已存在的值不覆盖（与节点形状的「只补缺」一致）。
+
+    与 `ir_hash` 的关系：`canonical_ir` 的边投影只有 `from`/`to`，`tensor_shape` 不进哈希，
+    因此本次回填**不会**让已验证的 IR 无故变 stale（与 6.6-4「回填不产生 stale」一致）。
+    """
+    filled = 0
+    node_map = nodes_by_id(ir)
+    for e in ir.get("edges") or []:
+        if e.get("tensor_shape"):
+            continue
+        src = node_map.get(e.get("from")) or {}
+        shape = src.get("output_shape") or src.get("input_shape")
+        if not shape:
+            continue
+        e["tensor_shape"] = list(shape)
+        filled += 1
+    return filled
+
+
 def _knowledge_hint(knowledge: dict) -> str:
     """把「任务前带入的知识」（需求六.1、数据设计三.3）渲染为 prompt 附注，限长避免挤占上下文。"""
     lines: list[str] = []
@@ -650,18 +677,19 @@ async def _run_trace(params: dict, task_id: str) -> None:
     shapes = json.loads(out_json.read_text(encoding="utf-8"))
     filled = _merge_shapes(ir, shapes)
     inferred = _infer_missing_shapes(ir)  # op 节点兜底（hook 抓不到）
+    edges_filled = _fill_edge_shapes(ir)  # 边形状（此前无写入方，见该函数 docstring）
     _write_ir(project, ir)
     knowledge_service.record_run({
         "project_id": project_id, "task_id": task_id, "run_type": "decompose_trace",
         "command": command, "status": "success",
         "metrics": {"captured_paths": len(shapes.get("shapes", shapes)) if isinstance(shapes, dict) else 0,
-                    "filled": filled, "inferred": inferred},
+                    "filled": filled, "inferred": inferred, "edges_filled": edges_filled},
         "artifact_path": str(out_json),
         "started_at": started, "finished_at": _now(),
     })
     task_manager.update_progress(task_id, {
         "captured_paths": len(shapes.get("shapes", shapes)) if isinstance(shapes, dict) else 0,
-        "filled": filled, "inferred": inferred,
+        "filled": filled, "inferred": inferred, "edges_filled": edges_filled,
     })
 
 
