@@ -4,6 +4,12 @@
 模板写入结构化项目工作区 runs/<task_id>/ → 经 proc_util 在**项目独立环境**执行 →
 指标 JSON → run_record（run_type=train）落库。任务经 task_manager 排队轮询。
 
+画布图分两类，均经 `network_export.generate` 这**一个**出口出码（导出即所存即所训）：
+标准画布图走画布引擎；拆解 ir 图（节点 type="ir"）走模块四 IR 链路
+（`graphir_to_ir` → `ir_codegen.generate`），故画布上的调参同样体现在训练所用代码里。
+ir 图缺字段/结构不合法 → `ExportError`：导出端点 400，训练入口也在入队前拦成 400
+（不让用户等到任务失败才看到原因）。
+
 目标环境：默认复用父原始项目的独立环境（拆解生成的结构化项目），也可显式指定
 其它 original 项目的环境（画布新建的网络没有父项目，必须指定）。环境未就绪一律
 报错引导先走模块一建环境——不静默退回宿主解释器（2.3 独立环境原则）。
@@ -148,6 +154,19 @@ def start_run(project_id: str, body: dict) -> str:
             f"环境未就绪：项目 {env_project_id} 还没有独立运行环境——"
             f"请先走模块一建环境（POST /api/projects/{env_project_id}/env），完成后再发起训练"
         )
+
+    # 拆解 ir 图：入队前先跑一次同源再生成（与导出端点同一个函数，导出即所训）。
+    # 缺字段/结构不合法/IR 不完整 → 400 + 定位到节点/字段的原因；
+    # 标准画布图保持既有行为（不在入队前介入，错误由任务失败透出）。
+    try:
+        graph = _graph(project)
+    except LookupError:
+        graph = None
+    if graph is not None and network_export.is_ir_graph(graph):
+        try:
+            network_export.generate(graph)
+        except network_export.ExportError as e:
+            raise ValueError(str(e)) from e
 
     params = {
         "project_id": project_id,

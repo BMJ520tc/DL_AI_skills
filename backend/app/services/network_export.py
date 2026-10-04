@@ -7,10 +7,14 @@
   节点代码模板见 `NODE_TABLE`（与前端各节点 getInitCode/getForwardCode 对应）。
 - module_ref 节点：内联模块包的代码文件（`module.py`；v4 之前的历史包为 `model.py`，两者都探测），
   实例化无参调用；画布上改过固化的参数则拒绝导出（不静默丢弃用户修改）。
+- 拆解 ir 图（节点 `type="ir"`，出自模块四入库的结构化项目）：`generate()` 分派到
+  `ir_graphir.graphir_to_ir`（画布还原为模块四 IR，画布调参/层级/连线都体现在结果里）
+  → `ir_codegen.generate`，末尾追加训练模板契约的 `GeneratedModel` 入口。
+  导出与训练都经本函数，故「导出即所存即所训」对 ir 图同样成立（7.5）。
 - 前端画布导出与训练运行共用本引擎——导出即所训，两端一致。
 
 纯函数、无 IO（module.py 读取除外）、无 subprocess；同图恒产出同代码。
-不支持的图（控制流节点 / 拆解视图 ir 节点 / 本地模块）抛 `ExportError`，
+不支持的图（控制流节点 / 本地模块 / ir 与标准节点混拼）抛 `ExportError`，
 message 面向用户，禁止静默产出错误代码。
 """
 from __future__ import annotations
@@ -20,7 +24,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from app.services import knowledge_service
+from app.services import ir_codegen, ir_graphir, knowledge_service
 
 HEADER = "import torch\nimport torch.nn as nn"
 MAIN_CLASS = "GeneratedModel"
@@ -1233,7 +1237,7 @@ def compile_graph(
         else:
             raise ExportError(
                 f"节点 {nid} 的类型 {node_type} 暂不支持导出代码"
-                "（拆解视图 ir 节点请走模块四的再生成代码链路）"
+                "（拆解 ir 图由 generate() 分派到模块四 IR 再生成链路，不经本引擎）"
             )
 
     # 5. 返回变量：顶层无出边节点的输出（单输出直接返回，多输出返回元组）
@@ -1254,16 +1258,81 @@ def compile_graph(
 # 入口：GraphIR → 完整代码
 # ---------------------------------------------------------------------------
 
+def _with_entry_class(code: str, root_id: str) -> str:
+    """在再生成代码末尾追加 `GeneratedModel` 入口（委托根节点类 `Decomp_<root>`）。
+
+    `templates/train.py` 只要求能从 model.py import 出 `GeneratedModel`；导出代码
+    也带这个入口，于是**同一份代码**既能在画布上查看、又能直接落地训练，且是
+    可直接实例化的自包含模型（模块四的 `Decomp_*` 类本身不含统一入口）。
+    """
+    entry = (
+        f"class {MAIN_CLASS}(nn.Module):\n"
+        '    """画布拆解图入口：委托根节点类（与模块四再生成同源；训练模板只认该类名）。"""\n'
+        "    def __init__(self):\n"
+        "        super().__init__()\n"
+        f"        self.root = Decomp_{root_id}()\n"
+        "\n"
+        "    def forward(self, x):\n"
+        "        return self.root(x)\n"
+    )
+    return code.rstrip("\n") + "\n\n\n" + entry
+
+
+def generate_ir(graph: dict) -> str:
+    """拆解 ir 图（GraphIR v2，全部节点 type="ir"）→ 自包含 PyTorch 代码。
+
+    链路：`ir_graphir.graphir_to_ir(graph)`（画布 → 模块四 IR；**画布上的调参、层级、
+    连线都体现在结果里**）→ `ir_codegen.generate(ir)` → 追加 `GeneratedModel` 入口。
+    与标准节点路径共用 `generate()` 这一个出口，故导出端点、训练链路、版本对比看到的
+    都是同一份代码（「导出即所存即所训」）。
+
+    失败一律抛 `ExportError`（缺字段/结构不合法/IR 不完整），message 定位到节点/字段。
+    """
+    try:
+        ir = ir_graphir.graphir_to_ir(graph)
+    except ir_graphir.GraphIRMappingError as e:
+        raise ExportError(f"拆解 ir 图无法还原为 IR：{e}") from e
+    try:
+        code = ir_codegen.generate(ir)
+    except ir_codegen.IrIncompleteError as e:
+        raise ExportError(f"拆解 ir 图无法再生成代码：{e}") from e
+    return _with_entry_class(code, ir["root_id"])
+
+
+def is_ir_graph(graph: dict) -> bool:
+    """是否拆解 ir 图（存在节点且全部为 `type="ir"`；空图/混拼图都不算）。"""
+    if not isinstance(graph, dict):
+        return False
+    nodes = graph.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        return False
+    return all(
+        isinstance(n, dict) and n.get("type") == ir_graphir.IR_NODE_TYPE for n in nodes
+    )
+
+
 def generate(graph: dict) -> str:
     """GraphIR v2 → 自包含 PyTorch 代码（class GeneratedModel）。
 
     输出布局与前端 recursiveCodeGenerator 一致：
     import 头 + 各被引用模块的内联代码块 + 主类。
+    拆解 ir 图在此分派到模块四 IR 再生成链路（`generate_ir`），标准画布图走原路径不变。
     """
     nodes = graph.get("nodes")
     edges = graph.get("edges")
     if not isinstance(nodes, list) or not isinstance(edges, list):
         raise ExportError("非法 GraphIR：需含 nodes/edges 数组")
+
+    ir_nodes = [n for n in nodes if isinstance(n, dict) and n.get("type") == ir_graphir.IR_NODE_TYPE]
+    if ir_nodes:
+        standard = [n for n in nodes if not (isinstance(n, dict) and n.get("type") == ir_graphir.IR_NODE_TYPE)]
+        if standard:
+            raise ExportError(
+                f"画布图同时含拆解 ir 节点（{len(ir_nodes)} 个）与标准画布节点（{len(standard)} 个）："
+                "两类节点走不同再生成引擎（ir 节点走模块四 IR 链路，标准节点走画布引擎），"
+                "不能混在同一张图里导出/训练；请把其中一类拆到另一张图，或删除多余节点"
+            )
+        return generate_ir(graph)
 
     # 先收集模块内联块（排重、保持引用顺序），失败即整体拒绝。
     # 不同模块的内联类可能同名（模块四按 `Decomp_<节点 id>` 命名，根节点 id 常相同）——
