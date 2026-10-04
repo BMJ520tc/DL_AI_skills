@@ -54,6 +54,33 @@ def test_credentials_clear(app_client, monkeypatch, tmp_path):
     assert not path.is_file()
 
 
+def test_credentials_blank_key_keeps_existing_and_updates_fields(app_client, monkeypatch, tmp_path):
+    """表单口径：已配置时留空密钥 = 保留现有密钥，只更新其余字段（UI 文案承诺）。"""
+    path = _isolate_credentials(monkeypatch, tmp_path)
+    app_client.put("/api/settings/credentials",
+                   json={"api_key": "sk-old-5678", "base_url": "https://old.example", "model": "old-model"})
+
+    resp = app_client.put("/api/settings/credentials",
+                          json={"api_key": "", "base_url": "https://new.example", "model": "new-model"})
+    body = resp.json()
+    assert body["configured"] is True
+    assert body["key_mask"] == "***5678"  # 旧密钥保留
+    assert body["base_url"] == "https://new.example"  # 其余字段已更新
+    assert body["model"] == "new-model"
+
+    saved = path.read_text(encoding="utf-8")
+    assert "sk-old-5678" in saved and "https://new.example" in saved
+
+
+def test_credentials_blank_key_without_existing_stays_unconfigured(app_client, monkeypatch, tmp_path):
+    """无现有密钥时留空 key + 其余字段 → 落盘无 key，状态仍未配置（无密钥不得静默算已配置）。"""
+    path = _isolate_credentials(monkeypatch, tmp_path)
+    resp = app_client.put("/api/settings/credentials",
+                          json={"api_key": "", "base_url": "https://x.example", "model": "m"})
+    assert resp.json()["configured"] is False
+    assert "api_key" not in path.read_text(encoding="utf-8")
+
+
 def test_credentials_env_source_shows_configured(app_client, monkeypatch, tmp_path):
     _isolate_credentials(monkeypatch, tmp_path)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
