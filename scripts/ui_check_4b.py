@@ -16,7 +16,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -33,11 +35,29 @@ BACKEND = ROOT / "backend"
 FRONTEND = ROOT / "frontend"
 EDGE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 
-BACKEND_PORT = 8000
-PREVIEW_PORT = 5199
-CDP_PORT = 9222
+# 端口可用 UI_CHECK_*_PORT 覆盖：本机可能已有真实后端跑在默认 8000 上。
+BACKEND_PORT = int(os.environ.get("UI_CHECK_BACKEND_PORT", "8000"))
+PREVIEW_PORT = int(os.environ.get("UI_CHECK_PREVIEW_PORT", "5199"))
+CDP_PORT = int(os.environ.get("UI_CHECK_CDP_PORT", "9222"))
 APP_URL = f"http://127.0.0.1:{PREVIEW_PORT}/"
 BACKEND_URL = f"http://127.0.0.1:{BACKEND_PORT}"
+
+
+def _assert_port_free(port: int, what: str) -> None:
+    """端口已被占用时必须中止（否则会连上别人的进程，把自检数据写进真实库）。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        if sock.connect_ex(("127.0.0.1", port)) == 0:
+            raise SystemExit(
+                f"FATAL: {what} 端口 {port} 已被占用——本脚本需要独占该端口启动临时库后端/预览服务，"
+                f"连到别人的进程会把自检数据写进真实库。请先释放端口，或用环境变量换端口："
+                f"UI_CHECK_BACKEND_PORT / UI_CHECK_PREVIEW_PORT / UI_CHECK_CDP_PORT。"
+            )
+
+
+_assert_port_free(BACKEND_PORT, "临时库后端")
+_assert_port_free(PREVIEW_PORT, "预览服务")
+_assert_port_free(CDP_PORT, "无头浏览器调试")
 
 # --headful：用可见的 Edge 窗口跑（人眼核 + 截图）；默认无头。截图一律落 data/_acceptance/shots/
 HEADFUL = "--headful" in sys.argv

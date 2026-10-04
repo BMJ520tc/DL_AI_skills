@@ -20,7 +20,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -35,11 +37,35 @@ BACKEND = ROOT / "backend"
 FRONTEND = ROOT / "frontend"
 EDGE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 
-BACKEND_PORT = 8000
-PREVIEW_PORT = 5199
-CDP_PORT = 9222
+# 端口可用 UI_CHECK_*_PORT 覆盖：本机可能已有真实后端跑在默认 8000 上。
+BACKEND_PORT = int(os.environ.get("UI_CHECK_BACKEND_PORT", "8000"))
+PREVIEW_PORT = int(os.environ.get("UI_CHECK_PREVIEW_PORT", "5199"))
+CDP_PORT = int(os.environ.get("UI_CHECK_CDP_PORT", "9222"))
 APP_URL = f"http://127.0.0.1:{PREVIEW_PORT}/"
 BACKEND_URL = f"http://127.0.0.1:{BACKEND_PORT}"
+
+
+def _assert_port_free(port: int, what: str) -> None:
+    """端口已被占用时必须中止。
+
+    本脚本要在这些端口上起**自己的临时库后端 / 预览服务 / 无头浏览器**。若端口已被别人占用
+    （例如用户本机正在跑真实后端 :8000），脚本会连上那个进程——自检数据就写进了**真实库**
+    （2026-10-04 实际发生过：ui_check_4a 连到真实后端并建了一个结构化项目）。
+    故改为「先探测、占用即中止」，并用 UI_CHECK_*_PORT 换端口。
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        if sock.connect_ex(("127.0.0.1", port)) == 0:
+            raise SystemExit(
+                f"FATAL: {what} 端口 {port} 已被占用——本脚本需要独占该端口启动临时库后端/预览服务，"
+                f"连到别人的进程会把自检数据写进真实库。请先释放端口，或用环境变量换端口："
+                f"UI_CHECK_BACKEND_PORT / UI_CHECK_PREVIEW_PORT / UI_CHECK_CDP_PORT。"
+            )
+
+
+_assert_port_free(BACKEND_PORT, "临时库后端")
+_assert_port_free(PREVIEW_PORT, "预览服务")
+_assert_port_free(CDP_PORT, "无头浏览器调试")
 
 PAPER_ID = "ui4a-paper-0001"
 DATASET_ID = "ui4a-ds-0001"
