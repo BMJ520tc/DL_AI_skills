@@ -837,21 +837,47 @@ def _param_count_of(verification: dict) -> Optional[int]:
 
 async def _run_ingest(params: dict, task_id: str) -> None:
     project_id = params["project_id"]
+    started = _now()
+
+    def _record_fail(reason: str) -> None:
+        """失败也要留 run_record（架构九.4：失败可检索供 agent 改进）。
+
+        与同章 decompose/trace/verify 同口径：入库链路每一处失败（IR 缺失/不完整、
+        验证未过或不新鲜、写盘失败）都**先记一条 failed、再原样抛出**，
+        异常类型与消息不变，调用方（task_manager）行为不受影响。
+        """
+        knowledge_service.record_run({
+            "project_id": project_id, "task_id": task_id, "run_type": "module_ingest",
+            "command": "module package → MODULES_DIR", "status": "failed", "error": reason,
+            "started_at": started, "finished_at": _now(),
+        })
+
     project = _require_original(project_id)
     ws = _ws(project)
     ir = _read_ir(project)
     if ir is None:
-        raise RuntimeError("尚未拆解：请先 POST /api/projects/{id}/decompose")
+        reason = "尚未拆解：请先 POST /api/projects/{id}/decompose"
+        _record_fail(reason)
+        raise RuntimeError(reason)
     verification = get_verification(project_id)
     if verification is None:
-        raise RuntimeError("尚未验证：请先 POST /api/projects/{id}/decompose/verify")
+        reason = "尚未验证：请先 POST /api/projects/{id}/decompose/verify"
+        _record_fail(reason)
+        raise RuntimeError(reason)
     if verification.get("overall") != "passed":
-        raise RuntimeError("验证未通过，不能入库；请调整 IR 后重新验证")
+        reason = "验证未通过，不能入库；请调整 IR 后重新验证"
+        _record_fail(reason)
+        raise RuntimeError(reason)
     if verification.get("ir_hash") != ir_hash(ir):
-        raise RuntimeError("IR 已修改（调参）但未重新验证，验证结果已过期；请重新执行 verify")
+        reason = "IR 已修改（调参）但未重新验证，验证结果已过期；请重新执行 verify"
+        _record_fail(reason)
+        raise RuntimeError(reason)
 
-    started = _now()
-    code = ir_codegen.generate(ir)  # 验证已通过，此处不应再缺项；缺则任务失败
+    try:
+        code = ir_codegen.generate(ir)  # 验证已通过，此处不应再缺项；缺则任务失败
+    except Exception as e:  # noqa: BLE001 —— 留痕后再原样抛出（缺项清单仍是 IrIncompleteError）
+        _record_fail(f"IR 不完整，无法再生成代码: {e}")
+        raise
     module_id = "mod_" + _module_signature(ir)
     root = nodes_by_id(ir)[ir["root_id"]]
     param_count = _param_count_of(verification)
@@ -934,7 +960,8 @@ async def _run_ingest(params: dict, task_id: str) -> None:
         # 临时目录 → 正式目录（rename 不创建父目录，先建 module_id 一级）
         package_dir.parent.mkdir(parents=True, exist_ok=True)
         tmp_dir.rename(package_dir)
-    except Exception:
+    except Exception as e:  # noqa: BLE001 —— 先留痕再抛出：补偿自身失败也不会丢掉这次失败记录
+        _record_fail(f"入库失败: {e}")
         if recorded:
             knowledge_service.delete_module(module_id, module_version)  # DB 行已写但包未落盘 → 回滚
         if tmp_dir is not None:
