@@ -57,7 +57,7 @@ Python 的 FastAPI）。`agents/prompts/` 里是交给大模型的任务提示�
 ```powershell
 # 解释器：本仓库当前用 D:\python.exe（Python 3.13，后端依赖 + torch/uvicorn/websockets 齐全）；
 # 若换到带项目内虚拟环境的机器，把下文的 D:\python.exe 换成该环境里的解释器。
-#   后端自动化用例（当前 323 个，全部通过；用 `D:\python.exe -m pytest -o addopts="" -p no:cacheprovider` 可核对，
+#   后端自动化用例（当前 351 个，全部通过；用 `D:\python.exe -m pytest -o addopts="" -p no:cacheprovider` 可核对，
 #   注意 pytest.ini 里有 addopts=-q，命令行再给 -q 会变成 -qq 而不打印统计行）
 D:\python.exe scripts/run_tests.py
 
