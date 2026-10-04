@@ -1,5 +1,4 @@
 import { Background, ReactFlow, type Edge, type IsValidConnection, type Node, type OnConnect, type OnEdgesChange, type OnNodeDrag, type OnNodesChange, type OnSelectionChangeFunc, type ReactFlowInstance } from "@xyflow/react";
-import { useMemo } from "react";
 import { edgeTypes } from "../../../types/edgeTypes";
 import { nodeTypes } from "../../../types/nodeTypes";
 
@@ -40,17 +39,14 @@ export function EditorCanvas({
 }: EditorCanvasProps) {
     // React Flow 默认「选中即抬高」（elevateNodesOnSelect）：选中时把该节点 zIndex 改成 1000、
     // 取消选中又设回 0 —— 这会把 applyGraphIR 按层级深度算好的 zIndex 冲掉，于是「移动过某个
-    // 节点、再点别处」时它会掉到容器之下（看起来被置于最底层）。故关掉它，改为渲染时自行抬高：
-    // 在原有深度 zIndex 上 +5（选中），幅度小于层级间距 10，所以子节点永远仍在其祖先之上。
-    const layeredNodes: Node[] = useMemo(
-        () => nodesForFlow.map(n => ({ ...n, zIndex: (n.zIndex ?? 0) + (n.selected ? 5 : 0) })),
-        [nodesForFlow]
-    );
+    // 节点、再点别处」时它会掉到容器之下（看起来被置于最底层）。故关掉它即可；**不要**再自己
+    // 给「选中的节点」加 zIndex 抬升：React Flow 会把内部节点对象回吐给 onNodesChange，抬升
+    // 会被写回源数据、每次交互叠一次（实测 40→50→55 的慢性漂移）。
     return (
         <div style={{ flex: 1, minWidth: 0, minHeight: 0, position: "relative", overflow: "hidden" }}>
             <div style={{ position: "absolute", inset: "0 0 0 0" }}>
                 <ReactFlow
-                    nodes={layeredNodes}
+                    nodes={nodesForFlow}
                     elevateNodesOnSelect={false}
                     edges={highlightedEdges}
                     onNodesChange={onNodesChange}

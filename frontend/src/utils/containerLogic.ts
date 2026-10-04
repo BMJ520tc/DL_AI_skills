@@ -70,6 +70,18 @@ const getDataSig = (nodeList: Node[]) => {
         })
         .join("||");
 };
+/** 结构化画布（模块四 ir 图）里的容器：模块四把节点分成 module/container/leaf/op 四类，
+ *  前两类能装子节点。画布的容器判定只按 `type`，而 ir 图里**所有**节点的 type 都是 "ir"，
+ *  于是容器一个也认不出来 → 拖动任意节点都会走「找不到父容器」分支、被解除父子关系
+ *  （实测：+10px 的小拖动就让 layer1_0_add 的 parentId 变成 null）。故按 IR 类别补判。 */
+const IR_CONTAINER_KINDS = new Set(["module", "container"]);
+
+export function isContainerNode(node: Node, config: ContainerConfig = DEFAULT_CONTAINER_CONFIG): boolean {
+    if (config.types.has(node.type || "")) return true;
+    const kind = (node.data as { kind?: unknown } | undefined)?.kind;
+    return typeof kind === "string" && IR_CONTAINER_KINDS.has(kind);
+}
+
 export function findBestParent(node: Node, currentNodes: Node[], config: ContainerConfig = DEFAULT_CONTAINER_CONFIG) {
     // A. Calculate the Dragged Node's Absolute Geometry
     const nodeAbsPos = getAbsolutePosition(node, currentNodes);
@@ -84,8 +96,8 @@ export function findBestParent(node: Node, currentNodes: Node[], config: Contain
 
     // B. Find All Potential Parents
     const candidates = currentNodes.filter(potentialParent => {
-        // 1. Must be a Container
-        if (!config.types.has(potentialParent.type || "")) return false;
+        // 1. Must be a Container（含 ir 图的 module/container 节点，见 isContainerNode）
+        if (!isContainerNode(potentialParent, config)) return false;
 
         // 2. Cannot be itself
         if (potentialParent.id === node.id) return false;
@@ -132,6 +144,16 @@ function depthZIndex(parentId: string | undefined, all: Node[]): number {
     return 10 + depth * 10;
 }
 
+/** 赋值规则：**只升不降**。
+ *
+ * `assignParent` 在「拖动后节点中心不再落在容器框内」时会解除父子关系（基底行为）；
+ * 若此时把 zIndex 一并重置回根档，节点就会掉到原来的容器之下——看起来像「一选中/一挪动
+ * 就消失了」。而已有节点本来就在容器之上，没有任何理由因为一次拖动把它降下去。
+ * 新节点（没有 zIndex）仍按深度取根档 10，避免压在所有已载入节点之下。 */
+function zAtLeast(node: Node, wanted: number): number {
+    return Math.max(node.zIndex ?? 0, wanted);
+}
+
 export function assignParent(
     node: Node,
     currentNodes: Node[],
@@ -153,7 +175,7 @@ export function assignParent(
                 parentId: undefined,
                 extent: undefined,
                 position: nodeAbs,
-                zIndex: depthZIndex(undefined, currentNodes),
+                zIndex: zAtLeast(node, depthZIndex(undefined, currentNodes)),
                 // Position is already absolute for new drops
             };
         }
@@ -171,17 +193,17 @@ export function assignParent(
                 x: nodeAbs.x - parentAbs.x,
                 y: nodeAbs.y - parentAbs.y,
             },
-            zIndex: depthZIndex(targetParent.id, currentNodes),
+            zIndex: zAtLeast(node, depthZIndex(targetParent.id, currentNodes)),
         };
     }
     const nodeAbs = node.parentId ? getAbsolutePosition(node, currentNodes) : node.position;
-    // 拖出容器的节点回到根层级，zIndex 同步回到根档（否则会带着较深的值浮在其他根节点之上）
+    // 拖出容器的节点按「只升不降」处理：保留原层级值（详见 zAtLeast 的说明）
     return {
         ...node,
         parentId: undefined,
         extent: undefined,
         position: nodeAbs,
-        zIndex: depthZIndex(undefined, currentNodes),
+        zIndex: zAtLeast(node, depthZIndex(undefined, currentNodes)),
     };
 }
 export function syncContainerData(
