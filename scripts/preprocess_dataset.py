@@ -27,6 +27,10 @@ from pathlib import Path
 
 UNIFIED_COLUMNS = ("id", "split", "label", "input")
 META_PREFIX = "meta_"
+# 标识/语义列：id 与 label 都不参与缺失值填充与 IQR 截断（口径见 clean 的 docstring）。
+# 统一 schema 里这两列的名字由 UNIFIED_COLUMNS 固定，故此处取同一约定。
+ID_COLUMN = "id"
+LABEL_COLUMN = "label"
 
 INPUT_ALIASES = ("input", "image", "img", "path", "file", "filename", "filepath",
                  "text", "sentence", "sequence", "seq")
@@ -364,8 +368,15 @@ def _looks_like_sequence(values: list[str]) -> bool:
     return alpha_ratio >= 0.8 and median_len >= 10
 
 
-def unify(rows: list[dict], columns: list[str]) -> tuple[list[dict], dict, dict]:
-    """映射到统一 schema；返回 (统一行, field_mapping, labels)。"""
+def unify(rows: list[dict], columns: list[str]) -> tuple[list[dict], dict, dict, list[dict]]:
+    """映射到统一 schema；返回 (统一行, field_mapping, labels, warnings)。
+
+    列名定位失败时**不静默**：定位不到输入列时统一行的 input 会整列为空字符串，
+    此时在 warnings 里登记 {"code": "missing_input_column", ...}，并带上原始列名（columns）、
+    可接受的别名（candidates，即 INPUT_ALIASES）与受影响行数，供人工复核与告警。
+    warnings 是新增的第 4 项（追加在末尾）；调用方 `run()` 已配套修改，并把非空告警
+    落进 dataset.schema.json 的 alignment.warnings。
+    """
     col_in = _match_alias(columns, INPUT_ALIASES)
     col_label = _match_alias(columns, LABEL_ALIASES)
     col_id = _match_alias(columns, ID_ALIASES)
@@ -374,6 +385,16 @@ def unify(rows: list[dict], columns: list[str]) -> tuple[list[dict], dict, dict]
     field_mapping: dict[str, str] = {}
     unified: list[dict] = []
     raw_labels: list[str] = []
+    warnings: list[dict] = []
+    if col_in is None:
+        # 不静默：否则用户拿到的是 input 全空的数据集却看不出问题
+        warnings.append({
+            "code": "missing_input_column",
+            "message": "未能从原始列中定位输入列（input），统一 schema 的 input 将全部为空字符串",
+            "columns": [str(c) for c in columns],
+            "candidates": list(INPUT_ALIASES),
+            "affected_rows": len(rows),
+        })
 
     for idx, row in enumerate(rows):
         out: dict = {}
@@ -408,7 +429,7 @@ def unify(rows: list[dict], columns: list[str]) -> tuple[list[dict], dict, dict]
         for out in unified:
             if out["label"]:
                 out["label"] = canonical[out["label"].casefold()]
-    return unified, field_mapping, label_merge
+    return unified, field_mapping, label_merge, warnings
 
 
 def normalize_units(unified: list[dict], columns: list[str]) -> tuple[list[dict], list[str], dict]:
@@ -489,14 +510,34 @@ def normalize_sequences(unified: list[dict]) -> tuple[list[dict], dict | None, i
 
 
 def clean(unified: list[dict], columns: list[str]) -> tuple[list[dict], dict]:
-    """清洗：去重、缺失值、异常值。返回 (清洗后行, 统计)。"""
-    stats = {"duplicates_removed": 0, "rows_dropped_missing": 0, "filled": {}, "outliers_clipped": {}}
+    """清洗：去重、缺失值、异常值。返回 (清洗后行, 统计)。
+
+    口径（标识/语义列不参与数值修补，与既有 id 处理保持一致）：
+    - **id 与 label 不参与缺失值填充，也不参与 IQR 异常值截断。** 对 id 补值/裁剪会伪造或重复
+      主键（数值型 id 被填成中位数即重复）；label 是类别语义，填众数等于凭空造类别
+      （把缺失样本划进多数类），IQR 截断会改写类别取值（数值型 label 被压到分位边界）。
+    - 整行缺失比例判据**沿用既有口径不变**（分母为除 id 外的列、含 label，>50% 才删行）：
+      label 缺失的行按该判据决定去留，保留下来就保持为空，绝不用众数伪造。
+    - 去重的「内容字段」也**沿用既有口径不变**：除 id 外的全部字段（含 label、split 与 meta_*）。
+    - 统计口径：`excluded_from_fill_and_clip` 列出未参与填充/截断的列；`label_missing` 如实记录
+      清洗后 label 仍为空的行数；`filled` / `outliers_clipped` 里不会出现这两列，
+      可据此复核「label 没有被众数填充、也没有被 IQR 截断」。
+    """
+    stats = {
+        "duplicates_removed": 0,
+        "rows_dropped_missing": 0,
+        "filled": {},
+        "outliers_clipped": {},
+        "excluded_from_fill_and_clip": [],
+        "label_missing": 0,
+    }
 
     # 去重：以内容字段的哈希为键（排除生成的 id，否则行号不同会导致重复行无法识别）
+    # 注意：内容字段含 label 与 meta_*，只有 meta 列不同的行哈希不同，不会被误判为重复
     seen: set[str] = set()
     deduped: list[dict] = []
     for row in unified:
-        content = {k: v for k, v in row.items() if k != "id"}
+        content = {k: v for k, v in row.items() if k != ID_COLUMN}
         key = hashlib.sha1(json.dumps(content, sort_keys=True, default=str).encode("utf-8")).hexdigest()
         if key in seen:
             stats["duplicates_removed"] += 1
@@ -504,9 +545,15 @@ def clean(unified: list[dict], columns: list[str]) -> tuple[list[dict], dict]:
         seen.add(key)
         deduped.append(row)
 
+    # 不参与填充/截断的标识列（只登记实际存在的列，便于复核基数）
+    stats["excluded_from_fill_and_clip"] = [c for c in (ID_COLUMN, LABEL_COLUMN) if c in columns]
+
     # 缺失值：整行缺失 >50% 删除；数值列填中位数、其余填众数
-    # id 列不参与填充/截断——对它补值或裁剪会伪造/重复主键（数值型 id 被填成中位数即重复）
-    value_cols = [c for c in columns if c != "id"]
+    # id 列不参与填充/截断——对它补值或裁剪会伪造/重复主键（数值型 id 被填成中位数即重复）；
+    # label 列同理不参与——填众数会伪造类别、IQR 截断会改写类别边界。
+    # 整行缺失比例沿用既有口径（分母仍为除 id 外的列，含 label），不因新增排除而改变判据。
+    value_cols = [c for c in columns if c != ID_COLUMN]
+    fillable_cols = [c for c in value_cols if c != LABEL_COLUMN]
     kept: list[dict] = []
     for row in deduped:
         missing = sum(1 for c in value_cols if _is_missing(row.get(c)))
@@ -516,12 +563,12 @@ def clean(unified: list[dict], columns: list[str]) -> tuple[list[dict], dict]:
         kept.append(row)
 
     numeric_cols: list[str] = []
-    for c in value_cols:
+    for c in fillable_cols:
         vals = [row.get(c) for row in kept if not _is_missing(row.get(c))]
         if vals and all(_to_float(v) is not None for v in vals):
             numeric_cols.append(c)
 
-    for c in value_cols:
+    for c in fillable_cols:
         present = [row.get(c) for row in kept if not _is_missing(row.get(c))]
         if not present:
             continue
@@ -537,7 +584,7 @@ def clean(unified: list[dict], columns: list[str]) -> tuple[list[dict], dict]:
         if filled:
             stats["filled"][c] = filled
 
-    # 异常值：IQR 1.5 倍，超出者截断到边界并计数
+    # 异常值：IQR 1.5 倍，超出者截断到边界并计数（numeric_cols 已排除 id/label）
     for c in numeric_cols:
         vals = sorted(_to_float(row.get(c)) for row in kept)
         if len(vals) < 4:
@@ -559,6 +606,10 @@ def clean(unified: list[dict], columns: list[str]) -> tuple[list[dict], dict]:
                 clipped += 1
         if clipped:
             stats["outliers_clipped"][c] = clipped
+    # 如实计数：清洗后 label 仍为空的行数（这些行没有被众数填充，保留为空）；
+    # 列集合里没有 label 列时不计（否则会把「无标签数据集」误算成「全部标签缺失」）
+    if LABEL_COLUMN in columns:
+        stats["label_missing"] = sum(1 for row in kept if _is_missing(row.get(LABEL_COLUMN)))
     return kept, stats
 
 
@@ -632,7 +683,7 @@ def run(
     if not rows:
         return _fail(fmt, "未读取到任何数据行")
 
-    unified, field_mapping, label_merge = unify(rows, columns)
+    unified, field_mapping, label_merge, warnings = unify(rows, columns)
     unified_columns = list(UNIFIED_COLUMNS) + [c for c in unified[0] if c.startswith(META_PREFIX)]
     # 顺序：单位换算 → 序列规范 → 清洗（清洗在统一量纲后进行，异常值判定才准确）
     unified, unified_columns, units = normalize_units(unified, unified_columns)
@@ -662,6 +713,9 @@ def run(
         "units": units,
         "version": "1.0",
     }
+    if warnings:
+        # 统一化告警（如未定位到输入列）随 alignment 落进 dataset.schema.json，不静默丢弃
+        summary["alignment"]["warnings"] = warnings
     if image_stats is not None:
         # 图片归一统计（色彩空间/RGB 转换/缩放）落进 alignment.images（5.6 约定结构）
         summary["alignment"]["images"] = image_stats
