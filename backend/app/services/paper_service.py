@@ -104,6 +104,13 @@ def _now() -> str:
 
 
 def _paper_dir(paper_id: str) -> Path:
+    """论文产物目录：`data/papers/<fs_name(paper_id)>/`。
+
+    目录名一律经 `ids.fs_name`（与 `download_service.download_paper` 落盘时同一个函数）：
+    arXiv 号 / `pubmed:456` 这类既有 id 的目录名不变，真实 DOI（`10.1101/2023.10.03.560734`，
+    bioRxiv/medRxiv 检索返回的 paper_id）落成单层的 `10.1101%2F2023.10.03.560734`——
+    写盘与读回同一映射，才不会出现「下载到 A 目录、解析去 B 目录找」。
+    """
     d = PAPERS_DIR / fs_name(paper_id, "paper_id")
     d.mkdir(parents=True, exist_ok=True)
     return d
