@@ -41,8 +41,10 @@ def search(
     return knowledge_service.search(type_list, task_type, model, dataset, q, limit, offset)
 
 
-@router.get("/items/{data_type}/{ref_id}")
+@router.get("/items/{data_type}/{ref_id:path}")
 def get_item(data_type: str, ref_id: str) -> dict:
+    """按主键取条目。`ref_id` 用 `:path` 形态：外部 id 可能是含 `/` 的 DOI
+    （如 bioRxiv 的 `10.1101/2023.10.03.560734`），单段参数在路由层就匹配不到。"""
     try:
         item = knowledge_service.get_item(data_type, ref_id)
     except ValueError as e:
@@ -67,8 +69,9 @@ def confirm_knowledge(knowledge_id: str) -> dict:
     return {"knowledge_id": knowledge_id, "status": "confirmed"}
 
 
-@router.delete("/items/{data_type}/{ref_id}")
+@router.delete("/items/{data_type}/{ref_id:path}")
 def delete_item(data_type: str, ref_id: str) -> dict:
+    """按主键删除条目（`ref_id` 同样用 `:path` 形态以支持含 `/` 的 DOI）。"""
     try:
         deleted = knowledge_service.delete_item(data_type, ref_id)
     except ValueError as e:

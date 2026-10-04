@@ -107,6 +107,32 @@ def _fake_download_dataset(source, source_id, dest):
     return [f]
 
 
+def test_extract_registers_inferred_format_for_downloaded_dataset(isolated_db, monkeypatch, tmp_path):
+    """抽址下载并登记的数据集要如实写入推断出的 format。
+
+    2026-10-04 完备性核查登记的缺口：此处此前恒写 `format: None`，于是「按数据类型检索」
+    （需求三.2）对抽址登记的公开数据集必漏。任务类型在抽址阶段拿不到，仍如实留空。
+    """
+    from app.services import knowledge_service
+
+    dataset_url = "https://zenodo.org/records/42"
+
+    async def fake_agent(prompt, **kwargs):
+        return {"structured_output": {"repositories": [], "datasets": [dataset_url]}}
+
+    monkeypatch.setattr(download_service.agent_service, "run_sync", fake_agent)
+    _patch_dirs(monkeypatch, tmp_path)
+    monkeypatch.setattr(download_service, "download_dataset", _fake_download_dataset)
+
+    task_id = _extract_task()
+    asyncio.run(download_service._run_extract({"paper_text": "正文"}, task_id))
+
+    datasets = knowledge_service.find_datasets(limit=10)
+    assert len(datasets) == 1
+    assert datasets[0]["format"] == "csv"      # _fake_download_dataset 产出 data.csv
+    assert datasets[0]["task_type"] is None    # 抽址阶段无任务类型，不编造
+
+
 def test_extract_clones_all_repos_and_isolates_single_failure(isolated_db, monkeypatch, tmp_path):
     """抽到 2 个仓库 + 1 个数据集：两个仓库都尝试克隆，单个失败不中断其余，失败原因进进度与 run_record。"""
     dataset_url = "https://zenodo.org/records/42"

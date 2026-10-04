@@ -369,18 +369,25 @@ def _register_extracted(datasets: list) -> tuple[list[dict], list[dict]]:
         except Exception as e:  # noqa: BLE001 —— 单个地址失败不影响其余
             failed.append({"url": url, "reason": str(e)})
             continue
+        # 登记格式：按下载文件扩展名**如实推断**（推不出留空并写明原因）。此前恒写 None，
+        # 导致抽址登记的公开数据集「按数据类型检索」必漏（2026-10-04 完备性核查登记）。
+        # 延迟导入：dataset_service 顶层 import 了本模块，函数内导入避免循环。
+        from app.services.dataset_service import infer_format
+
+        fmt, fmt_note = infer_format(list(files))
         dataset_id = knowledge_service.register_dataset({
             "name": f"{source}:{source_id}",
             "url": url,
             "source": source,
-            "task_type": None,
-            "format": None,
+            "task_type": None,  # 抽址阶段拿不到任务类型，不编造
+            "format": fmt,
             "fields": None,
             "labels": None,
             "alignment": None,
             "local_path": str(dest),
         })
-        registered.append({"url": url, "dataset_id": dataset_id, "n_files": len(files)})
+        registered.append({"url": url, "dataset_id": dataset_id, "n_files": len(files),
+                           "format": fmt, "format_note": fmt_note})
     return registered, failed
 
 
