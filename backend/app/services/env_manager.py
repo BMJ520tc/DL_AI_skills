@@ -1,6 +1,12 @@
 """环境管理（模块详细设计 2.3）。
 
 决策树: Dockerfile → 容器（可选扩展，需本机 docker）; environment.yml → conda; 否则 venv。
+容器分支按 2.3 步骤 1「无 docker 时此分支不支持并明确提示」先探测本机 docker：
+探测不到 → 明确提示用 conda/venv；探测到但本仓库没有容器环境创建实现 → 也是明确的可执行报错，
+绝不静默改道、也不假装成功（见 _container_unavailable_reason）。
+版本判断（2.3 步骤 2 与「异常与边界」）:
+  ① 清单/元数据声明的 Python 要求驱动 venv 解释器选择（选不到即告警回退，见 resolve_env_python）；
+  ② 驱动 CUDA 与依赖清单里的 torch/CUDA 要求不匹配 → 记录结论并选 CPU 版 wheel（见 plan_cuda）。
 依赖修正循环: 安装失败 → agent 判断 → 降级/替换/移除 → 重试（上限 3 次）。
 环境创建步骤与每次安装尝试写 run_record(env_install)，报错入 error 字段（供蒸馏知识提炼，需求六.1）。
 """
@@ -17,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from app.config import CONDA_PATH, ENV_VENV_PYTHON, PIP_FALLBACK_INDEX, PIP_INDEX_URL
-from app.services import agent_service, knowledge_service, proc_util, project_manager, task_manager
+from app.services import agent_service, knowledge_service, proc_util, project_manager, prompts, task_manager
 
 ENV_TASK_TYPE = "env_create"
 INSTALL_TIMEOUT_S = 600  # 单次 pip 安装上限（超时即杀进程树）
@@ -49,6 +55,37 @@ def detect_env_type(workspace: Path) -> str:
     return "venv"
 
 
+def _detect_docker() -> Optional[str]:
+    """探测本机 docker CLI（DOCKER_PATH 可覆盖，口径同 config 的 CONDA_EXE）。
+
+    只探 CLI 是否在 PATH，不连 daemon：设计 2.3 只要求「需本机 docker」这一可用性判据；
+    daemon 未启动会在真正执行容器命令时露出真实报错，不在探测阶段臆断。
+    """
+    return shutil.which(os.getenv("DOCKER_PATH") or "docker")
+
+
+def _container_unavailable_reason() -> str:
+    """容器通道不可用的明确原因（据此给出可执行的下一步）。
+
+    本仓库现状（已核实）：backend/runner.py 是**形状追踪**的独立服务，按预构建镜像
+    `torchlens-worker:latest` 跑 backend/worker.py，并不存在「按项目 Dockerfile 建/运行项目环境」
+    的容器环境创建实现——故探测到 docker 也不能接上，只能如实报错。
+    """
+    docker = _detect_docker()
+    if docker is None:
+        return (
+            "项目带 Dockerfile，需容器环境；但本机未检测到 docker，容器通道不可用；"
+            "请用 conda/venv（提供 environment.yml 或 requirements.txt，"
+            "或设 DOCKER_PATH 指向 docker 可执行文件后重试）"
+        )
+    return (
+        f"项目带 Dockerfile，本机已检测到 docker（{docker}），但本仓库尚未实现容器环境创建："
+        "backend/runner.py 仅是形状追踪的独立服务（按预构建镜像 torchlens-worker:latest 运行 worker.py），"
+        "不按项目 Dockerfile 建/运行项目环境 → 容器通道不可用；请用 conda/venv"
+        "（提供 environment.yml 或 requirements.txt）"
+    )
+
+
 def create_env(project_id: str) -> str:
     project_manager.require_type(project_id, {"original"})
     return task_manager.create_task(ENV_TASK_TYPE, project_id=project_id, params={"project_id": project_id})
@@ -69,7 +106,8 @@ async def _run_env_create(params: dict, task_id: str) -> None:
     env_type = detect_env_type(ws)
 
     if env_type == "container":
-        raise RuntimeError("项目带 Dockerfile，需容器环境；容器通道为可选扩展，当前未启用（默认走 conda/venv）")
+        # 2.3 步骤 1：先探测本机 docker 再决定提示——有 docker 也不假装能建容器环境（如实报错）。
+        raise RuntimeError(_container_unavailable_reason())
 
     env_dir = ws / "env"
     created_at = _now()
@@ -93,14 +131,22 @@ async def _run_env_create(params: dict, task_id: str) -> None:
         )
     if env_type == "conda":
         cmd = _conda_create_cmd(source, env_dir)
+        python_note: dict = {}
     else:
-        # 默认用后端解释器；ENV_VENV_PYTHON 指定其他版本（项目依赖钉旧 Python 时）
-        cmd = [ENV_VENV_PYTHON or sys.executable, "-m", "venv", str(env_dir)]
+        # 语言版本生效（2.3 步骤 2）：清单声明的 Python 要求 → venv 解释器选择；
+        # 选不到匹配解释器时告警回退（不静默），没有要求时行为与旧版一致（后端解释器 / ENV_VENV_PYTHON）。
+        python_cmd, python_note = resolve_env_python(source)
+        cmd = [*python_cmd, "-m", "venv", str(env_dir)]
+    create_params: dict = {"step": "env_create"}
+    if python_note.get("required"):
+        create_params["python_selection"] = python_note
+        if python_note.get("warning"):
+            task_manager.update_progress(task_id, {"env_python": python_note})
     err = await _create_env_dir(env_type, source, env_dir, cmd)
     if err is not None:
         knowledge_service.record_run(
             {"project_id": project_id, "task_id": task_id, "run_type": "env_install",
-             "environment": {"type": env_type}, "params": {"step": "env_create"},
+             "environment": {"type": env_type}, "params": create_params,
              "command": " ".join(cmd), "status": "failed", "error": err,
              "started_at": created_at, "finished_at": _now()}
         )
@@ -110,7 +156,7 @@ async def _run_env_create(params: dict, task_id: str) -> None:
 
     knowledge_service.record_run(
         {"project_id": project_id, "task_id": task_id, "run_type": "env_install",
-         "environment": {"type": env_type}, "params": {"step": "env_create"},
+         "environment": {"type": env_type}, "params": create_params,
          "command": " ".join(cmd), "status": "success",
          "started_at": created_at, "finished_at": _now()}
     )
@@ -219,17 +265,23 @@ async def _install_with_fix(
     pip = _env_pip(env_dir)
     req_file = _find_requirements(source)
     versions = detect_versions(source, _env_python(env_dir))
+    cuda_plan = versions.get("cuda_plan") or {}
+    extra_index_url = None
+    if cuda_plan.get("action") == "cpu_wheel":
+        # CUDA 降级结论必须可见：进任务进度，且随 environment.cuda_plan 进每次安装的 run_record
+        extra_index_url = cuda_plan.get("index")
+        task_manager.update_progress(task_id, {"env_cuda": cuda_plan})
     index_url = PIP_INDEX_URL  # None → 用 pip 自身配置（用户 pip.ini）
 
     for attempt in range(1, 4):
-        result = await _try_install(pip, req_file, index_url)
+        result = await _try_install(pip, req_file, index_url, extra_index_url)
         _record_install(project_id, task_id, attempt, result, versions, env_type)
         if result["ok"]:
             return True
         # 索引不可达（非依赖冲突）：切备源重试一次，不消耗依赖修正循环
         if index_url != PIP_FALLBACK_INDEX and _is_index_error(result["error"]):
             index_url = PIP_FALLBACK_INDEX
-            result = await _try_install(pip, req_file, index_url)
+            result = await _try_install(pip, req_file, index_url, extra_index_url)
             _record_install(project_id, task_id, attempt, result, versions, env_type, step="pip_install_fallback")
             if result["ok"]:
                 return True
@@ -280,15 +332,410 @@ PIP_RETRIES = int(os.getenv("PIP_RETRIES", "5"))
 PIP_TIMEOUT_S = int(os.getenv("PIP_TIMEOUT_S", "120"))
 
 
-def _install_cmd(pip: str, req_file: Path, index_url: Optional[str] = None) -> list[str]:
+def _install_cmd(pip: str, req_file: Path, index_url: Optional[str] = None,
+                 extra_index_url: Optional[str] = None) -> list[str]:
     if req_file.name.lower() in _PROJECT_MANIFESTS:
         cmd = [pip, "install", str(req_file.parent)]  # 安装项目及其声明依赖
     else:
         cmd = [pip, "install", "-r", str(req_file)]
     if index_url:
         cmd += ["--index-url", index_url]
+    if extra_index_url:
+        cmd += ["--extra-index-url", extra_index_url]  # CUDA 不匹配 → CPU 版 wheel 索引
     cmd += ["--retries", str(PIP_RETRIES), "--timeout", str(PIP_TIMEOUT_S)]
     return cmd
+
+
+# ---- 版本判断（2.3 步骤 2）：清单声明的语言/框架/CUDA 版本 —— 纯文本解析，不执行清单 ----
+
+# 框架包名前缀；conda 的 pytorch / pytorch-cuda 归一到 torch
+_FRAMEWORK_PKGS = ("torch", "torchvision", "torchaudio", "tensorflow", "keras", "jax",
+                   "paddlepaddle", "paddle")
+_FRAMEWORK_ALIASES = {"pytorch": "torch", "pytorch-cuda": "torch", "pytorch-gpu": "torch"}
+
+# CPU 版 torch wheel 的额外索引（PEP 440：同一公共版本下 `2.1.2+cpu` 高于 `2.1.2`，
+# 故把 CPU 索引作为额外索引交给 pip，pip 会优先取 CPU 版 wheel；主索引仍可服务其余依赖）。
+CPU_TORCH_INDEX = os.getenv("ENV_CPU_TORCH_INDEX", "https://download.pytorch.org/whl/cpu")
+
+_CUDA_SUFFIX_RE = re.compile(r"\+(cu\d{2,3})\b")
+_CUDA_INDEX_RE = re.compile(r"/(cu\d{2,3})(?=[/\s\"']|$)")
+_CUDA_DEP_RE = re.compile(r"-cu(\d{2})(?=[=<>!~\s\"]|$)")
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", v or ""))
+
+
+def _normalize_version_spec(raw: str) -> Optional[str]:
+    """归一化版本写法为比较式（供 _constraint_ok 判定）:
+    poetry caret `^3.9` → `>=3.9,<4.0`；裸版本/conda `=3.9` → `==3.9.*`；其余原样返回。
+    """
+    s = (raw or "").strip().strip("\"'")
+    if not s:
+        return None
+    if s.startswith("^"):
+        parts = [int(x) for x in re.findall(r"\d+", s[1:])]
+        if not parts:
+            return None
+        if len(parts) == 1:
+            upper = [parts[0] + 1]
+        elif len(parts) == 2:
+            upper = [parts[0] + 1, 0]
+        else:
+            upper = parts[:-1] + [parts[-1] + 1]
+        low = ".".join(str(p) for p in parts)
+        return f">={low},<{'.'.join(str(u) for u in upper)}"
+    if re.fullmatch(r"=?[\d.]+(\.\*)?", s):        # 3.9 / =3.9 / 3.9.*
+        v = s.lstrip("=")
+        return v if v.endswith(".*") else f"=={v}.*"
+    return s
+
+
+def _constraint_ok(version: str, constraint: str) -> bool:
+    """版本是否满足比较式约束（自实现，不新增依赖）。
+
+    宽松口径：`==3.9` 与 `==3.9.*` 都按前缀匹配（清单里 3.9 这种浮点写法很常见）；
+    `~=` 按 PEP 440 展开；解析不出的片段不阻塞判定。
+    """
+    v = _version_tuple(version)
+    if not v:
+        return False
+    for raw in (constraint or "").split(","):
+        c = raw.strip()
+        if not c:
+            continue
+        m = re.match(r"^(==|>=|<=|!=|~=|>|<)\s*([\d.*]+)", c)
+        if not m:
+            continue
+        op, target = m.group(1), m.group(2)
+        if op == "~=":
+            t = _version_tuple(target)
+            if not t:
+                continue
+            upper = t[:-1] + (t[-1] + 1,) if len(t) > 1 else (t[0] + 1,)
+            if not (v >= t and v < upper):
+                return False
+            continue
+        if target.endswith(".*"):
+            prefix = _version_tuple(target[:-2])
+            if not prefix:
+                continue
+            matched = v[:len(prefix)] == prefix
+            if (op == "!=") == matched:      # `==3.9.*` 要求命中前缀，`!=3.9.*` 要求不命中
+                return False
+            continue
+        t = _version_tuple(target)
+        if not t:
+            continue
+        if op == "==":
+            if v[:len(t)] != t:
+                return False
+        elif op == "!=":
+            if v[:len(t)] == t:
+                return False
+        elif op == ">=":
+            if v < t:
+                return False
+        elif op == "<=":
+            if v > t:
+                return False
+        elif op == ">":
+            if v <= t:
+                return False
+        elif op == "<":
+            if v >= t:
+                return False
+    return True
+
+
+def _conda_python_requirement(text: str) -> Optional[str]:
+    """environment.yml 里 `- python=3.9` / `- python>=3.9` / `- python 3.9` → 归一化约束串。"""
+    for line in text.splitlines():
+        m = re.match(r"^\s*-\s*python\s*([=<>!~]+)\s*([0-9][0-9.*]*)\s*$", line)
+        if m:
+            op, ver = m.group(1), m.group(2)
+            if op == "=":
+                return ver if (ver.endswith(".*") or ver.count(".") >= 2) else f"=={ver}.*"
+            return f"{op}{ver}"
+        m = re.match(r"^\s*-\s*python\s+([0-9][0-9.*]*)\s*$", line)
+        if m:
+            ver = m.group(1)
+            return ver if (ver.endswith(".*") or ver.count(".") >= 2) else f"=={ver}.*"
+    return None
+
+
+def _pyproject_python_requirement(text: str) -> Optional[str]:
+    """pyproject.toml 的 `requires-python`（PEP 621）或 poetry 的 `python = "^3.9"`。"""
+    m = re.search(r"requires-python\s*=\s*[\"']([^\"']+)[\"']", text)
+    if m:
+        return m.group(1)
+    m = re.search(r"^\s*python\s*=\s*\{[^}]*?version\s*=\s*[\"']([^\"']+)[\"']", text, re.MULTILINE)
+    if m:
+        return m.group(1)
+    m = re.search(r"^\s*python\s*=\s*[\"']([^\"']+)[\"']", text, re.MULTILINE)
+    return m.group(1) if m else None
+
+
+def _python_requirement(source: Path) -> Optional[dict]:
+    """清单/元数据声明的 Python 版本要求 → {"spec": 归一化约束串, "source": 文件名}。
+
+    读取面（2.3 步骤 2，均纯文本解析、不执行）：pyproject.toml 的 requires-python、
+    setup.py 的 python_requires、environment.yml 的 python=。优先级与决策树一致：venv 类清单在前。
+    """
+    pyp = source / "pyproject.toml"
+    if pyp.exists():
+        spec = _normalize_version_spec(_pyproject_python_requirement(_read_text(pyp)) or "")
+        if spec:
+            return {"spec": spec, "source": "pyproject.toml"}
+    setup = source / "setup.py"
+    if setup.exists():
+        m = re.search(r"python_requires\s*=\s*[\"']([^\"']+)[\"']", _read_text(setup))
+        spec = _normalize_version_spec(m.group(1)) if m else None
+        if spec:
+            return {"spec": spec, "source": "setup.py"}
+    for name in ("environment.yml", "environment.yaml"):
+        yml = source / name
+        if yml.exists():
+            spec = _normalize_version_spec(_conda_python_requirement(_read_text(yml)) or "")
+            if spec:
+                return {"spec": spec, "source": name}
+    return None
+
+
+def _iter_python_interpreter_cmds(spec: str) -> list[list[str]]:
+    """候选解释器命令前缀：先按约束里出现的版本号，再按 3.13→3.7 由高到低（pythonX.Y 与 py -X.Y）。"""
+    wanted: list[tuple[int, int]] = []
+    for major, minor in re.findall(r"(\d+)\.(\d+)", spec or ""):
+        pair = (int(major), int(minor))
+        if pair not in wanted:
+            wanted.append(pair)
+    for minor in range(13, 6, -1):
+        pair = (3, minor)
+        if pair not in wanted:
+            wanted.append(pair)
+    cmds: list[list[str]] = []
+    for major, minor in wanted:
+        cmds.append([f"python{major}.{minor}"])
+        cmds.append(["py", f"-{major}.{minor}"])
+    return cmds
+
+
+def _cmd_python_version(cmd: list[str]) -> Optional[str]:
+    """执行候选解释器命令取版本；命令不存在/超时 → None。"""
+    try:
+        proc = subprocess.run(
+            [*cmd, "-c", "import sys;print(sys.version.split()[0])"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 and proc.stdout.strip() else None
+
+
+def resolve_env_python(source: Path) -> tuple[list[str], dict]:
+    """按清单声明的 Python 要求选 venv 解释器（2.3 步骤 2「语言版本」落地）。
+
+    优先级：ENV_VENV_PYTHON（显式配置）> 满足要求且已在用的后端解释器 > 本机探测到的匹配解释器
+    > 告警回退默认解释器（回退不静默：返回的结论写进任务进度与 run_record）。
+    无 Python 要求时行为与旧版完全一致（后端解释器 / ENV_VENV_PYTHON）。
+    """
+    host = sys.version.split()[0]
+    req = _python_requirement(source)
+    note: dict = {"required": None, "requirement_source": None, "command": None,
+                  "matched": None, "warning": None}
+    if req:
+        note["required"] = req["spec"]
+        note["requirement_source"] = req["source"]
+    if ENV_VENV_PYTHON:
+        note.update(command=[ENV_VENV_PYTHON], origin="ENV_VENV_PYTHON", matched=True)
+        if req:
+            ver = _cmd_python_version([ENV_VENV_PYTHON])
+            if ver and not _constraint_ok(ver, req["spec"]):
+                # 显式配置优先，但不静默：不满足清单要求要如实告警
+                note["matched"] = False
+                note["warning"] = (
+                    f"ENV_VENV_PYTHON 指向的解释器 {ENV_VENV_PYTHON}（{ver}）不满足清单要求 "
+                    f"{req['spec']}（{req['source']}）；仍按显式配置使用，依赖可能装不上"
+                )
+        return [ENV_VENV_PYTHON], note
+    if req is None:
+        note.update(command=[sys.executable], origin="backend", matched=True)
+        return [sys.executable], note
+    if _constraint_ok(host, req["spec"]):
+        note.update(command=[sys.executable], origin="backend", matched=True, version=host)
+        return [sys.executable], note
+    for candidate in _iter_python_interpreter_cmds(req["spec"]):
+        exe = shutil.which(candidate[0])
+        if exe is None:
+            continue
+        cmd = [exe, *candidate[1:]]
+        ver = _cmd_python_version(cmd)
+        if ver and _constraint_ok(ver, req["spec"]):
+            note.update(command=cmd, origin="detected", matched=True, version=ver)
+            return cmd, note
+    note.update(command=[sys.executable], origin="fallback", matched=False,
+                warning=(f"清单要求 Python {req['spec']}（{req['source']}），但本机未找到满足要求的解释器"
+                         f"（候选 pythonX.Y / py -X.Y 均不可用）→ 回退默认解释器 {sys.executable}（{host}），"
+                         "依赖可能装不上；请安装匹配解释器或设 ENV_VENV_PYTHON"))
+    return [sys.executable], note
+
+
+def _framework_from_line(line: str) -> Optional[str]:
+    """单行依赖是否是框架包 → 归一后的包名（小写），否则 None。"""
+    m = re.match(r"^\s*[-*]?\s*([A-Za-z0-9_.\-]+)", line or "")
+    if not m:
+        return None
+    name = m.group(1).lower()
+    name = _FRAMEWORK_ALIASES.get(name, name)
+    return name if name in _FRAMEWORK_PKGS else None
+
+
+def _framework_names_in(frameworks: list[str]) -> set[str]:
+    names = set()
+    for line in frameworks:
+        fw = _framework_from_line(line)
+        if fw:
+            names.add(fw)
+    return names
+
+
+def _add_framework(info: dict, line: str) -> None:
+    """把依赖行按框架包去重收集（同一框架只记第一次出现的清单行）。"""
+    fw = _framework_from_line(line)
+    if fw and fw not in _framework_names_in(info["frameworks"]):
+        info["frameworks"].append(line.strip())
+
+
+def _conda_dependency_lines(text: str) -> list[str]:
+    """environment.yml 的 dependencies 段（含 pip: 子列表）→ 依赖行；跳过 python=/pip/频道行。"""
+    out: list[str] = []
+    in_deps = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if re.match(r"^dependencies\s*:", stripped):
+            in_deps = True
+            continue
+        if not in_deps:
+            continue
+        if not stripped:
+            continue
+        if not stripped.startswith("-"):
+            if not line[:1].isspace():
+                break          # 回到顶层键（channels: 等），dependencies 段结束
+            continue
+        item = stripped.lstrip("-").strip()
+        if not item or item == "pip" or re.match(r"^python\s*[=<>!~]", item):
+            continue
+        out.append(item)
+    return out
+
+
+def _pyproject_dependency_lines(text: str) -> list[str]:
+    """pyproject.toml 的 `dependencies = [...]`（PEP 621）与 `[tool.poetry.dependencies]` 条目。"""
+    out: list[str] = []
+    m = re.search(r"^dependencies\s*=\s*\[(.*?)\]", text, re.DOTALL | re.MULTILINE)
+    if m:
+        out += [s.strip() for s in re.findall(r"[\"']([^\"']+)[\"']", m.group(1))]
+    for m in re.finditer(
+        r"^\s*([A-Za-z0-9_.\-]+)\s*=\s*(?:\{[^}]*?version\s*=\s*)?[\"']([^\"']+)[\"']",
+        text, re.MULTILINE,
+    ):
+        name, ver = m.group(1), m.group(2)
+        if name.lower() in ("python", "name", "version", "description", "readme", "repository",
+                            "requires-python", "license"):
+            continue
+        spec = _normalize_version_spec(ver) or ver
+        out.append(f"{name}{spec}" if spec[:1] in "<>=!~" else f"{name}=={spec}")
+    return out
+
+
+def _setup_install_requires(text: str) -> list[str]:
+    """setup.py 的 install_requires 列表（只读文本解析，不执行）。"""
+    m = re.search(r"install_requires\s*=\s*\[(.*?)\]", text, re.DOTALL)
+    if not m:
+        return []
+    return [s.strip() for s in re.findall(r"[\"']([^\"']+)[\"']", m.group(1))]
+
+
+def _manifest_dependency_lines(source: Path) -> list[str]:
+    """各依赖清单的依赖行（requirements.txt / environment.yml / pyproject.toml / setup.py）。"""
+    lines: list[str] = []
+    req = source / "requirements.txt"
+    if req.exists():
+        lines += [ln.strip() for ln in _read_text(req).splitlines() if ln.strip()]
+    for name in ("environment.yml", "environment.yaml"):
+        yml = source / name
+        if yml.exists():
+            lines += _conda_dependency_lines(_read_text(yml))
+    pyp = source / "pyproject.toml"
+    if pyp.exists():
+        lines += _pyproject_dependency_lines(_read_text(pyp))
+    setup = source / "setup.py"
+    if setup.exists():
+        lines += _setup_install_requires(_read_text(setup))
+    return lines
+
+
+def _cuda_tag_to_version(tag: str) -> Optional[str]:
+    """`cu121` → `12.1`、`cu118` → `11.8`、`cu12` → `12.0`。"""
+    digits = tag[2:]
+    if len(digits) == 3:
+        return f"{digits[:2]}.{digits[2]}"
+    if len(digits) == 2:
+        return f"{digits[0]}.{digits[1]}"
+    return None
+
+
+def _required_cuda(source: Path) -> Optional[dict]:
+    """依赖清单声明的 CUDA 要求 → {"version": "12.1", "source": 文件名}。
+
+    三类写法（文本解析）：torch wheel 后缀 `torch==2.1.2+cu121`、pip 源
+    `--index-url .../whl/cu118`、依赖包名 `nvidia-cuda-runtime-cu12`（只到主版本 → 记 12.0）。
+    """
+    for name in ("requirements.txt", "environment.yml", "environment.yaml",
+                 "pyproject.toml", "setup.py"):
+        p = source / name
+        if not p.exists():
+            continue
+        text = _read_text(p)
+        for regex in (_CUDA_SUFFIX_RE, _CUDA_INDEX_RE, _CUDA_DEP_RE):
+            m = regex.search(text)
+            if m:
+                ver = _cuda_tag_to_version(m.group(1))
+                if ver:
+                    return {"version": ver, "source": name}
+    return None
+
+
+def plan_cuda(source: Path, versions: dict) -> dict:
+    """驱动 CUDA 与依赖要求的判定（2.3「异常与边界」：不匹配 → 记录并降级 CPU 运行）。
+
+    返回结论字典（进 run_record 的 environment.cuda_plan 与任务进度，不静默）：
+    action=None 按默认 wheel 安装；action="cpu_wheel" 时 index 为 CPU 版 wheel 额外索引。
+    """
+    required = _required_cuda(source)
+    driver = versions.get("cuda")
+    if required is None:
+        return {"driver": driver, "required": None, "match": None, "action": None,
+                "reason": "依赖清单未声明 CUDA 版本，按默认 wheel 安装（不做降级）"}
+    if driver and _version_tuple(driver) >= _version_tuple(required["version"]):
+        return {"driver": driver, "required": required["version"],
+                "requirement_source": required["source"], "match": True, "action": None,
+                "reason": f"驱动支持 CUDA {driver} ≥ 依赖要求 {required['version']}，按默认 wheel 安装"}
+    return {"driver": driver, "required": required["version"],
+            "requirement_source": required["source"], "match": False, "action": "cpu_wheel",
+            "index": CPU_TORCH_INDEX,
+            "reason": (f"依赖要求 CUDA {required['version']}（{required['source']}），本机"
+                       + ("未检测到 NVIDIA 驱动（nvidia-smi 不可用）" if not driver
+                          else f"驱动仅支持 CUDA {driver}")
+                       + f" → 降级 CPU 运行：以额外索引 {CPU_TORCH_INDEX} 选 CPU 版 torch wheel")}
 
 
 def _detect_cuda() -> Optional[str]:
@@ -305,30 +752,29 @@ def _detect_cuda() -> Optional[str]:
 def _python_version(python_exe: Optional[str]) -> str:
     """取目标环境解释器版本（非宿主），失败则回退宿主版本。"""
     if python_exe:
-        try:
-            proc = subprocess.run(
-                [python_exe, "-c", "import sys;print(sys.version.split()[0])"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if proc.returncode == 0 and proc.stdout.strip():
-                return proc.stdout.strip()
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        ver = _cmd_python_version([python_exe])
+        if ver:
+            return ver
     return sys.version.split()[0]
 
 
 def detect_versions(source: Path, python_exe: Optional[str] = None) -> dict:
-    """版本判断（需求一.2、2.3）：解析依赖清单与代码 import 确定语言/框架/CUDA 版本。"""
+    """版本判断（需求一.2、2.3）：解析依赖清单与代码 import 确定语言/框架/CUDA 版本。
+
+    语言版本：python_required/python_requirement_source 为清单声明的 Python 要求（同时作为
+    venv 解释器选择依据，见 resolve_env_python）。框架版本：读取 requirements.txt、
+    environment.yml、pyproject.toml、setup.py（install_requires）。CUDA：cuda 为驱动支持版本，
+    cuda_plan 为「驱动 vs 依赖要求」的判定结论与降级动作（不匹配 → CPU 版 wheel），
+    结论随 environment 进 run_record，不静默。
+    """
     info: dict = {"python": _python_version(python_exe), "frameworks": [], "cuda": _detect_cuda()}
 
-    req = source / "requirements.txt"
-    if req.exists():
-        text = req.read_text(encoding="utf-8", errors="ignore")
-        for line in text.splitlines():
-            low = line.strip().lower()
-            for fw in ("torch", "tensorflow", "keras", "jax", "paddlepaddle"):
-                if low.startswith(fw) and not any(f.startswith(fw) for f in info["frameworks"]):
-                    info["frameworks"].append(line.strip())
+    py_req = _python_requirement(source)
+    info["python_required"] = py_req["spec"] if py_req else None
+    info["python_requirement_source"] = py_req["source"] if py_req else None
+
+    for line in _manifest_dependency_lines(source):
+        _add_framework(info, line)
 
     for py in source.rglob("*.py"):
         try:
@@ -337,18 +783,21 @@ def detect_versions(source: Path, python_exe: Optional[str] = None) -> dict:
             continue
         for fw in ("torch", "tensorflow", "keras", "jax"):
             if f"import {fw}" in text or f"from {fw}" in text:
-                if not any(f.startswith(fw) for f in info["frameworks"]):
+                if fw not in _framework_names_in(info["frameworks"]):
                     info["frameworks"].append(fw)
 
+    info["cuda_plan"] = plan_cuda(source, info)
     return info
 
 
-async def _try_install(pip: str, req_file: Optional[Path], index_url: Optional[str] = None) -> dict:
+async def _try_install(pip: str, req_file: Optional[Path], index_url: Optional[str] = None,
+                      extra_index_url: Optional[str] = None) -> dict:
     if req_file is None or not req_file.exists():
         # 无依赖清单（如 conda 项目仅 environment.yml），跳过 pip 安装
         return {"ok": True, "error": None, "command": None, "index_url": index_url,
+                "extra_index_url": extra_index_url,
                 "started_at": _now(), "finished_at": _now()}
-    cmd = _install_cmd(pip, req_file, index_url)
+    cmd = _install_cmd(pip, req_file, index_url, extra_index_url)
     started = _now()
     try:
         rc, out = await proc_util.run_command(cmd, timeout=INSTALL_TIMEOUT_S)
@@ -361,6 +810,7 @@ async def _try_install(pip: str, req_file: Optional[Path], index_url: Optional[s
     except Exception as e:  # noqa: BLE001
         ok, error = False, str(e)
     return {"ok": ok, "error": error, "command": " ".join(cmd), "index_url": index_url,
+            "extra_index_url": extra_index_url,
             "started_at": started, "finished_at": _now()}
 
 
@@ -390,7 +840,8 @@ def _record_install(
             "task_id": task_id,
             "run_type": "env_install",
             "environment": {"type": env_type, **versions},
-            "params": {"attempt": attempt, "step": step, "index_url": result.get("index_url")},
+            "params": {"attempt": attempt, "step": step, "index_url": result.get("index_url"),
+                       "extra_index_url": result.get("extra_index_url")},
             "command": result.get("command"),
             "status": "success" if result["ok"] else "failed",
             "error": result.get("error"),
@@ -401,14 +852,15 @@ def _record_install(
 
 
 async def _agent_fix_advice(source: Path, error: str) -> dict:
-    prompt = (
-        f"一个项目在安装依赖时失败，错误信息如下：\n\n{error}\n\n"
-        f"请阅读项目代码（目录 {source}）与依赖清单，判断代码实际 import 了哪些库，"
-        "给出**修正后的完整依赖清单**（每行一条、pip requirements 语法）——按需降级/替换版本、"
-        "移除未实际使用的项；仅在某版本在当前 Python 下确无可安装 wheel 时才放宽或去掉它的版本钉，"
-        "不要无谓放宽。\n"
-        "严格按如下 JSON 输出，顶层键必须同时为 requirements 与 reason：\n"
-        '{"requirements": ["numpy", "pandas==2.2.2"], "reason": "改了哪些包、为什么"}'
+    """依赖修正建议：模板（`agents/prompts/dependency_fix.md`）+ 本次报错与项目目录。
+
+    契约是「返回修正后的完整依赖清单」（`FIX_SCHEMA.requirements` + `reason`），
+    模板里固定角色/任务/约束，运行期上下文（目录、pip 报错）与 schema 由代码追加。
+    """
+    prompt = prompts.render_prompt(
+        "dependency_fix",
+        context=f"### 项目代码目录\n\n{source}\n\n### pip install 失败报错（stderr/stdout 末尾）\n\n{error}",
+        schema=FIX_SCHEMA,
     )
     try:
         result = await agent_service.run_sync(prompt, cwd=str(source), output_schema=FIX_SCHEMA)
