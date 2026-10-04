@@ -52,16 +52,43 @@ def create_project(body: ProjectCreate) -> dict:
         try:
             analysis_service.load_source(project_id, body.source_url)
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=400, detail=f"加载失败: {e}")
+            # 创建 + 加载是一笔动作：加载失败即回滚半成品（项目记录 + 工作区），不留孤儿项目
+            raise HTTPException(status_code=400, detail=_rollback_failed_create(project_id, e))
 
-    # 结构化项目无异步加载流程，创建即就绪（4a）；original 项目由加载流程推进状态
-    response: dict = {
-        "project_id": project_id,
-        "status": "ready" if body.project_type == "structured" else "loading",
-    }
+    # 结构化项目无异步加载流程，创建即就绪（4a）；original 项目加载成功即 loaded，
+    # 未传 source_url 时保持 loading（等用户显式触发分析）
+    if body.project_type == "structured":
+        status = "ready"
+    elif body.source_url:
+        status = "loaded"
+    else:
+        status = "loading"
+
+    response: dict = {"project_id": project_id, "status": status}
     if body.project_type == "structured":
         response.update({"version": version, "version_error": version_error})
     return response
+
+
+def _rollback_failed_create(project_id: str, error: Exception) -> str:
+    """加载失败的补偿：删除半成品项目，返回带 project_id 与失败原因的 400 detail。
+
+    回滚未完成时不静默——把工作区路径一并透出，便于用户手动清理。
+    """
+    project = project_manager.get_project(project_id)
+    ws = project.get("workspace_path") if project else None
+    try:
+        removed = project_manager.delete_project(project_id)
+        rollback_error: Exception | None = None
+    except Exception as e:  # noqa: BLE001
+        removed = False
+        rollback_error = e
+    if removed:
+        return f"加载失败，project_id={project_id}（已回滚删除该项目）: {error}"
+    if rollback_error is not None:
+        return (f"加载失败，project_id={project_id}（回滚异常：{rollback_error}，"
+                f"请手动清理工作区 {ws}）: {error}")
+    return f"加载失败，project_id={project_id}（回滚未生效，请手动清理工作区 {ws}）: {error}"
 
 
 @router.get("")

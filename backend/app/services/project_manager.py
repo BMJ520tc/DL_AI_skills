@@ -3,7 +3,9 @@
 两类项目: original（仅分析与运行）与 structured（画布可编辑）。
 阶段1 只实现 original；structured 目录骨架预留，git 版本仓库归 7.6（阶段4）。
 """
-import shutil
+import os
+import stat
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,8 +85,80 @@ def update_status(project_id: str, status: str) -> None:
         conn.close()
 
 
+def _is_link(path: Path) -> bool:
+    """符号链接或 Windows 目录联接（junction）判定——两者都只能删链接本身，不能递归进去。"""
+    try:
+        if path.is_symlink():
+            return True
+        attrs = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        return True  # 判不准时按链接处理（保守：宁可不删，也不跟随删除用户数据）
+    flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(flag and attrs & flag)
+
+
+def _remove_link(path: Path) -> bool:
+    """只删除链接本身（目录符号链接/联接用 os.rmdir 删重解析点，绝不进入目标）。"""
+    try:
+        os.rmdir(path)
+        return True
+    except OSError:
+        pass
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        pass
+    if os.name == "nt":
+        try:
+            proc = subprocess.run(
+                ["cmd", "/c", "rmdir", str(path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+            return proc.returncode == 0
+        except OSError:
+            return False
+    return False
+
+
+def _remove_dir_safely(root: Path) -> None:
+    """递归删除目录树，但遇到符号链接/联接只删链接本身。
+
+    任意项目加载会把工作区 `source` 软链到用户本机目录（_mount_local）。shutil.rmtree
+    对目录联接（junction）的处理随 Python 版本而异（3.13 起不再跟随，更早版本会递归进
+    目标删用户数据），故此处自行遍历、逐个判定，不依赖该行为；删不掉就留下，绝不越界。
+    """
+    if _is_link(root):
+        _remove_link(root)
+        return
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return
+    for entry in entries:
+        p = Path(entry.path)
+        if _is_link(p):
+            _remove_link(p)
+            continue
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                _remove_dir_safely(p)
+            else:
+                p.unlink()
+        except OSError:
+            continue
+    try:
+        root.rmdir()
+    except OSError:
+        pass
+
+
 def delete_project(project_id: str) -> bool:
-    """删除项目记录与工作区目录（失败补偿用，如入库链路中途失败要清掉半成品结构化项目）。"""
+    """删除项目记录与工作区目录（失败补偿用，如入库链路中途失败要清掉半成品结构化项目）。
+
+    工作区可能含指向用户本机目录的符号链接/联接（任意项目加载的本地挂载），
+    删除时只删链接本身，安全性见 _remove_dir_safely。
+    """
     project = get_project(project_id)
     if project is None:
         return False
@@ -96,7 +170,7 @@ def delete_project(project_id: str) -> bool:
         conn.close()
     ws = project.get("workspace_path")
     if ws:
-        shutil.rmtree(Path(ws), ignore_errors=True)
+        _remove_dir_safely(Path(ws))
     return True
 
 

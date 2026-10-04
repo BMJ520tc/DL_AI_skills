@@ -1,8 +1,16 @@
 """项目管理 API（阶段4 4a）：画布新建结构化项目、画布快照类型守卫、图表文件服务。
 
+另覆盖阶段5 前置修复：任意项目加载成功落态 loaded、加载失败回滚半成品项目，
+以及回滚时对「工作区 source 指向用户本机目录的符号链接/联接」的安全删除。
+
 工作区目录经 monkeypatch 指向临时路径，测试不触碰真实 data/projects（AGENTS.md 规矩 5）。
 """
 from __future__ import annotations
+
+import os
+import re
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -86,3 +94,135 @@ def test_figures_endpoint_serves_whitelisted_chart(tmp_projects, tmp_path):
     # 工作区目录确实在临时路径，未触碰真实数据目录
     project = project_manager.get_project(project_id)
     assert str(ws) == project["workspace_path"]
+
+
+# ---------------- 任意项目加载（3.3）：落态与失败回滚 ----------------
+
+
+def _create_original_with_url(client, source_url: str):
+    return client.post(
+        "/api/projects",
+        json={"project_type": "original", "source": "local-test", "source_url": source_url},
+    )
+
+
+def _project_id_from_detail(detail: str) -> str:
+    m = re.search(r"project_id=([0-9a-f]{32})", detail)
+    assert m, f"detail 未带 project_id: {detail}"
+    return m.group(1)
+
+
+def _try_dir_link(target: Path, link: Path) -> str | None:
+    """在 link 处建指向 target 的目录链接：优先符号链接，无权限时退到 Windows 目录联接。
+
+    两者都不行（非 Windows 且无 symlink 权限）返回 None，由调用方决定 skip。
+    """
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return "symlink"
+    except OSError:
+        pass
+    if os.name == "nt":
+        proc = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+        if proc.returncode == 0:
+            return "junction"
+    return None
+
+
+def _drop_link(link: Path) -> None:
+    for fn in (link.rmdir, link.unlink):
+        try:
+            fn()
+            return
+        except OSError:
+            continue
+
+
+def test_create_original_with_local_source_marks_loaded(tmp_projects, tmp_path):
+    """加载成功：响应与库里的项目状态都推进为 loaded（前端 BUSY_STATUSES 不再命中）。"""
+    from app.services import project_manager
+
+    src = tmp_path / "repo"
+    src.mkdir()
+    (src / "train.py").write_text("print('hi')", encoding="utf-8")
+
+    r = _create_original_with_url(tmp_projects, str(src))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "loaded"
+
+    project = project_manager.get_project(body["project_id"])
+    assert project["status"] == "loaded"
+    assert (Path(project["workspace_path"]) / "source" / "train.py").exists()
+
+
+def test_create_original_without_source_url_stays_loading(tmp_projects):
+    """不传 source_url：保持 loading，等用户显式触发分析（本次不改这条语义）。"""
+    from app.services import project_manager
+
+    r = tmp_projects.post("/api/projects", json={"project_type": "original", "source": "local-test"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "loading"
+    assert project_manager.get_project(body["project_id"])["status"] == "loading"
+
+
+def test_load_failure_rolls_back_project(tmp_projects, tmp_path):
+    """加载失败：400、detail 带 project_id 与原因，且半成品项目记录与工作区都被清掉。"""
+    from app.services import project_manager
+
+    r = _create_original_with_url(tmp_projects, str(tmp_path / "not-exist-dir"))
+    assert r.status_code == 400, r.text
+    detail = r.json()["detail"]
+    assert "加载失败" in detail
+    assert "本地路径不存在" in detail
+
+    project_id = _project_id_from_detail(detail)
+    assert project_manager.get_project(project_id) is None
+    assert not (tmp_path / "projects" / project_id).exists()
+
+
+def test_rollback_does_not_follow_source_link(tmp_projects, tmp_path, monkeypatch):
+    """回滚只删工作区里的 source 链接本身，绝不跟随链接删用户原目录（本地挂载安全硬要求）。
+
+    构造「挂载成功之后再失败」的真实场景：把 _mount_local 换成建链接后抛错。
+    """
+    from app.services import analysis_service, project_manager
+
+    target = tmp_path / "user_dir"
+    target.mkdir()
+    (target / "important.txt").write_text("用户数据", encoding="utf-8")
+
+    probe = tmp_path / "probe_link"
+    kind = _try_dir_link(target, probe)
+    if kind is None:
+        pytest.skip("本机无创建目录符号链接/目录联接的权限：跳过「回滚不跟随链接」断言")
+    _drop_link(probe)
+
+    created: list[str] = []
+
+    def _mount_then_fail(local: Path, source_dir: Path) -> None:
+        if source_dir.is_dir() and not source_dir.is_symlink():
+            source_dir.rmdir()  # create_project 建的空 source 目录，先让位给链接
+        kind = _try_dir_link(local, source_dir)
+        assert kind is not None, "探针可建链接，实际挂载却失败"
+        created.append(kind)
+        raise RuntimeError("模拟挂载后加载失败")
+
+    monkeypatch.setattr(analysis_service, "_mount_local", _mount_then_fail)
+    r = _create_original_with_url(tmp_projects, str(target))
+    assert r.status_code == 400, r.text
+    assert created, "未走到挂载步骤"
+    project_id = _project_id_from_detail(r.json()["detail"])
+
+    # 用户原目录与其内容完好（回滚没有递归进链接目标）
+    assert target.is_dir()
+    assert (target / "important.txt").read_text(encoding="utf-8") == "用户数据"
+
+    # 链接所在的工作区已清理
+    assert project_manager.get_project(project_id) is None
+    assert not (tmp_path / "projects" / project_id).exists()
+

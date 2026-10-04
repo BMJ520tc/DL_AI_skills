@@ -44,7 +44,11 @@ def _now() -> str:
 
 
 def load_source(project_id: str, source_url: str) -> None:
-    """3.3 任意项目加载：仓库地址 clone，本地路径挂载（软链，避免拷贝）。"""
+    """3.3 任意项目加载：仓库地址 clone，本地路径挂载（软链，避免拷贝）。
+
+    加载成功即把项目状态推进为 loaded（前端据此停止轮询）；失败直接抛错，
+    由调用方（POST /api/projects）回滚这笔半成品创建。
+    """
     project = project_manager.get_project(project_id)
     source_dir = Path(project["workspace_path"]) / "source"
 
@@ -57,6 +61,8 @@ def load_source(project_id: str, source_url: str) -> None:
         if not local.exists():
             raise RuntimeError(f"本地路径不存在: {source_url}")
         _mount_local(local, source_dir)
+
+    project_manager.update_status(project_id, "loaded")
 
 
 def _mount_local(local: Path, source_dir: Path) -> None:
