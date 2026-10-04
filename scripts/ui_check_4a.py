@@ -2,16 +2,19 @@
 #
 # 全链路真实打开构建产物：
 #   1. 进程内启动后端（临时 SQLite + 临时项目目录，绝不触碰 data/ 真实数据），
-#      种子：论文一条（含实验条目）、数据集一条、原始项目一条；
+#      种子：论文一条（含实验条目）、数据集一条、原始项目一条（含结构报告与 IR 种子）；
 #   2. `vite preview` 服务 frontend/dist（当前构建产物，API 基址为默认 :8000）；
 #   3. 无头 Edge（CDP）逐项断言：
-#      - 项目列表渲染、无「后端连接失败」横幅；
+#      - 项目列表渲染、无「后端连接失败」横幅；检索与下载入口存在；
 #      - 「＋ 新建模型」创建结构化项目并直接打开画布（空图正常渲染，无报错）；
 #      - 经 HTTP 复核：新项目 graph.json = {nodes:[], edges:[]}、status=ready；
 #      - 返回列表 → 打开原始项目查看器：三并列入口（先复现/先使用/先拆解）齐备；
-#      - 「先复现」面板：论文下拉含种子论文 → 实验条目表 → 点「确认」过 4.2 闸门
-#        （按钮 ② 变为「已确认 1/1 条」）；
-#      - 「先使用」面板：数据集下拉含种子数据集、四个操作按钮齐备；
+#      - 模块一新增入口：独立环境/最小可运行命令验证按钮、结构报告内容渲染（报告页签）、
+#        参数区「入口输入规格」PUT 真写回后端；
+#      - 「先复现」面板：论文下拉含种子论文 → 实验条目五要素表 + 编辑入口 → 点「确认」过 4.2 闸门
+#        （按钮 ② 变为「已确认 1/1 条」）→ 「⓪ 解析论文」真的发起 pdf_parse 任务（失败原因可见）；
+#      - 「先使用」面板：数据集下拉含种子数据集、四个操作按钮齐备、「⓪ 数据预处理」真的发起
+#        preprocess 任务（空路径先给可见校验提示）、公开数据检索入口存在；
 #      - 全程收集浏览器 console 错误，非 favicon 类错误即判失败。
 #
 # 用法（需已执行 `npm run build`）：
@@ -85,6 +88,23 @@ def http_json(path: str) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def wait_for_task(task_type: str, project_id: str | None = None, timeout: float = 25.0) -> dict | None:
+    """轮询 GET /api/tasks，等某类型任务出现（界面按钮真的发起了任务才算通过）。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            for task in http_json("/api/tasks?limit=100"):
+                if task.get("task_type") != task_type:
+                    continue
+                if project_id and task.get("project_id") != project_id:
+                    continue
+                return task
+        except Exception:
+            pass
+        time.sleep(0.4)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 1. 临时库后端（进程内 uvicorn）
 # ---------------------------------------------------------------------------
@@ -115,6 +135,41 @@ def start_backend(tmp_dir: Path):
     })
     orig_ws = Path(project_manager.PROJECTS_DIR) / ORIG_PROJECT_ID
     orig_ws.mkdir(parents=True, exist_ok=True)
+    # 结构报告与 IR 种子（本轮新增界面入口的真实数据来源）：
+    # 报告 → 查看器「报告」页签的内容渲染；IR → 参数区「入口输入规格」PUT 通道。
+    reports = orig_ws / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    (reports / "structure_report.json").write_text(json.dumps({
+        "entry_points": ["train.py", "scripts/eval.sh"],
+        "model_files": ["models/sample_net.py"],
+        "train_flow": [{"file": "train.py", "function": "train"}],
+        "inference_flow": [{"file": "train.py", "function": "evaluate"}],
+        "module_hierarchy": [{"file": "models/sample_net.py", "class": "Net", "parent": "Module"}],
+        "module_tree": [],
+        "call_chain": [],
+        "dependencies": [{"name": "torch", "version_spec": ">=2.0", "used_in": ["train.py"]}],
+        "uncertain": [{"file": "models/sample_net.py", "reason": "dynamic getattr"}],
+        "dynamic_supplement": {"supplements": [
+            {"file": "models/sample_net.py", "reason": "dynamic getattr",
+             "judgement": "条件分支构造的层，运行期才确定"},
+        ]},
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    (reports / "ir.json").write_text(json.dumps({
+        "schema_version": "1.0",
+        "source_file": "models/sample_net.py",
+        "entry_class": "Net",
+        "task_type": "classification",
+        "input_spec": None,           # 故意留空：验证「补输入规格」这个补参通道
+        "root_id": "net",
+        "nodes": [
+            {"id": "net", "kind": "module", "class_name": "Net", "parent_id": None,
+             "input_shape": [1, 4], "output_shape": [1, 8]},
+            {"id": "fc1", "kind": "leaf", "class_name": "nn.Linear", "parent_id": "net",
+             "module_path": "fc1", "params": {"in_features": 4, "out_features": 8},
+             "input_shape": [1, 4], "output_shape": [1, 8]},
+        ],
+        "edges": [{"from": "net", "to": "fc1", "tensor_shape": [1, 4]}],
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
     conn = connection.get_connection()
     conn.execute(
         """
@@ -201,8 +256,23 @@ def click_button(cdp: CDP, text: str, exact: bool = False) -> bool:
     return True
 
 
+def set_input_by_placeholder(cdp: CDP, placeholder_prefix: str, value: str) -> bool:
+    """按 placeholder 前缀定位输入框并回填（React 19 受控组件：实例赋值 + input/change 双事件）。"""
+    return bool(cdp.evaluate(
+        f"""(() => {{
+            const el = [...document.querySelectorAll('input, textarea')]
+                .find(i => (i.placeholder || '').startsWith({json.dumps(placeholder_prefix)}));
+            if (!el) return false;
+            const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, {json.dumps(value)});
+            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            return el.value === {json.dumps(value)};
+        }})()"""))
+
+
 def console_errors(cdp: CDP) -> tuple[list[str], list[str]]:
-    """返回 (真错误, 预期噪声)。预期噪声：种子原始项目尚无结构报告/IR 的 404 资源日志。"""
+    """返回 (真错误, 预期噪声)。预期噪声：资源类 404 日志（如尚未生成的图表文件）。"""
     errors: list[str] = []
     noise: list[str] = []
     for ev in cdp.events:
@@ -337,6 +407,12 @@ def main() -> int:
             check("项目列表无后端错误横幅", "后端连接失败" not in body)
             check("列表含种子原始项目", "4a 自检原始项目" in body)
             check("「＋ 新建模型」按钮存在", "＋ 新建模型" in body)
+            check("项目列表有「检索与下载」入口（模块一 2.4）", "检索与下载" in body)
+            parent_option = cdp.evaluate(
+                "(() => { const s = [...document.querySelectorAll('option')]"
+                ".find(o => (o.textContent || '').includes('父项目（可选'));"
+                " return s ? s.textContent : ''; })()")
+            check("新建模型可选父项目（父项目下拉存在）", bool(parent_option), str(parent_option))
 
         # --- 新建模型 → 画布 ---
         if click_button(cdp, "＋ 新建模型"):
@@ -368,6 +444,51 @@ def main() -> int:
                 for label in ("先复现", "先使用", "先拆解"):
                     check(f"三并列入口「{label}」存在", label in body)
                 check("默认先拆解模式渲染", "原始项目操作目录" in body)
+                # --- 模块一：独立环境 / 最小可运行命令验证 / 结构报告内容 / 输入规格补参 ---
+                check("原始项目查看器有「建独立环境」按钮", "建独立环境" in body or "重建独立环境" in body)
+                check("原始项目查看器有「最小可运行命令验证」按钮", "最小可运行命令验证" in body)
+                # IR 是异步加载的：等参数区把输入规格块渲染出来再断言
+                wait_for(cdp, "document.body.innerText.includes('入口输入规格')", True,
+                         "参数区「入口输入规格（input_spec）」入口渲染")
+                check("参数区有「入口输入规格（input_spec）」入口",
+                      "入口输入规格" in cdp.evaluate("document.body.innerText"))
+
+                # 结构报告：点「报告」页签必须渲染内容（此前只判有没有）
+                if click_button(cdp, "报告"):
+                    wait_for(cdp, "document.body.innerText.includes('入口脚本')", True,
+                             "结构报告内容渲染（页签）")
+                    report_body = cdp.evaluate("document.body.innerText")
+                    check("报告渲染入口脚本/模型文件/依赖版本/不确定项/动态补充",
+                          all(k in report_body for k in ("入口脚本", "模型文件", "依赖及版本要求",
+                                                         "不确定项", "动态补充", "train.py", "torch", ">=2.0")),
+                          "缺失：" + "、".join(k for k in ("入口脚本", "模型文件", "依赖及版本要求",
+                                                          "不确定项", "动态补充", "train.py", "torch", ">=2.0")
+                                              if k not in report_body))
+
+                # 输入规格补参：PUT /ir/input_spec（agent 给不出维度时的唯一通道）
+                if click_button(cdp, "参数", exact=True):
+                    wait_for(cdp, "document.body.innerText.includes('入口输入规格')", True,
+                             "参数区输入规格入口渲染")
+                    filled = set_input_by_placeholder(cdp, "shape，如", "1, 3, 8, 8")
+                    check("输入规格 shape 可填写", filled)
+                    if filled and click_button(cdp, "保存输入规格"):
+                        wait_for(cdp, "document.body.innerText.includes('旧验证变 stale')", True,
+                                 "输入规格保存后提示旧验证变 stale", timeout=15)
+                        spec = http_json(f"/api/projects/{ORIG_PROJECT_ID}/ir")["ir"].get("input_spec")
+                        check("PUT /ir/input_spec 真的写回后端",
+                              spec == {"shape": [1, 3, 8, 8]}, f"input_spec={spec}")
+
+                # 最小可运行命令验证：确实发起 verify 任务；环境未就绪时失败原因与 run_record 都要可见
+                if click_button(cdp, "最小可运行命令验证"):
+                    verify_task = wait_for_task("verify", ORIG_PROJECT_ID, timeout=25)
+                    check("最小可运行命令验证任务已发起（POST /verify）", verify_task is not None,
+                          f"status={verify_task.get('status') if verify_task else 'None'}")
+                    wait_for(cdp, "document.body.innerText.includes('最小可运行命令 run_record')"
+                                  " || document.body.innerText.includes('环境未就绪')", True,
+                             "验证结果/失败原因在界面可见", timeout=25)
+                    verify_body = cdp.evaluate("document.body.innerText")
+                    check("最小命令验证失败不静默（run_record 或失败横幅可见）",
+                          ("最小可运行命令 run_record" in verify_body) or ("环境未就绪" in verify_body))
 
         # --- 先复现：选论文 → 看条目 → 过 4.2 确认闸门 ---
         if click_button(cdp, "先复现"):
@@ -394,6 +515,22 @@ def main() -> int:
                              "4.2 闸门：条目确认后计数更新")
                     wait_for(cdp, "document.body.innerText.includes('条目已确认')", True,
                              "确认成功提示")
+                # 模块二 4.1：解析入口（PDF→markdown）能发起任务；种子论文无 PDF，失败原因必须可见
+                item_body = cdp.evaluate("document.body.innerText")
+                check("先复现面板有「解析论文（PDF→markdown）」入口", "解析论文" in item_body)
+                check("先复现面板显示条目五要素表头（数据集/划分方式/超参数/对比基线）",
+                      all(k in item_body for k in ("数据集", "划分方式", "超参数", "对比基线")))
+                check("先复现面板有条目「编辑」入口", "编辑" in item_body)
+                if click_button(cdp, "⓪ 解析论文"):
+                    parse_task = wait_for_task("pdf_parse", None, timeout=25)
+                    check("论文解析任务已发起（POST /papers/{id}/parse）", parse_task is not None,
+                          f"status={parse_task.get('status') if parse_task else 'None'}")
+                    wait_for(cdp, "document.body.innerText.includes('pdf_parse')"
+                                  " || document.body.innerText.includes('PDF 不存在')", True,
+                             "解析任务状态/失败原因可见", timeout=25)
+                    parse_body = cdp.evaluate("document.body.innerText")
+                    check("解析失败原因透出（不静默）",
+                          ("pdf_parse" in parse_body) or ("PDF 不存在" in parse_body))
 
         # --- 先使用：数据集下拉 + 按钮齐备 ---
         if click_button(cdp, "先使用"):
@@ -407,11 +544,32 @@ def main() -> int:
                           "④ 性能对比图", "④ 误差分布图", "④ 典型案例图"):
                 check(f"按钮「{label}」存在", label in body)
 
+            # --- 模块三 5.1：数据预处理入口（真实发起 preprocess 任务） ---
+            check("先使用面板有「⓪ 数据预处理」入口", "⓪ 数据预处理" in body)
+            check("先使用面板有「运行预处理」按钮", "运行预处理" in body)
+            if click_button(cdp, "运行预处理"):
+                wait_for(cdp, "document.body.innerText.includes('请填写预处理输入路径')", True,
+                         "预处理空路径校验提示可见", timeout=15)
+            filled = set_input_by_placeholder(cdp, "输入路径",
+                                              str(Path(tempfile.gettempdir()) / "ui4a_missing_input.csv"))
+            check("预处理输入路径可填写", filled)
+            if filled and click_button(cdp, "运行预处理"):
+                preprocess_task = wait_for_task("preprocess", ORIG_PROJECT_ID, timeout=25)
+                check("数据预处理任务已发起（POST /api/preprocess）", preprocess_task is not None,
+                      f"status={preprocess_task.get('status') if preprocess_task else 'None'}")
+                wait_for(cdp, "document.body.innerText.includes('preprocess')", True,
+                         "预处理任务状态在界面可见", timeout=25)
+
+            # --- 模块三 5.3：公开数据检索入口（存在性；真发外部检索依赖网络，故不在此触发） ---
+            search_body = cdp.evaluate("document.body.innerText")
+            check("先使用面板有公开数据检索入口",
+                  "公开数据检索" in search_body and "检索公开数据" in search_body)
+
         # --- 控制台错误汇总 ---
         time.sleep(1.0)
         errors, noise = console_errors(cdp)
         if noise:
-            print(f"  预期噪声（种子项目无报告/IR 的 404 资源日志）：{len(noise)} 条")
+            print(f"  预期噪声（资源类 404 日志）：{len(noise)} 条")
         check("浏览器控制台无错误", not errors, "；".join(errors[:5]) if errors else "0 条")
         if errors:
             print("  完整错误清单：")

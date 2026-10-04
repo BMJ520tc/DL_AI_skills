@@ -238,6 +238,113 @@ export const postAnalyze = (projectId: string) =>
 export const getReport = (projectId: string) =>
     request<Record<string, unknown>>(`/api/projects/${projectId}/report`);
 
+/** 最小可运行命令验证（模块一 2.3「代码能否跑起来」；异步任务，结果落 run_record）。 */
+export const postProjectVerify = (projectId: string) =>
+    request<{ task_id: string; status: string }>(`/api/projects/${projectId}/verify`, { method: "POST" });
+
+// ---------------------------------------------------------------------------
+// 检索与下载（模块一 需求一，模块详细设计 2.4）
+// ---------------------------------------------------------------------------
+
+export interface PaperSearchParams {
+    q: string;
+    source?: "arxiv" | "pubmed" | "biorxiv";
+    max_results?: number;
+    /** 逗号分隔的作者过滤（bioRxiv 不支持服务端过滤，结果里会带 filter_note） */
+    authors?: string;
+    /** YYYY[-MM[-DD]] */
+    date_from?: string;
+    date_to?: string;
+    /** PubMed/bioRxiv 尽力抓 PMC OA 全文（取不到记 abstract_only，不报错） */
+    fulltext?: boolean;
+}
+
+/** 论文检索：返回结果条目（字段随来源而异，统一以 paper_id/title/abstract/pdf_url 为主）。 */
+export const searchPapers = (params: PaperSearchParams) => {
+    const query = new URLSearchParams({ q: params.q });
+    if (params.source) query.set("source", params.source);
+    if (params.max_results !== undefined) query.set("max_results", String(params.max_results));
+    if (params.authors) query.set("authors", params.authors);
+    if (params.date_from) query.set("date_from", params.date_from);
+    if (params.date_to) query.set("date_to", params.date_to);
+    if (params.fulltext) query.set("fulltext", "true");
+    return request<Array<Record<string, unknown>>>(`/api/search/papers?${query.toString()}`);
+};
+
+export interface DownloadPaperBody {
+    paper_id: string;
+    /** source=pubmed 时可省：后端改抓 PMC OA 全文 */
+    pdf_url?: string | null;
+    title?: string | null;
+    abstract?: string | null;
+    source?: string | null;
+}
+
+/** 单篇下载（同步接口）：落库成 paper 记录。 */
+export const downloadPaper = (body: DownloadPaperBody) =>
+    request<{ paper_id: string; status: string }>("/api/search/papers/download", {
+        method: "POST",
+        body: JSON.stringify(body),
+    });
+
+/** 批量下载（同步串行；单篇失败不整体失败，逐篇返回成功/失败原因）。 */
+export const downloadPapersBatch = (papers: DownloadPaperBody[]) =>
+    request<{
+        total: number;
+        succeeded: number;
+        failed: number;
+        note: string | null;
+        results: Array<{ paper_id: string; status: string; reason?: string }>;
+    }>("/api/search/papers/download-batch", {
+        method: "POST",
+        body: JSON.stringify({ papers }),
+    });
+
+export interface ExtractAddressesBody {
+    /** 论文正文（必填） */
+    paper_text: string;
+    /** 给了 paper_id 就顺带扫 data/papers/<id>/ 下的补充材料 */
+    paper_id?: string;
+    /** 显式补充材料路径（PDF/压缩包/纯文本），与目录扫描合并去重 */
+    supplementary_paths?: string[];
+    /** 抽到仓库地址后是否立刻完整克隆（默认 true） */
+    clone_repos?: boolean;
+    /** 克隆口径：true=完整克隆，false=浅克隆 */
+    full_clone?: boolean;
+    cwd?: string;
+}
+
+/** 地址抽取任务（仓库/数据集地址 → 克隆与登记；进度里可复核每条结果）。 */
+export const postExtractAddresses = (body: ExtractAddressesBody) =>
+    request<{ task_id: string; status: string }>("/api/search/extract", {
+        method: "POST",
+        body: JSON.stringify(body),
+    });
+
+/** run_record 行（数据设计五.4；经通用知识库列表接口读出，按 project/task 过滤）。 */
+export interface RunRecord {
+    run_id: string;
+    project_id: string | null;
+    task_id: string | null;
+    run_type: string;
+    command: string | null;
+    status: string;
+    metrics: string | null;
+    error: string | null;
+    params: string | null;
+    artifact_path: string | null;
+    started_at: string | null;
+    finished_at: string | null;
+    duration_s: number | null;
+}
+
+/** 某项目的运行记录（既有 GET /api/knowledge/list?data_type=run，按项目过滤）。
+ *  后端没有「按项目列 run_record」的专用端点，这里复用通用列表并如实按 project_id 过滤。 */
+export async function listRunRecords(projectId: string, limit = 200): Promise<RunRecord[]> {
+    const rows = await listKnowledge("run", limit);
+    return (rows as unknown as RunRecord[]).filter(r => r.project_id === projectId);
+}
+
 // ---------------------------------------------------------------------------
 // 模块四（6.1/6.2/6.3/6.4）
 // ---------------------------------------------------------------------------
@@ -263,6 +370,14 @@ export const putNodeParams = (projectId: string, nodeId: string, params: Record<
     request<Record<string, unknown>>(`/api/projects/${projectId}/ir/nodes/${nodeId}`, {
         method: "PUT",
         body: JSON.stringify({ params }),
+    });
+
+/** 修正 IR 入口输入规格（6.1/6.2）：库型模型 agent 给不出具体维度时的补参通道；
+ *  写回后 ir_hash 变化 → 旧验证变 stale（与调参同口径），入库前必须重新验证。 */
+export const putIrInputSpec = (projectId: string, shape: number[], dtype?: string | null) =>
+    request<{ shape: number[]; dtype?: string }>(`/api/projects/${projectId}/ir/input_spec`, {
+        method: "PUT",
+        body: JSON.stringify(dtype ? { shape, dtype } : { shape }),
     });
 
 // ---------------------------------------------------------------------------
@@ -300,8 +415,32 @@ export interface PaperDetail {
 
 export const getPaperDetail = (paperId: string) => request<PaperDetail>(`/api/papers/${paperId}`);
 
+/** 4.1 PDF → markdown（规则 + agent 修正）；任务进度里带保真核对 fidelity 字段。 */
+export const postParsePaper = (paperId: string) =>
+    request<{ task_id: string; status: string }>(`/api/papers/${paperId}/parse`, { method: "POST" });
+
 export const postExtractItems = (paperId: string) =>
     request<{ task_id: string; status: string }>(`/api/papers/${paperId}/extract`, { method: "POST" });
+
+/** 4.2 条目编辑字段（只传要改的键；hyperparams/baselines 传对象或数组，后端存 JSON）。 */
+export interface PaperItemEdit {
+    section_ref?: string | null;
+    dataset_name?: string | null;
+    split_method?: string | null;
+    metric_name?: string | null;
+    metric_value_reported?: string | null;
+    metric_unit?: string | null;
+    hyperparams?: Record<string, unknown> | null;
+    baselines?: unknown[] | null;
+    status?: string | null;
+}
+
+/** 4.2 用户编辑实验条目（确认后条目生效）；返回更新后的条目。 */
+export const putPaperItem = (paperId: string, itemId: string, body: PaperItemEdit) =>
+    request<Record<string, unknown>>(`/api/papers/${paperId}/items/${itemId}`, {
+        method: "PUT",
+        body: JSON.stringify(body),
+    });
 
 export const postReproduce = (paperId: string, projectId: string) =>
     request<{ task_id: string; status: string }>(`/api/papers/${paperId}/reproduce`, {
@@ -311,6 +450,13 @@ export const postReproduce = (paperId: string, projectId: string) =>
 
 export const postConclusion = (paperId: string) =>
     request<{ task_id: string; status: string }>(`/api/papers/${paperId}/conclusion`, { method: "POST" });
+
+/** 4.4 用户确认或修改可信度结论（只传要改的键；后端在缺省时保留原值）。 */
+export const putPaperConclusion = (paperId: string, body: { overall_verdict?: string; summary?: string }) =>
+    request<{ conclusion_id: string; status: string }>(`/api/papers/${paperId}/conclusion`, {
+        method: "PUT",
+        body: JSON.stringify(body),
+    });
 
 export const confirmPaperItem = (paperId: string, itemId: string) =>
     request<{ item_id: string; status: string }>(`/api/papers/${paperId}/items/${itemId}/confirm`, { method: "POST" });
@@ -328,6 +474,70 @@ export const postAlign = (projectId: string, datasetId: string) =>
     request<{ task_id: string; status: string }>(`/api/projects/${projectId}/datasets/align`, {
         method: "POST",
         body: JSON.stringify({ dataset_id: datasetId }),
+    });
+
+// ---------------------------------------------------------------------------
+// 模块三 5.1/5.3：数据预处理与公开数据检索下载
+// ---------------------------------------------------------------------------
+
+export interface PreprocessBody {
+    /** 待预处理的数据文件/目录路径（必填） */
+    input_path: string;
+    /** 数据集名（带 project_id 时默认 "self"，产物落 <workspace>/data/<name>） */
+    dataset_name?: string | null;
+    task_type?: string;
+    /** 传原始项目 id 时按项目自带数据处理（产物落项目工作区，便于自动定位） */
+    project_id?: string | null;
+    /** 来源溯源（公开数据经预处理后仍保留来源） */
+    source?: string | null;
+    url?: string | null;
+}
+
+/** 5.1 数据预处理（异步任务；进度经任务轮询，结果含 dataset_id/统一 schema 摘要）。 */
+export const postPreprocess = (body: PreprocessBody) =>
+    request<{ task_id: string; status: string }>("/api/preprocess", {
+        method: "POST",
+        body: JSON.stringify(body),
+    });
+
+export interface DatasetSearchParams {
+    task_type?: string;
+    format?: string;
+    q?: string;
+    limit?: number;
+    /** 传 project_id 附带「自带数据是否充足」判定，并把自带数据集从 local 里排除 */
+    project_id?: string;
+}
+
+export interface DatasetSearchResult {
+    local: Array<Record<string, unknown>>;
+    external: Array<Record<string, unknown>>;
+    self_data?: {
+        sufficient: boolean;
+        n_samples: number;
+        threshold: number;
+        hint: string | null;
+    };
+    hint?: string;
+}
+
+/** 5.3 公开数据检索（本地 registry + Zenodo 尽力而为；不阻断流程）。 */
+export const searchDatasets = (params: DatasetSearchParams) => {
+    const query = new URLSearchParams();
+    if (params.task_type) query.set("task_type", params.task_type);
+    if (params.format) query.set("format", params.format);
+    if (params.q) query.set("q", params.q);
+    if (params.limit !== undefined) query.set("limit", String(params.limit));
+    if (params.project_id) query.set("project_id", params.project_id);
+    const suffix = query.toString();
+    return request<DatasetSearchResult>(`/api/datasets/search${suffix ? `?${suffix}` : ""}`);
+};
+
+/** 5.3 下载公开数据集并登记（同步；返回新登记的 dataset_id）。 */
+export const downloadDataset = (body: { source: string; source_id: string; name: string; task_type?: string | null }) =>
+    request<{ dataset_id: string }>("/api/datasets/download", {
+        method: "POST",
+        body: JSON.stringify(body),
     });
 
 export const confirmAlignment = (datasetId: string) =>

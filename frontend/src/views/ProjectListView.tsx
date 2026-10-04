@@ -9,6 +9,7 @@ import {
     listProjects,
     type Project,
 } from "../api/client";
+import SearchDownloadPanel from "./panels/SearchDownloadPanel";
 
 const BUSY_STATUSES = new Set(["loading", "preparing", "queued", "running"]);
 
@@ -27,6 +28,7 @@ export default function ProjectListView({ onOpenViewer, onOpenCanvas, onOpenSand
     const [creating, setCreating] = useState(false);
     const [createError, setCreateError] = useState<string | null>(null);
     const [modelName, setModelName] = useState("");
+    const [modelParentId, setModelParentId] = useState("");
     const [creatingModel, setCreatingModel] = useState(false);
     const [createModelError, setCreateModelError] = useState<string | null>(null);
 
@@ -77,7 +79,8 @@ export default function ProjectListView({ onOpenViewer, onOpenCanvas, onOpenSand
         }
     };
 
-    // 画布新建模型（阶段4 4a）：创建空结构化项目并直接打开画布
+    // 画布新建模型（阶段4 4a）：创建空结构化项目并直接打开画布。
+    // 可选父项目：不传时画布网络没有父项目，其运行面板需要自行选择/新建环境来源。
     const handleCreateModel = async () => {
         setCreatingModel(true);
         setCreateModelError(null);
@@ -85,8 +88,10 @@ export default function ProjectListView({ onOpenViewer, onOpenCanvas, onOpenSand
             const { project_id } = await createProject({
                 project_type: "structured",
                 name: modelName.trim() || undefined,
+                parent_project_id: modelParentId || undefined,
             });
             setModelName("");
+            setModelParentId("");
             onOpenCanvas(project_id);
         } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
@@ -204,6 +209,16 @@ export default function ProjectListView({ onOpenViewer, onOpenCanvas, onOpenSand
                     {createError && <div style={{ color: "#f87171", fontSize: 12, marginTop: 8 }}>{createError}</div>}
                 </div>
 
+                {/* 检索与下载（模块一 2.4：论文检索/下载、地址抽取） */}
+                <details style={{ ...card, marginBottom: 28 }}>
+                    <summary style={{ cursor: "pointer", fontSize: 15, fontWeight: 700 }}>
+                        检索与下载 <span style={{ color: "#64748b", fontSize: 12, fontWeight: 400 }}>（论文检索 → 单篇/批量下载入库；地址抽取 → 仓库克隆 + 数据集登记）</span>
+                    </summary>
+                    <div style={{ marginTop: 14 }}>
+                        <SearchDownloadPanel />
+                    </div>
+                </details>
+
                 {loading ? (
                     <div style={{ color: "#64748b" }}>加载中…</div>
                 ) : (
@@ -219,13 +234,26 @@ export default function ProjectListView({ onOpenViewer, onOpenCanvas, onOpenSand
                                 <h2 style={{ fontSize: 15, margin: 0 }}>
                                     结构化项目 <span style={{ color: "#64748b", fontSize: 12, fontWeight: 400 }}>（模块入库后生成，也可直接新建，画布可编辑）</span>
                                 </h2>
-                                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                                     <input
                                         style={{ ...input, flex: "none", minWidth: 180, maxWidth: 220, padding: "5px 10px", fontSize: 12 }}
                                         placeholder="新模型名称（可选）"
                                         value={modelName}
                                         onChange={e => setModelName(e.target.value)}
                                     />
+                                    <select
+                                        style={{ ...input, flex: "none", minWidth: 200, maxWidth: 280, padding: "5px 10px", fontSize: 12 }}
+                                        value={modelParentId}
+                                        onChange={e => setModelParentId(e.target.value)}
+                                        title="可选：选定父项目后，该网络运行时的默认环境就是父原始项目的独立环境"
+                                    >
+                                        <option value="">父项目（可选，用于默认运行环境）</option>
+                                        {originals.map(p => (
+                                            <option key={p.project_id} value={p.project_id}>
+                                                {p.name || p.project_id}
+                                            </option>
+                                        ))}
+                                    </select>
                                     <button style={btn} onClick={() => void handleCreateModel()} disabled={creatingModel}>
                                         {creatingModel ? "创建中…" : "＋ 新建模型"}
                                     </button>

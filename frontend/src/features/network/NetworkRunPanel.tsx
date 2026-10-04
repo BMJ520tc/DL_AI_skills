@@ -6,8 +6,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-    createProjectEnv, getNetworkRunOptions, getProjectEnvStatus, listNetworkRuns, postNetworkRun,
-    type NetworkRunOptions, type NetworkRunRecord, type Task,
+    createProjectEnv, getNetworkRunOptions, getProjectEnvStatus, listNetworkRuns, listProjects,
+    postNetworkRun, type NetworkRunOptions, type NetworkRunRecord, type Project, type Task,
 } from "../../api/client";
 import { useTaskPolling } from "../../hooks/useTaskPolling";
 
@@ -82,10 +82,13 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
     const [startState, setStartState] = useState<"idle" | "starting" | "error">("idle");
     const [startError, setStartError] = useState<string | null>(null);
 
-    // 4c-3：父项目环境状态与「建环境」（复用模块一 2.3 的既有 env 接口）
+    // 4c-3：环境（复用模块一 2.3 的既有 env 接口）。
+    // 画布新建的结构化项目没有父项目，此时允许从全部 original 项目里选一个作为环境来源并就地建环境。
     const [envTaskId, setEnvTaskId] = useState<string | null>(null);
     const [envStatus, setEnvStatus] = useState<string | null>(null);
     const [envError, setEnvError] = useState<string | null>(null);
+    const [originals, setOriginals] = useState<Project[]>([]);
+    const [envTargetId, setEnvTargetId] = useState<string>("");
 
     const loadRuns = useCallback(async () => {
         try {
@@ -95,6 +98,14 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
         }
     }, [projectId]);
 
+    const loadOriginals = useCallback(async () => {
+        try {
+            setOriginals(await listProjects("original"));
+        } catch {
+            // original 项目列表失败不阻塞面板（父项目环境仍可用）
+        }
+    }, []);
+
     /** 拉运行面板初始化数据（建环境完成后复用刷新）。 */
     const refreshOptions = useCallback(async () => {
         try {
@@ -102,13 +113,6 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
             setOptions(opts);
             setOptionsError(null);
             setEnvironmentProjectId(prev => prev || opts.parent_project_id || opts.environments[0]?.project_id || "");
-            if (opts.parent_project_id) {
-                try {
-                    setEnvStatus((await getProjectEnvStatus(opts.parent_project_id)).status);
-                } catch {
-                    setEnvStatus(null);
-                }
-            }
         } catch (e) {
             setOptionsError(e instanceof Error ? e.message : String(e));
         }
@@ -117,13 +121,34 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
     useEffect(() => {
         void (async () => {
             await refreshOptions();
+            await loadOriginals();
             try {
                 setRuns(await listNetworkRuns(projectId));
             } catch {
                 // 运行记录加载失败不阻塞面板（训练结束后会再次刷新）
             }
         })();
-    }, [projectId, refreshOptions]);
+    }, [projectId, refreshOptions, loadOriginals]);
+
+    // 建环境的目标：显式选择 > 父项目 > 第一个 original 项目（没有父项目也能建）
+    const envTarget = envTargetId || options?.parent_project_id || originals[0]?.project_id || null;
+    const envTargetIsParent = !!envTarget && envTarget === options?.parent_project_id;
+
+    useEffect(() => {
+        if (!envTarget) return;
+        let cancelled = false;
+        void (async () => {
+            try {
+                const status = (await getProjectEnvStatus(envTarget)).status;
+                if (!cancelled) setEnvStatus(status);
+            } catch {
+                if (!cancelled) setEnvStatus(null);
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [envTarget]);
 
     const handleStart = useCallback(async () => {
         if (startState === "starting") return;
@@ -160,9 +185,8 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
         }
     }, [projectId, datasetId, environmentProjectId, epochs, batchSize, learningRate, saveGraph, startState]);
 
-    // 4c-3「可选新建环境」：为父原始项目发起建环境（既有接口），任务轮询到终态后刷新面板
-    const envTarget = options?.parent_project_id ?? null;
-    const parentEnvReady = !!envTarget && !!options?.environments.some(e => e.project_id === envTarget);
+    // 4c-3「可选新建环境」：为所选原始项目发起建环境（既有接口），任务轮询到终态后刷新面板
+    const envReady = !!envTarget && !!options?.environments.some(e => e.project_id === envTarget);
 
     const handleCreateEnv = useCallback(async () => {
         if (!envTarget || envTaskId) return;
@@ -181,6 +205,7 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
         onDone: async () => {
             setEnvTaskId(null);
             await refreshOptions();
+            await loadOriginals();
         },
         onError: message => {
             setEnvTaskId(null);
@@ -286,21 +311,44 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
 
             {envTarget && (
                 <div style={{ marginTop: 6, fontSize: 11, color: "#94a3b8",
-                              display: "flex", alignItems: "center", gap: 8 }}>
+                              display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                     <span>
-                        父项目环境：{envTaskId ? "创建中…" : parentEnvReady ? "已就绪" : (envStatus ?? "未就绪")}
+                        {envTargetIsParent ? "父项目环境" : "所选原始项目环境"}：
+                        {envTaskId ? "创建中…" : envReady ? "已就绪" : (envStatus ?? "未就绪")}
                     </span>
                     <button
                         onClick={() => void handleCreateEnv()}
                         disabled={!!envTaskId || running}
                         style={{ ...smallButtonStyle, cursor: envTaskId || running ? "wait" : "pointer" }}
                     >
-                        {envTaskId ? "创建中…" : parentEnvReady ? "重建环境" : "建环境"}
+                        {envTaskId ? "创建中…" : envReady ? "重建环境" : "建环境"}
                     </button>
                 </div>
             )}
+            {!options?.parent_project_id && (
+                <div style={{ marginTop: 4, fontSize: 11, color: "#64748b" }}>
+                    本项目没有父项目（画布新建）：可在下方选择任意原始项目作为环境来源，
+                    并直接为它建/重建独立环境（POST /api/projects/&#123;id&#125;/env，轮询到终态后刷新）。
+                </div>
+            )}
+            <label style={{ ...labelStyle, marginTop: 8 }}>环境来源（原始项目，可就地建环境）</label>
+            <select
+                style={inputStyle}
+                value={envTarget ?? ""}
+                onChange={e => setEnvTargetId(e.target.value)}
+                disabled={running || !!envTaskId}
+            >
+                <option value="">{originals.length === 0 ? "（没有原始项目，请先创建）" : "请选择…"}</option>
+                {originals.map(p => (
+                    <option key={p.project_id} value={p.project_id}>
+                        {p.name || p.project_id}
+                        {p.project_id === options?.parent_project_id ? "（父项目）" : ""}
+                        {options?.environments.some(e => e.project_id === p.project_id) ? " · 环境已就绪" : " · 无环境"}
+                    </option>
+                ))}
+            </select>
             {envError && (
-                <div style={{ color: "#f87171", marginTop: 4, fontSize: 11 }}>{envError}</div>
+                <div style={{ color: "#f87171", marginTop: 4, fontSize: 11, whiteSpace: "pre-wrap" }}>{envError}</div>
             )}
 
             <div style={{ display: "flex", gap: 8, marginTop: 10 }}>

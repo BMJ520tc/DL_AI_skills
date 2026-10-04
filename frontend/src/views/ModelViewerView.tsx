@@ -9,22 +9,28 @@ import "@xyflow/react/dist/style.css";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
     ApiError,
+    createProjectEnv,
     getIr,
     getProject,
+    getProjectEnvStatus,
     getReport,
     listModules,
     listProjects,
+    listRunRecords,
     postAnalyze,
     postDecompose,
     postIngestModule,
+    postProjectVerify,
     postRegenerate,
     postTrace,
     postVerifyDecompose,
+    putIrInputSpec,
     putNodeParams,
     type IrNode,
     type IrResponse,
     type ModuleItem,
     type Project,
+    type RunRecord,
     type Task,
     type Verification,
 } from "../api/client";
@@ -55,7 +61,7 @@ const KIND_LABELS: Record<string, string> = {
     op: "算子",
 };
 
-type TaskKind = "analyze" | "decompose" | "trace" | "verify" | "ingest";
+type TaskKind = "analyze" | "decompose" | "trace" | "verify" | "ingest" | "smoke";
 
 export type ModelViewerViewProps = {
     projectId: string;
@@ -397,16 +403,135 @@ function IrTree({
 }
 
 // ---------------------------------------------------------------------------
+// 结构分析报告（只读渲染 GET /api/projects/{id}/report 的既有字段）
+// ---------------------------------------------------------------------------
+function asArray(value: unknown): Array<Record<string, unknown>> {
+    return Array.isArray(value) ? (value.filter(v => v && typeof v === "object") as Array<Record<string, unknown>>) : [];
+}
+
+function asStringList(value: unknown): string[] {
+    return Array.isArray(value) ? value.map(v => String(v)) : [];
+}
+
+/** 折叠小节（报告只读展示用；默认展开，长清单可收起）。 */
+function ReportSection({
+    title,
+    count,
+    children,
+    defaultOpen = true,
+}: {
+    title: string;
+    count: number;
+    children: ReactNode;
+    defaultOpen?: boolean;
+}) {
+    return (
+        <details open={defaultOpen} style={{ marginBottom: 10, border: "1px solid #1f2937", borderRadius: 6 }}>
+            <summary style={{ cursor: "pointer", padding: "5px 8px", fontSize: 12, fontWeight: 700, color: "#cbd5e1" }}>
+                {title} <span style={{ color: "#64748b", fontWeight: 400 }}>（{count}）</span>
+            </summary>
+            <div style={{ padding: "4px 8px 8px", fontSize: 11, color: "#94a3b8" }}>
+                {count === 0 ? <div style={{ color: "#64748b" }}>（无）</div> : children}
+            </div>
+        </details>
+    );
+}
+
+function StructureReportView({ report }: { report: Record<string, unknown> }) {
+    const entries = asStringList(report.entry_points);
+    const modelFiles = asStringList(report.model_files);
+    const hierarchy = asArray(report.module_hierarchy);
+    const trainFlow = asArray(report.train_flow);
+    const inferenceFlow = asArray(report.inference_flow);
+    const deps = asArray(report.dependencies);
+    const uncertain = asArray(report.uncertain);
+    const supplements = asArray((report.dynamic_supplement as Record<string, unknown> | undefined)?.supplements);
+    const rowStyle: CSSProperties = { fontFamily: "monospace", padding: "1px 0" };
+
+    return (
+        <div style={{ fontSize: 12 }}>
+            <div style={{ color: "#64748b", fontSize: 11, marginBottom: 8 }}>
+                结构分析报告（structure_report.json，只读；重新点「① 结构分析」会覆盖）
+            </div>
+
+            <ReportSection title="入口脚本" count={entries.length}>
+                {entries.map(e => <div key={e} style={rowStyle}>{e}</div>)}
+            </ReportSection>
+
+            <ReportSection title="模型文件（nn.Module 所在文件）" count={modelFiles.length}>
+                {modelFiles.map(f => <div key={f} style={rowStyle}>{f}</div>)}
+            </ReportSection>
+
+            <ReportSection title="模型类层级（继承关系）" count={hierarchy.length} defaultOpen={false}>
+                {hierarchy.map((h, i) => (
+                    <div key={i} style={rowStyle}>
+                        {String(h.class ?? "?")} ← {String(h.parent ?? "?")} <span style={{ color: "#64748b" }}>{String(h.file ?? "")}</span>
+                    </div>
+                ))}
+            </ReportSection>
+
+            <ReportSection title="训练 / 推理流程函数" count={trainFlow.length + inferenceFlow.length} defaultOpen={false}>
+                {trainFlow.map((f, i) => (
+                    <div key={`t${i}`} style={rowStyle}>训练 {String(f.function ?? "?")} <span style={{ color: "#64748b" }}>{String(f.file ?? "")}</span></div>
+                ))}
+                {inferenceFlow.map((f, i) => (
+                    <div key={`i${i}`} style={rowStyle}>推理 {String(f.function ?? "?")} <span style={{ color: "#64748b" }}>{String(f.file ?? "")}</span></div>
+                ))}
+            </ReportSection>
+
+            <ReportSection title="依赖及版本要求" count={deps.length}>
+                {deps.map((d, i) => (
+                    <div key={i} style={rowStyle}>
+                        {String(d.name ?? "?")}
+                        <span style={{ color: d.version_spec ? "#2dd4bf" : "#64748b" }}>
+                            {d.version_spec ? String(d.version_spec) : "（未在 requirements 中锁定版本）"}
+                        </span>
+                        {Array.isArray(d.used_in) && d.used_in.length > 0 && (
+                            <span style={{ color: "#64748b" }}> · 用于 {asStringList(d.used_in).join("、")}</span>
+                        )}
+                    </div>
+                ))}
+            </ReportSection>
+
+            <ReportSection title="不确定项（agent 动态补充的输入）" count={uncertain.length}>
+                {uncertain.map((u, i) => (
+                    <div key={i} style={{ ...rowStyle, fontFamily: "inherit" }}>
+                        <span style={{ color: "#f59e0b" }}>{String(u.reason ?? "?")}</span>
+                        <span style={{ color: "#64748b" }}> · {String(u.file ?? "")}</span>
+                    </div>
+                ))}
+            </ReportSection>
+
+            <ReportSection title="动态行为补充判断（agent）" count={supplements.length}>
+                {supplements.map((s, i) => (
+                    <div key={i} style={{ marginBottom: 6 }}>
+                        <div style={{ color: "#f59e0b" }}>{String(s.reason ?? "?")}</div>
+                        <div>判定：{String(s.judgement ?? s.note ?? "—")}</div>
+                        <div style={{ color: "#64748b" }}>{String(s.file ?? "")}</div>
+                    </div>
+                ))}
+                {supplements.length === 0 && typeof report.dynamic_supplement === "object" && report.dynamic_supplement !== null && (
+                    <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 11 }}>
+                        {JSON.stringify(report.dynamic_supplement, null, 2)}
+                    </pre>
+                )}
+            </ReportSection>
+        </div>
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 主视图
 // ---------------------------------------------------------------------------
 export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: ModelViewerViewProps) {
     const [project, setProject] = useState<Project | null>(null);
     const [reportOk, setReportOk] = useState<boolean | null>(null);
+    const [report, setReport] = useState<Record<string, unknown> | null>(null);
     const [irResp, setIrResp] = useState<IrResponse | null>(null);
     const [code, setCode] = useState<string | null>(null);
     const [regenError, setRegenError] = useState<{ error: string; missing: string[] } | null>(null);
     const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
-    const [tab, setTab] = useState<"params" | "code" | "verify" | "tree">("params");
+    const [tab, setTab] = useState<"params" | "code" | "verify" | "tree" | "report">("params");
     const [showDiagram, setShowDiagram] = useState(false);
     const [showShapes, setShowShapes] = useState(true);
     const [savingParams, setSavingParams] = useState(false);
@@ -420,6 +545,16 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
     const [entryMode, setEntryMode] = useState<EntryMode>("decompose");
     const [collapsedContainers, setCollapsedContainers] = useState<Set<string>>(() => new Set());
     const [treeCollapsed, setTreeCollapsed] = useState<Set<string>>(() => new Set());
+    // 模块一：独立环境（建/重建）+ 最小可运行命令验证（run_record）
+    const [envStatus, setEnvStatus] = useState<string | null>(null);
+    const [envTaskId, setEnvTaskId] = useState<string | null>(null);
+    const [envError, setEnvError] = useState<string | null>(null);
+    const [smokeRuns, setSmokeRuns] = useState<RunRecord[]>([]);
+    // 模块四 6.2：入口输入规格补参（agent 给不出维度时的唯一通道）
+    const [specShape, setSpecShape] = useState("");
+    const [specDtype, setSpecDtype] = useState("");
+    const [specError, setSpecError] = useState<string | null>(null);
+    const [savingSpec, setSavingSpec] = useState(false);
 
     // 同步重入保护：点击即写 ref（同一 tick 内后续点击被拦截），state 同步驱动按钮 disabled
     const [busy, setBusy] = useState<Set<string>>(() => new Set());
@@ -437,6 +572,40 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
     const vStatus = irResp?.verification_status ?? "none";
 
     // ---------------- 加载 ----------------
+    /** 结构报告内容（存在即渲染；404 视为尚未分析，不阻塞拆解链路）。 */
+    const refreshReport = useCallback(async () => {
+        try {
+            setReport(await getReport(projectId));
+            setReportOk(true);
+        } catch (e) {
+            setReport(null);
+            if (e instanceof ApiError && e.status === 404) setReportOk(false);
+            // 其他错误不阻塞：拆解任务本身会校验结构报告
+        }
+    }, [projectId]);
+
+    /** 独立环境状态（未创建/创建中/env_ready/env_failed 如实展示，不静默）。 */
+    const refreshEnvStatus = useCallback(async () => {
+        try {
+            setEnvStatus((await getProjectEnvStatus(projectId)).status);
+        } catch (e) {
+            setEnvStatus(null);
+            if (!(e instanceof ApiError && e.status === 404)) {
+                setEnvError(e instanceof Error ? e.message : String(e));
+            }
+        }
+    }, [projectId]);
+
+    /** 本项目的最小可运行命令运行记录（run_type=smoke_run，含失败记录）。 */
+    const refreshSmokeRuns = useCallback(async () => {
+        try {
+            const rows = await listRunRecords(projectId);
+            setSmokeRuns(rows.filter(r => r.run_type === "smoke_run"));
+        } catch {
+            // 运行记录读不到不阻塞主链路（任务横幅仍会给出失败原因）
+        }
+    }, [projectId]);
+
     useEffect(() => {
         void (async () => {
             try {
@@ -444,13 +613,9 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
             } catch (e) {
                 setBanner(e instanceof Error ? e.message : String(e));
             }
-            try {
-                await getReport(projectId);
-                setReportOk(true);
-            } catch (e) {
-                if (e instanceof ApiError && e.status === 404) setReportOk(false);
-                // 其他错误不阻塞：拆解任务本身会校验结构报告
-            }
+            await refreshReport();
+            await refreshEnvStatus();
+            await refreshSmokeRuns();
             try {
                 setIrResp(await getIr(projectId));
             } catch (e) {
@@ -458,7 +623,7 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                 else setBanner(`IR 读取失败：${e instanceof Error ? e.message : String(e)}`);
             }
         })();
-    }, [projectId]);
+    }, [projectId, refreshReport, refreshEnvStatus, refreshSmokeRuns]);
 
     const refreshIr = useCallback(async () => {
         try {
@@ -488,7 +653,25 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
         onError: message => {
             if (task) markBusy(task.kind, false);
             setBanner(message);
+            // 失败也要把 run_record（含真实命令与报错）刷出来，供用户复核
+            if (task?.kind === "smoke") void refreshSmokeRuns();
             setTask(null);
+        },
+    });
+
+    // 独立环境创建任务：终态刷新环境状态；失败把原因透出（不静默）
+    useTaskPolling({
+        taskId: envTaskId,
+        onDone: async () => {
+            setEnvTaskId(null);
+            setEnvError(null);
+            await refreshEnvStatus();
+            setFlash("独立环境已就绪（可重跑最小命令验证或补形状）");
+        },
+        onError: async message => {
+            setEnvTaskId(null);
+            setEnvError(message);
+            await refreshEnvStatus();
         },
     });
 
@@ -515,6 +698,8 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
     // ---------------- 操作链 ----------------
     const afterAnalyze = async () => {
         setReportOk(true);
+        await refreshReport();
+        setTab("report");   // 分析完成直接展示报告内容（此前只判「有没有」，内容不渲染）
     };
     const afterDecompose = async () => {
         await refreshIr();
@@ -583,6 +768,66 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
             setBanner(e instanceof Error ? e.message : String(e));
         } finally {
             setSavingParams(false);
+        }
+    };
+
+    // ---------------- 模块一：独立环境 + 最小可运行命令验证 ----------------
+
+    /** 建/重建独立环境（POST /api/projects/{id}/env，异步任务轮询到终态）。 */
+    const handleCreateEnv = () => {
+        if (envTaskId) return;
+        setEnvError(null);
+        setBanner(null);
+        void (async () => {
+            try {
+                const { task_id } = await createProjectEnv(projectId);
+                setEnvTaskId(task_id);
+            } catch (e) {
+                setEnvError(e instanceof Error ? e.message : String(e));
+            }
+        })();
+    };
+
+    /** 最小可运行命令验证（POST /verify：定位并真跑一条命令，逐条落 run_record）。 */
+    const handleSmokeVerify = () => {
+        runTask("smoke", () => postProjectVerify(projectId), async () => {
+            await refreshSmokeRuns();
+            await refreshEnvStatus();
+            setFlash("最小可运行命令验证已完成（结果见下方 run_record）");
+        });
+    };
+
+    // ---------------- 模块四 6.2：入口输入规格补参 ----------------
+
+    /** 解析逗号/空格分隔的维度串；非正整数一律拒绝（后端同样只收正整数数组）。 */
+    const parseShapeDraft = (raw: string): { shape: number[] | null; error: string | null } => {
+        const parts = raw.split(/[,，\s]+/).filter(Boolean);
+        if (!parts.length) return { shape: null, error: "请输入至少一个维度，如 1, 3, 224, 224" };
+        const nums: number[] = [];
+        for (const p of parts) {
+            const n = Number(p);
+            if (!Number.isInteger(n) || n <= 0) return { shape: null, error: `维度「${p}」不是正整数（不接受 null/0/负数）` };
+            nums.push(n);
+        }
+        return { shape: nums, error: null };
+    };
+
+    const handleSaveInputSpec = async () => {
+        const { shape, error } = parseShapeDraft(specShape);
+        if (error || !shape) {
+            setSpecError(error);
+            return;
+        }
+        setSpecError(null);
+        setSavingSpec(true);
+        try {
+            await putIrInputSpec(projectId, shape, specDtype.trim() || null);
+            await refreshIr();
+            setFlash("输入规格已保存；IR 已变化，旧验证变 stale，入库前需重新验证");
+        } catch (e) {
+            setBanner(e instanceof Error ? e.message : String(e));
+        } finally {
+            setSavingSpec(false);
         }
     };
 
@@ -824,6 +1069,61 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                             </label>
                             {ir && <span style={{ fontSize: 11, color: "#64748b" }}>IR 已生成，入口 {ir.entry_class}</span>}
                         </div>
+                        {/* 模块一 2.3：独立环境与最小可运行命令验证（拆解/补形状/复现都依赖它） */}
+                        <div
+                            style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 10,
+                                flexWrap: "wrap",
+                                border: "1px solid #1f2937",
+                                borderRadius: 8,
+                                padding: "6px 10px",
+                                marginBottom: 8,
+                                background: "#0f172a",
+                            }}
+                        >
+                            <span style={{ fontSize: 11, color: "#94a3b8" }}>
+                                独立环境：
+                                <b style={{ color: envTone(envStatus).color, marginLeft: 4 }}>{envLabel(envStatus)}</b>
+                            </span>
+                            <button style={btnStyle} onClick={handleCreateEnv} disabled={!!envTaskId || busy.has("smoke")}>
+                                {envTaskId ? "创建中…" : envStatus === "env_ready" ? "重建独立环境" : "建独立环境"}
+                            </button>
+                            <button
+                                style={btnStyle}
+                                onClick={handleSmokeVerify}
+                                disabled={!!task || busy.has("smoke") || !!envTaskId}
+                                title="在项目独立环境里定位并真跑一条最小命令；结果逐条落 run_record（失败原因不隐藏）"
+                            >
+                                最小可运行命令验证
+                            </button>
+                            {envStatus === "env_ready" ? null : (
+                                <span style={{ fontSize: 11, color: "#d97706" }}>
+                                    独立环境是「最小命令验证 / 补形状 / 复现」的前提；未就绪时会如实报错（点左侧按钮可建/重建）
+                                </span>
+                            )}
+                        </div>
+                        {envError && (
+                            <div style={{ ...infoBanner, background: "#3f1d1d", borderColor: "#b91c1c", color: "#fecaca" }}>
+                                环境创建失败：{envError}
+                                <button style={{ ...btnStyle, marginLeft: 10 }} onClick={() => setEnvError(null)}>关闭</button>
+                            </div>
+                        )}
+                        {smokeRuns.length > 0 && (
+                            <div style={{ border: "1px solid #1f2937", borderRadius: 8, padding: "6px 10px", marginBottom: 8 }}>
+                                <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>
+                                    最小可运行命令 run_record（最近 {Math.min(smokeRuns.length, 3)} 条，只读）
+                                </div>
+                                {smokeRuns.slice(0, 3).map(r => (
+                                    <div key={r.run_id} style={{ fontSize: 11, fontFamily: "monospace", color: r.status === "success" ? "#86efac" : "#fca5a5" }}>
+                                        [{r.status}] {r.command ?? "（未定位到命令）"}
+                                        {r.error ? ` — ${r.error.slice(0, 200)}` : ""}
+                                        {r.started_at ? ` · ${r.started_at.slice(0, 19).replace("T", " ")}` : ""}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
                         {steps}
                     </>
                 ) : (
@@ -940,7 +1240,7 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                 {/* 右：面板 */}
                 <div style={{ width: 380, borderLeft: "1px solid #1f2937", display: "flex", flexDirection: "column", minHeight: 0, background: "#0f172a" }}>
                     <div style={{ display: "flex", borderBottom: "1px solid #1f2937" }}>
-                        {(["params", "code", "verify", "tree"] as const).map(t => (
+                        {(["params", "code", "verify", "tree", "report"] as const).map(t => (
                             <button
                                 key={t}
                                 onClick={() => setTab(t)}
@@ -956,13 +1256,44 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                                     cursor: "pointer",
                                 }}
                             >
-                                {t === "params" ? "参数" : t === "code" ? "代码" : t === "verify" ? "验证" : "层级树"}
+                                {t === "params" ? "参数" : t === "code" ? "代码" : t === "verify" ? "验证" : t === "tree" ? "层级树" : "报告"}
                             </button>
                         ))}
                     </div>
                     <div style={{ flex: 1, overflowY: "auto", padding: 14 }}>
                         {tab === "params" && (
-                            selectedNode ? (
+                            <div>
+                                {/* 模块四 6.2：入口输入规格补参（agent 给不出维度时的唯一通道） */}
+                                {ir && (
+                                    <div style={{ border: "1px solid #1f2937", borderRadius: 8, padding: "8px 10px", marginBottom: 12 }}>
+                                        <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4 }}>入口输入规格（input_spec）</div>
+                                        <div style={{ fontSize: 11, color: "#94a3b8", fontFamily: "monospace", marginBottom: 6 }}>
+                                            当前：{ir.input_spec ? `${JSON.stringify(ir.input_spec.shape)}${ir.input_spec.dtype ? ` dtype=${ir.input_spec.dtype}` : ""}` : "（agent 未给出具体维度）"}
+                                        </div>
+                                        <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6 }}>
+                                            <input
+                                                style={{ ...inputStyle, flex: 1, fontFamily: "monospace" }}
+                                                placeholder="shape，如 1, 3, 224, 224"
+                                                value={specShape}
+                                                onChange={e => setSpecShape(e.target.value)}
+                                            />
+                                            <input
+                                                style={{ ...inputStyle, width: 90, fontFamily: "monospace" }}
+                                                placeholder="dtype（可选）"
+                                                value={specDtype}
+                                                onChange={e => setSpecDtype(e.target.value)}
+                                            />
+                                        </div>
+                                        {specError && <div style={{ color: "#fca5a5", fontSize: 11, marginBottom: 6 }}>{specError}</div>}
+                                        <button style={{ ...btnStyle, width: "100%" }} disabled={savingSpec} onClick={() => void handleSaveInputSpec()}>
+                                            {savingSpec ? "保存中…" : "保存输入规格（旧验证将变 stale）"}
+                                        </button>
+                                        <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
+                                            shape 需为正整数数组；写回后旧验证失效，入库前需重新走「⑤ 两步验证」。
+                                        </div>
+                                    </div>
+                                )}
+                                {selectedNode ? (
                                 <div>
                                     <div style={{ fontWeight: 700, marginBottom: 4 }}>
                                         {selectedNode.class_name || selectedNode.id}
@@ -980,7 +1311,8 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                                 </div>
                             ) : (
                                 <div style={{ color: "#64748b", fontSize: 12 }}>在结构图中点击节点查看/编辑参数</div>
-                            )
+                            )}
+                            </div>
                         )}
 
                         {tab === "code" && (
@@ -1133,6 +1465,16 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                                 setCollapsed={setTreeCollapsed}
                             />
                         )}
+
+                        {tab === "report" && (
+                            report ? (
+                                <StructureReportView report={report} />
+                            ) : (
+                                <div style={{ color: "#64748b", fontSize: 12 }}>
+                                    尚无结构报告（structure_report.json）。在操作链点「① 结构分析」生成。
+                                </div>
+                            )
+                        )}
                     </div>
                 </div>
             </div>
@@ -1180,6 +1522,23 @@ const inputStyle: CSSProperties = {
     fontSize: 12,
 };
 const tdStyle: CSSProperties = { padding: "3px 6px", borderBottom: "1px solid #1f2937" };
+
+/** 独立环境状态。
+ *  后端 GET /api/projects/{id}/env 返回的是**项目状态字段**：建环境成功=env_ready、失败=env_failed，
+ *  之后结构分析等步骤会把状态改成别的值（如 analyzed），此时不能据此断定环境不在，
+ *  故如实标为「未确认」并给原始状态，由「最小可运行命令验证」实际判定。 */
+function envLabel(status: string | null): string {
+    if (status === "env_ready") return "已就绪";
+    if (status === "env_failed") return "创建失败（可重建）";
+    if (status === "loading" || status === "preparing" || status === "queued" || status === "running") return "创建中…";
+    return status ? `未确认（项目状态 ${status}）` : "未创建";
+}
+
+function envTone(status: string | null): { color: string } {
+    if (status === "env_ready") return { color: "#4ade80" };
+    if (status === "env_failed") return { color: "#f87171" };
+    return { color: "#d97706" };
+}
 
 /** 差异层条目（结构比对/数值比对共用的对象结构）→ 一行可读文本。 */
 function formatDiffLayer(l: Record<string, unknown>): string {
