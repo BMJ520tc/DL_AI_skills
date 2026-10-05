@@ -631,11 +631,21 @@ def _missing_dep_to_fix(error: Optional[str], already: list[str]) -> Optional[st
 
 
 async def _install_missing_dep(project_id: str, task_id: str, env_dir: Path, package: str) -> bool:
-    """补装缺包并留痕（run_type=env_install，step=smoke_missing_dep）；返回是否装成功。"""
-    from app.services import env_manager  # 延迟导入：避开 analysis_service ↔ env_manager 环
+    """补装缺包并留痕（run_type=env_install，step=smoke_missing_dep）；返回是否装成功。
+
+    装成功后同时把它记进项目的**额外依赖清单**——否则重建环境按仓库清单重装又会缺这个包
+    （2026-10-06 scGPT/IPython 实测：重建后补形状直接挂）。
+    """
+    from app.services import env_manager, project_manager  # 延迟导入：避开循环依赖
 
     started = _now()
     res = await env_manager.install_missing_package(env_dir, package)
+    if res.get("ok"):
+        try:
+            ws = Path(project_manager.get_project(project_id)["workspace_path"])
+            env_manager.record_extra_dep(ws, package)
+        except Exception as e:  # noqa: BLE001 —— 记录失败不影响本次自愈（外层 run_record 已留痕）
+            print(f"[env] 记录额外依赖失败：project={project_id} package={package} err={e}")
     knowledge_service.record_run({
         "project_id": project_id, "task_id": task_id, "run_type": "env_install",
         "params": {"step": "smoke_missing_dep", "package": package},

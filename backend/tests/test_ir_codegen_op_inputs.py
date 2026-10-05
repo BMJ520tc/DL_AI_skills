@@ -97,14 +97,35 @@ def test_single_input_signature_unchanged_without_declaration():
     assert "var_a = self.a(x)" in code and "var_b = self.b(x)" in code
 
 
-def test_leaf_with_two_in_edges_is_still_rejected():
-    """**叶子**仍是单张量输入（多操作数叶子表达不了）；要多输入用 **module 节点**（见下）。"""
+def test_whitelist_leaf_with_two_in_edges_is_still_rejected():
+    """**白名单叶子**（无 code_hint）仍是单张量输入——多输入要么用 module 节点，要么给叶子一个
+    `code_hint`（后者是**复合层折叠**的合法形态，见 `test_code_hint_leaf_may_take_multiple_inputs`）。"""
     ir = _two_input_ir()
-    ir["nodes"].append({"id": "cos", "kind": "leaf", "class_name": "nn.CosineSimilarity",
-                        "parent_id": "net", "code_hint": "nn.CosineSimilarity(dim=-1)"})
-    ir["edges"] = [{"from": "a", "to": "cos"}, {"from": "b", "to": "cos"}]
+    ir["nodes"].append({"id": "fc", "kind": "leaf", "class_name": "nn.Linear",
+                        "parent_id": "net", "params": {"in_features": 4, "out_features": 2}})
+    ir["edges"] = [{"from": "a", "to": "fc"}, {"from": "b", "to": "fc"}]
     with pytest.raises(IrIncompleteError, match="多条入边"):
         ir_codegen.generate(ir)
+
+
+def test_code_hint_leaf_may_take_multiple_inputs():
+    """带 `code_hint` 的**复合叶子**按入边序传多个实参——折叠 `nn.TransformerEncoder` 这类
+    「构造一次、forward 吃多个张量」的层；built-in 白名单叶子仍受单输入限制。"""
+    ir = {
+        "source_file": "m.py", "entry_class": "Net", "task_type": "classification",
+        "input_spec": {"shape": [1, 4], "dtype": "float32"}, "root_id": "net",
+        "nodes": [
+            {"id": "net", "kind": "module", "class_name": "Net", "parent_id": None, "module_path": ""},
+            {"id": "a", "kind": "leaf", "class_name": "nn.Identity", "parent_id": "net"},
+            {"id": "b", "kind": "leaf", "class_name": "nn.Identity", "parent_id": "net"},
+            {"id": "enc", "kind": "leaf", "class_name": "nn.TransformerEncoder", "parent_id": "net",
+             "code_hint": "nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=4, nhead=2), num_layers=1)"},
+        ],
+        "edges": [{"from": "a", "to": "enc"}, {"from": "b", "to": "enc"}],
+    }
+    code = ir_codegen.generate(ir)
+    assert "self.enc = nn.TransformerEncoder(" in code
+    assert "self.enc(var_a, var_b)" in code
 
 
 def test_multi_input_module_gets_params_matching_its_in_edges():

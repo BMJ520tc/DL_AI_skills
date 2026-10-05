@@ -53,13 +53,24 @@ _CONF_ALIASES = {
 }
 
 
+def _as_text(v) -> str:
+    """把「本该是字符串」的字段安全取成 str —— 非字符串（模型偶尔把 content/confidence 给成数字或对象）
+    一律视为空。
+
+    LLM 产出的结构化字段**值**同样会漂移（先例：scope 出现列表/别名键、confidence 出现 `medium-high`）。
+    此前 `(item.get("content") or "").strip()` 在 content 是数字（如 `0.9`）时直接
+    `'float' object has no attribute 'strip'`，把整条蒸馏任务打挂（2026-10-05 实测）。
+    """
+    return v if isinstance(v, str) else ""
+
+
 def _normalize_confidence(raw) -> str:
     """confidence 归一到 {high, medium, low}（数据设计六.2）。
 
     实测模型写过 `medium-high` 这类超出枚举的值；先查显式别名、再按词根兜底，未知/缺失归 `low`
     （蒸馏默认保守）。
     """
-    c = (raw or "").strip().lower()
+    c = _as_text(raw).strip().lower()
     if c in ("high", "medium", "low"):
         return c
     if c in _CONF_ALIASES:
@@ -77,7 +88,7 @@ def _normalize_type(raw, allowed: Optional[tuple] = None) -> str:
     `allowed` 限定某来源允许的类型集合：越界（如论文蒸馏里模型误写 fusion_insight）时回落到
     allowed 首项，避免把「多模型综合分析结论」这类专属类型混进别的来源。
     """
-    t = (raw or "").strip()
+    t = _as_text(raw).strip()
     if t not in _KNOWLEDGE_TYPES:
         t = _TYPE_ALIASES.get(t.lower(), "usage_guidance")
     if allowed and t not in allowed:
@@ -209,14 +220,14 @@ async def _draft_from_run(run: dict, source_task_id: str) -> list[str]:
     result = await agent_service.run_sync(_prompt(run, related), output_schema=DISTILL_SCHEMA, timeout_s=180)
     ids: list[str] = []
     for item in _knowledge_items(result.get("structured_output")):
-        if not (item.get("content") or "").strip():
+        if not _as_text(item.get("content")).strip():
             continue  # 空结论不落条目（8.3 异常边界）
         structured = dict(item.get("structured") or {})
         structured.setdefault("run_id", run.get("run_id"))
         structured["source_task_id"] = source_task_id
         kid = knowledge_service.record_knowledge({
             "type": _normalize_type(item.get("type")),
-            "title": item.get("title") or f"{run.get('run_type')} 蒸馏结论",
+            "title": _as_text(item.get("title")) or f"{run.get('run_type')} 蒸馏结论",
             "content": item.get("content"),
             "structured": structured,
             "sources": [{"type": "run_record", "ref": run.get("run_id")}],
@@ -316,7 +327,7 @@ async def distill_paper(paper_id: str) -> list[str]:
     result = await agent_service.run_sync(_paper_prompt(digest), output_schema=DISTILL_SCHEMA, timeout_s=180)
     ids: list[str] = []
     for item in _knowledge_items(result.get("structured_output")):
-        if not (item.get("content") or "").strip():
+        if not _as_text(item.get("content")).strip():
             continue
         structured = dict(item.get("structured") or {})
         structured["source_paper_id"] = paper_id
@@ -324,7 +335,7 @@ async def distill_paper(paper_id: str) -> list[str]:
             # 论文蒸馏的结论只能是使用建议/参数建议/复现不一致（fusion_insight 属多模型分析专用）
             "type": _normalize_type(item.get("type"),
                                     allowed=("usage_guidance", "param_advice", "reproduction_discrepancy")),
-            "title": item.get("title") or f"论文蒸馏：{digest['title'] or paper_id}",
+            "title": _as_text(item.get("title")) or f"论文蒸馏：{digest['title'] or paper_id}",
             "content": item.get("content"),
             "structured": structured,
             "sources": [{"type": "paper", "ref": paper_id}],

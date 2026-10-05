@@ -195,7 +195,7 @@ async def start() -> None:
     global _queue, _worker_task
     stale = reconcile_stale_tasks()
     if stale:
-        print(f"[task] 启动收敛：{stale} 个残留 running 任务已置为 failed（服务重启中断，可重试）")
+        print(f"[task] 启动收敛：{stale} 个残留任务（running/queued）已置为 failed（服务重启中断，可重试）")
     if _queue is None:
         _queue = asyncio.Queue()
     if _worker_task is None:
@@ -203,21 +203,32 @@ async def start() -> None:
 
 
 def reconcile_stale_tasks() -> int:
-    """启动时收敛残留 running 任务，返回被收敛的条数。
+    """启动时收敛残留 running / queued 任务，返回被收敛的条数。
 
-    状态机（2.1）只有 queued → running → success/failed/cancelled，没有「进程崩溃」迁移边：
-    服务重启后，上次进程中被中断的任务会永久停在 running——worker 不会拾取它（队列是内存态），
-    它也无法经 retry（要求 failed）重新入队。此处统一置 failed 并写明原因，
-    使状态可自洽、可用现有 retry 通道重新入队（failed → queued）。
+    状态机（2.1）只有 queued → running → success/failed/cancelled，没有「进程崩溃」迁移边；
+    2.1「异常与边界」写明「执行进程崩溃→任务标记 failed」。服务重启后有两类残留都会卡死：
+    - `running`：worker 不会拾取（队列是内存态），也无法经 retry（要求 failed）；
+    - `queued`：**队列同样是内存态，重启即清空**，永远不会被拾取；更糟的是 `create_task` 的
+      「同参数已在 queued/running 即复用」会把后续提交也一并吃掉（2026-10-05 实测：补形状点了
+      几次都显示「在跑」、其实一个字节都没执行）。
+    两类都统一置 failed 并写明原因，可用现有 retry 通道重新入队（failed → queued）。
     """
     conn = get_connection()
     try:
+        total = 0
         cur = conn.execute(
             "UPDATE task SET status = 'failed', error = ?, updated_at = ? WHERE status = 'running'",
             ("服务重启中断：任务未执行完（残留 running 状态由启动收敛置为 failed，可重试）", _now()),
         )
+        total += cur.rowcount
+        cur = conn.execute(
+            "UPDATE task SET status = 'failed', error = ?, updated_at = ? WHERE status = 'queued'",
+            ("服务重启中断：任务未被执行（队列为内存态，重启即清空）——"
+             "残留 queued 由启动收敛置为 failed，可直接重试", _now()),
+        )
+        total += cur.rowcount
         conn.commit()
-        return cur.rowcount
+        return total
     finally:
         conn.close()
 

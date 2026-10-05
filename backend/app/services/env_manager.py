@@ -221,7 +221,7 @@ async def _run_env_create(params: dict, task_id: str) -> None:
     )
 
     report("环境已创建，开始安装依赖…")
-    ok = await _install_with_fix(source, env_dir, project_id, task_id, env_type, report)
+    ok = await _install_with_fix(source, env_dir, project_id, task_id, env_type, report, ws=ws)
     if ok:
         project_manager.update_status(project_id, "env_ready")
         report("环境就绪 ✓")
@@ -336,6 +336,7 @@ async def _create_env_dir(env_type: str, source: Path, env_dir: Path, cmd: list[
 
 async def _install_with_fix(
     source: Path, env_dir: Path, project_id: str, task_id: str, env_type: str, report=None,
+    ws: Optional[Path] = None,
 ) -> bool:
     def _report(stage: str, **extra) -> None:
         if report is not None:
@@ -370,12 +371,15 @@ async def _install_with_fix(
         _report("检测到 CUDA 要求，改用 CPU 版 wheel", env_cuda=cuda_plan)
     index_url = PIP_INDEX_URL  # None → 用 pip 自身配置（用户 pip.ini）
 
+    attempt = 0
+    ok = False
     for attempt in range(1, 4):
         _report(f"安装依赖（第 {attempt}/3 次尝试）…（下载/安装可能数分钟）")
         result = await _try_install(pip, req_file, index_url, extra_index_url)
         _record_install(project_id, task_id, attempt, result, versions, env_type)
         if result["ok"]:
-            return True
+            ok = True
+            break
         # 索引不可达（非依赖冲突）：切备源重试一次，不消耗依赖修正循环
         if index_url != PIP_FALLBACK_INDEX and _is_index_error(result["error"]):
             index_url = PIP_FALLBACK_INDEX
@@ -383,7 +387,8 @@ async def _install_with_fix(
             result = await _try_install(pip, req_file, index_url, extra_index_url)
             _record_install(project_id, task_id, attempt, result, versions, env_type, step="pip_install_fallback")
             if result["ok"]:
-                return True
+                ok = True
+                break
         # Windows 260 字符路径上限：同一路径必然再失败，重试只是白等几分钟 → 立刻中止，
         # 由界面给出「开启长路径支持」入口（见 services/long_paths）
         if long_paths.is_long_path_error(result["error"]) and not long_paths.is_enabled():
@@ -403,7 +408,11 @@ async def _install_with_fix(
             "requirements_updated": new_req is not req_file,
         })
         req_file = new_req
-    return False
+    if not ok:
+        return False
+    # 主清单装好后，再装「额外依赖」（清单漏声明、此前由缺包自愈补装过的包）：重建环境因此能复现。
+    return await _install_extras(pip, ws or source.parent, attempt, index_url, extra_index_url,
+                                 versions, project_id, task_id, env_type, _report)
 
 
 def _env_python(env_dir: Path) -> str:
@@ -418,6 +427,67 @@ def _env_pip(env_dir: Path) -> str:
         if c.exists():
             return str(c)
     return str(env_dir / "Scripts" / "pip.exe")
+
+
+def extra_deps_path(ws: Path) -> Path:
+    """项目的「额外依赖」清单（pip requirements 语法，一行一个包）。
+
+    存放位置是**工作区**（`<ws>/deps_extra.txt`）——工作区不随环境重建而清空，故重建环境能复现。
+    """
+    return ws / "deps_extra.txt"
+
+
+def load_extra_deps(ws: Path) -> list[str]:
+    p = extra_deps_path(ws)
+    if not p.exists():
+        return []
+    try:
+        return [ln.strip() for ln in p.read_text(encoding="utf-8").splitlines()
+                if ln.strip() and not ln.strip().startswith("#")]
+    except OSError:
+        return []
+
+
+def record_extra_dep(ws: Path, package: str) -> None:
+    """把「清单漏声明、装完 `import` 才发现缺」的包记进项目额外依赖清单。
+
+    背景（2026-10-06 scGPT/IPython 实测）：`install_missing_package` 能就地把缺包补装自愈，
+    但它**不留痕**——用户重建独立环境时按仓库清单重装，补装的包又没了，于是「昨天补形状好好的、
+    重建环境后补形状直接挂」，而且该包不在仓库 requirements 里，**每次重建都会再丢一次**。
+    记进工作区即可让重建复现出真实可用的环境。
+    """
+    pkg = (package or "").strip()
+    if not pkg:
+        return
+    def _base(name: str) -> str:
+        return name.split("==")[0].split(">=")[0].split("<=")[0].split(">")[0].split("<")[0].strip().lower()
+    names = load_extra_deps(ws)
+    if any(_base(n) == _base(pkg) for n in names):
+        return
+    names.append(pkg)
+    ws.mkdir(parents=True, exist_ok=True)
+    extra_deps_path(ws).write_text("\n".join(names) + "\n", encoding="utf-8")
+
+
+async def _install_extras(pip: str, ws: Path, attempt: int, index_url: Optional[str],
+                          extra_index_url: Optional[str], versions: dict,
+                          project_id: str, task_id: str, env_type: str, report) -> bool:
+    """安装项目「额外依赖」（清单漏声明、由缺包自愈补装过的包），使**重建环境**能复现可用环境。
+
+    没有额外依赖时直接 True。额外依赖安装失败即判本次建环境失败（否则会留下一个「建成功但 import
+    起不来」的环境，问题更隐蔽）。
+    """
+    extra = load_extra_deps(ws)
+    if not extra:
+        return True
+    report(f"安装额外依赖（清单漏声明、此前自动补装的 {len(extra)} 个：{', '.join(extra)}）…")
+    result = await _try_install(pip, extra_deps_path(ws), index_url, extra_index_url)
+    _record_install(project_id, task_id, attempt, result, versions, env_type, step="pip_install_extra")
+    if result["ok"]:
+        return True
+    report("额外依赖安装失败（这些包不在仓库依赖清单里，但项目运行需要它们）",
+           env_extra_error=(result.get("error") or "")[-800:])
+    return False
 
 
 async def install_missing_package(env_dir: Path, package: str, timeout_s: int = INSTALL_TIMEOUT_S) -> dict:

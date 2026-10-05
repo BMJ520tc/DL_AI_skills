@@ -8,6 +8,7 @@ import importlib.util
 import json
 import sys
 import traceback
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
@@ -142,6 +143,19 @@ def _numeric_pass(rel_max: float, abs_max: float, rtol: float, atol: float) -> b
     return rel_max <= rtol or abs_max <= atol
 
 
+def _output_map(obj) -> tuple[bool, dict]:
+    """模型输出 → (是否 Mapping, {键: 张量})。
+
+    多输出头模型（如 scGPT 返回 `{mlm_output, cell_emb, cls_output, mvc_output, …}`）**必须逐个输出
+    比对**——只比「首个张量」会漏掉整条分支：实测再生成模型丢了 `mvc_output`、`loss_cce` 也算错，
+    而 ⑤ 仍判 passed（2026-10-06 坐实）。非 Mapping 输出用空串做键（等同「首个张量」口径）。
+    """
+    if isinstance(obj, Mapping):
+        return True, {str(k): v for k, v in obj.items() if torch.is_tensor(v)}
+    t = first_tensor(obj)
+    return False, ({"": t} if t is not None else {})
+
+
 def _diff_paths(ref_cap: list, test_cap: list, rtol: float, atol: float) -> list[dict]:
     """按位置对齐两模型的内部输出，返回不一致的层（最深者在前），路径取原模型命名。"""
     out: list[dict] = []
@@ -194,7 +208,9 @@ def main() -> None:
     # 前向失败（IR 内部不一致，例如改了 conv 的 out_channels 却未同步其后的 BN）→ 记业务失败，
     # 不让脚本异常退出：验证「不过」是正常结果，宿主据此落 run_record(status=failed)。
     forward_error: str | None = None
-    yo = yr = None
+    o_map: dict = {}
+    r_map: dict = {}
+    o_is_map = r_is_map = False
     torch.manual_seed(seeds[0])
     fkw = call_kwargs(spec)          # forward 关键字参数（如 CLS/MVC 分支开关）
     fkw_o = accepted_kwargs(orig.forward, fkw)    # 原模型按开关跑对应分支
@@ -204,13 +220,22 @@ def main() -> None:
     x0_g = accepted_positional(regen.forward, x0)   # 再生成模型只声明它消费的输入
     try:
         with torch.no_grad():
-            yo = first_tensor(orig(*x0_o, **fkw_o))   # dict/tuple 输出取首个张量（如 scGPT 返回 Mapping）
-            yr = first_tensor(regen(*x0_g, **fkw_g))
+            o_is_map, o_map = _output_map(orig(*x0_o, **fkw_o))
+            r_is_map, r_map = _output_map(regen(*x0_g, **fkw_g))
     except Exception as e:  # noqa: BLE001
         forward_error = f"{type(e).__name__}: {e}"
-    output_shape_match = yo is not None and yr is not None and list(yo.shape) == list(yr.shape)
+
+    # 输出**逐键**一致：多输出头模型少一个键 = 丢了一条分支（结构不一致），与形状不符同判。
+    missing_keys = sorted(set(o_map) - set(r_map))
+    extra_keys = sorted(set(r_map) - set(o_map))
+    keys_match = bool(o_map) and o_is_map == r_is_map and not missing_keys and not extra_keys
+    output_shape_match = keys_match and all(
+        list(o_map[k].shape) == list(r_map[k].shape) for k in o_map)
 
     structure = _compare_structure(orig, regen, output_shape_match)
+    structure["output_keys_match"] = keys_match
+    if missing_keys or extra_keys:
+        structure["output_key_diff"] = {"missing": missing_keys, "extra": extra_keys}
     if forward_error:
         structure["forward_error"] = forward_error
 
@@ -222,19 +247,39 @@ def main() -> None:
         torch.manual_seed(seed)
         x = (make_dummy_input(shape, dtype), *make_extra_inputs(spec))
         if seed == seeds[0]:
-            y_ref, y_test = yo, yr
+            o_m, r_m = o_map, r_map
         else:
-            y_ref = first_tensor(_run_capture(orig, accepted_positional(orig.forward, x), fkw_o)[0])
-            y_test = first_tensor(_run_capture(regen, accepted_positional(regen.forward, x), fkw_g)[0])
-        rel_max, abs_max = _max_errors(y_ref, y_test)
-        passed = _numeric_pass(rel_max, abs_max, rtol, atol)
-        record = {"seed": seed, "max_rel_err": rel_max, "max_abs_err": abs_max, "passed": passed}
-        if not passed:
-            _y, ref_cap = _run_capture(orig, x, fkw)
-            _y2, test_cap = _run_capture(regen, x, fkw)
+            o_m = _output_map(_run_capture(orig, accepted_positional(orig.forward, x), fkw_o)[0])[1]
+            r_m = _output_map(_run_capture(regen, accepted_positional(regen.forward, x), fkw_g)[0])[1]
+        miss = sorted(set(o_m) - set(r_m))
+        extra = sorted(set(r_m) - set(o_m))
+        passed = not miss and not extra
+        worst_rel = worst_abs = 0.0
+        per_key: dict = {}
+        for k in sorted(set(o_m) & set(r_m)):
+            if list(o_m[k].shape) != list(r_m[k].shape):
+                per_key[k or "(single)"] = {"passed": False, "note": "shape mismatch"}
+                passed = False
+                continue
+            rel_max, abs_max = _max_errors(o_m[k], r_m[k])
+            ok = _numeric_pass(rel_max, abs_max, rtol, atol)
+            per_key[k or "(single)"] = {"max_rel_err": rel_max, "max_abs_err": abs_max, "passed": ok}
+            worst_rel, worst_abs = max(worst_rel, rel_max), max(worst_abs, abs_max)
+            if not ok:
+                passed = False
+        record = {"seed": seed, "max_rel_err": worst_rel, "max_abs_err": worst_abs,
+                  "passed": passed, "per_key": per_key}
+        if miss or extra:
+            record["missing_keys"], record["extra_keys"] = miss, extra
+        if not passed and not (miss or extra):
+            # 逐层定位只在「键一致、数值不符」时有意义（键不一致时层对齐本就不可靠）；
+            # 且两模型都要按各自**接受的**实参/kwargs 调用——再生成模型的 forward 由 IR 生成，
+            # 未必认识 CLS/MVC 这些开关（原先传原始 fkw 会直接 TypeError，2026-10-06 踩到）。
+            _y, ref_cap = _run_capture(orig, accepted_positional(orig.forward, x), fkw_o)
+            _y2, test_cap = _run_capture(regen, accepted_positional(regen.forward, x), fkw_g)
             record["diff_layers"] = _diff_paths(ref_cap, test_cap, rtol, atol)
-            if first_fail is None:
-                first_fail = record
+        if not passed and first_fail is None:
+            first_fail = record
         per_seed.append(record)
 
     numeric = {"passed": not forward_error and all(r["passed"] for r in per_seed),
@@ -251,6 +296,12 @@ def main() -> None:
             f"结构比对失败: layer_sequence_match={structure['layer_sequence_match']}, "
             f"param_shapes_match={structure['param_shapes_match']}, param_count={pc}/{rpc}; "
             f"差异: {json.dumps(structure['diff_layers'][:3], ensure_ascii=False)}"
+        )
+    elif not structure["passed"] and structure.get("output_key_diff"):
+        d = structure["output_key_diff"]
+        failure_reason = (
+            f"输出分支不一致（多输出头模型必须逐个输出比对）: 再生成模型缺少 {d['missing']}、"
+            f"多出 {d['extra']}；只比「首个张量」会把整条分支丢掉（实测 scGPT 的 mvc_output 即如此漏过）"
         )
     elif not structure["passed"]:
         pc, rpc = structure["param_count"]["original"], structure["param_count"]["regenerated"]

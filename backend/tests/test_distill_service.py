@@ -36,6 +36,34 @@ def test_knowledge_items_accepts_all_shapes():
     assert distill_service._knowledge_items([1, "x", item]) == [item]           # 非 dict 项剔除
 
 
+def test_text_fields_tolerate_non_string_values(isolated_db, monkeypatch):
+    """字段值漂移回归：模型把 content/confidence 给成**数字**时不得崩。
+
+    实测 `(item.get("content") or "").strip()` 在 content 是 `0.9` 时抛
+    `'float' object has no attribute 'strip'`，把整条蒸馏任务打挂（2026-10-05）。
+    """
+    run = {"run_id": "r-num", "run_type": "train", "status": "failed", "params": {}}
+
+    async def fake(*a, **k):
+        return {"structured_output": [
+            {"type": "param_advice", "title": 0.9, "content": 0.9, "confidence": 0.9},  # 数字 content → 视为空、跳过
+            {"type": "usage_guidance", "title": "T", "content": "有效结论", "confidence": 0.8},
+        ]}
+
+    monkeypatch.setattr(distill_service.agent_service, "run_sync", fake)
+    ids = asyncio.run(distill_service._draft_from_run(run, "task-num"))    # 不得抛异常
+
+    assert [d["content"] for d in knowledge_service.list_knowledge(status="draft")] == ["有效结论"]
+    assert len(ids) == 1
+
+
+def test_normalize_text_helpers_with_non_string():
+    assert distill_service._as_text(0.9) == "" and distill_service._as_text("x") == "x"
+    assert distill_service._normalize_confidence(0.9) == "low"      # 非字符串 → 保守归 low
+    assert distill_service._normalize_confidence(None) == "low"
+    assert distill_service._normalize_type(0.9) == "usage_guidance"
+
+
 def test_normalize_confidence_enum():
     """confidence 归一到 {high, medium, low}（实测模型写过超枚举的 medium-high）。"""
     assert distill_service._normalize_confidence("high") == "high"

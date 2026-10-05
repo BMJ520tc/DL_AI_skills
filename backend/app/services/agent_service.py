@@ -187,6 +187,35 @@ def _api_error_hint(message: str) -> str:
     return f"模型接口错误：{message}"
 
 
+# CLI **未登录/凭证失效**时会把提示当「回复文本」返回（实测：`Not logged in · Please run /login`）。
+# 与 API 层错误同性质：**重试无意义**，必须立即中止并给可照做的指引——否则会被上层当成
+# 「模型没产出内容」反复重试（2026-10-05 实测：拆解因此白试 12 轮，报成「structured_output 缺失」）。
+# 判据与文案由本模块统一提供，assistant_service 复用同一份标记。
+AUTH_ERROR_MARKERS = ("not logged in", "please run /login", "invalid api key",
+                      "authentication_error", "invalid x-api-key", "unauthorized")
+_CREDENTIAL_HINT = ("模型接口未登录或凭证已失效：请到「设置 → 模型接口凭证」填写 API Key 与接口地址，"
+                    "或给后端进程设置 ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY（也可先执行 claude 登录）。"
+                    "**重试无意义，已中止**")
+
+
+def is_auth_error(text) -> bool:
+    """CLI 的「未登录/凭证失效」提示（当作回复文本返回）识别。"""
+    low = str(text or "").lower()
+    return any(m in low for m in AUTH_ERROR_MARKERS)
+
+
+def raise_if_agent_error(result_text) -> None:
+    """把 CLI 当「回复文本」返回的**终止性错误**译制后抛出（这类重试无意义）。
+
+    先判 API 层错误（余额/鉴权/限流），再判未登录/凭证失效；都不是则什么也不做。
+    """
+    api_err = _api_error_message(result_text)
+    if api_err:
+        raise RuntimeError(_api_error_hint(api_err))
+    if is_auth_error(result_text):
+        raise RuntimeError(_CREDENTIAL_HINT)
+
+
 def _emit_tool_uses(msg, on_event) -> None:
     """把一次 AssistantMessage 里的工具调用回调给 on_event（供拆解等长任务报进度）。
 
@@ -269,12 +298,13 @@ def _build_options(params: dict) -> ClaudeAgentOptions:
         output_format=params.get("output_schema"),
         setting_sources=[],
         can_use_tool=_can_use_tool,
-        env={"DISABLE_AUTOUPDATER": "1"},
+        env={"DISABLE_AUTOUPDATER": "1", **(params.get("model_env") or {})},
     )
     if attach:
         options.mcp_servers = _knowledge_mcp()
-    if DEFAULT_MODEL:
-        options.model = DEFAULT_MODEL
+    model = params.get("model")
+    if model or DEFAULT_MODEL:
+        options.model = model or DEFAULT_MODEL
     return options
 
 
@@ -290,6 +320,8 @@ def submit(
     permission_mode: str = "dontAsk",
     attach_knowledge: bool = True,
     timeout_s: int = DEFAULT_TIMEOUT_S,
+    model: Optional[str] = None,
+    model_env: Optional[dict] = None,
 ) -> str:
     params = {
         "prompt": prompt,
@@ -302,6 +334,8 @@ def submit(
         "permission_mode": permission_mode,
         "attach_knowledge": attach_knowledge,
         "timeout_s": timeout_s,
+        "model": model,
+        "model_env": model_env,
     }
     return task_manager.create_task(AGENT_TASK_TYPE, params=params)
 
@@ -348,7 +382,8 @@ async def _run(params: dict, task_id: str) -> None:
     outcome: dict = {}
     retries = 3 if params.get("output_schema") else 1
     for _ in range(retries):
-        outcome = await _collect(prompt, options, params.get("timeout_s", DEFAULT_TIMEOUT_S))
+        outcome = await _collect(prompt, options, params.get("timeout_s", DEFAULT_TIMEOUT_S),
+                                 model_override=params.get("model"))
         # 结果：优先 structured_output，否则读 agent 写的结果文件（DeepSeek 兜底）
         structured = outcome.get("structured_output")
         if structured is None and result_path.exists():
@@ -391,14 +426,20 @@ async def _run(params: dict, task_id: str) -> None:
 
 
 async def _collect(prompt: str, options: ClaudeAgentOptions, timeout_s: int, retries: int = 2,
-                   on_event=None) -> dict:
-    """执行一次 agent 会话，带指数退避重试（2.5 异常兜底：429 退避、超时重试）。"""
+                   on_event=None, model_override: Optional[str] = None) -> dict:
+    """执行一次 agent 会话，带指数退避重试（2.5 异常兜底：429 退避、超时重试）。
+
+    model_override：**按任务指定的模型**（如拆解单独走强模型），优先级最高——高于凭证文件里的
+    模型名与全局 DEFAULT_MODEL。
+    """
     # 一键封装凭证页（K2）：凭证文件在配置时覆盖进程环境（SDK 的 CLI 子进程继承读取）；
     # 文件里的模型名同时覆盖 options.model（显式保存是用户最新意图）。
     from app import settings_store
 
     cred = settings_store.apply_credentials_env()
-    if cred.get("model"):
+    if model_override:
+        options.model = model_override
+    elif cred.get("model"):
         options.model = cred["model"]
 
     outcome: dict = {}
@@ -427,11 +468,9 @@ async def _collect(prompt: str, options: ClaudeAgentOptions, timeout_s: int, ret
             if not saw_result:
                 # 会话流结束却没有 ResultMessage：属异常终止，不能当成功返回空结果
                 raise RuntimeError("agent 会话未返回 ResultMessage（会话异常终止，无结果可用）")
-            # API 层错误（余额不足/鉴权/限流）会被 CLI 当成「回复文本」返回：必须如实抛出中止，
-            # 否则会被上层当成「模型没产出内容」反复重试（实测白试 11 轮，还把诊断带偏）。
-            api_err = _api_error_message(outcome.get("result"))
-            if api_err:
-                raise RuntimeError(_api_error_hint(api_err))
+            # API 层错误（余额不足/鉴权/限流）与未登录/凭证失效都会被 CLI 当成「回复文本」返回：
+            # 必须如实抛出中止，否则会被上层当成「模型没产出内容」反复重试（实测白试十几轮）。
+            raise_if_agent_error(outcome.get("result"))
             return outcome
         except asyncio.TimeoutError as e:
             last_error = e
@@ -656,6 +695,8 @@ async def run_sync(
     attach_knowledge: bool = False,
     resume: Optional[str] = None,
     on_event=None,
+    model: Optional[str] = None,
+    model_env: Optional[dict] = None,
 ) -> dict:
     """直接执行一次 agent 会话（不走任务队列），供其他服务的 handler 内部调用。
 
@@ -663,6 +704,9 @@ async def run_sync(
     attach_knowledge=True 时挂载知识库 MCP 并把其工具加入白名单（默认不挂载，保持既有调用方行为）。
     resume=会话 id 时**续接该会话**（上下文连续；前端多轮对话用）。
     on_event(kind, data) 可选：逐条回调会话事件（目前仅 `tool`＝工具调用名），供长任务报进度。
+    model / model_env：**按任务覆盖模型与端点**（如拆解单独走强模型）——`model` 覆盖模型名，
+    `model_env` 覆盖 CLI 子进程环境变量（`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` 等，SDK 会把
+    它合并到继承环境之上）。都不给则用全局配置（行为不变）。
     """
     d = _sync_dir()
     result_path = d / "result.json"
@@ -689,16 +733,16 @@ async def run_sync(
         output_format=output_schema,
         setting_sources=[],
         can_use_tool=_can_use_tool,
-        env={"DISABLE_AUTOUPDATER": "1"},
+        env={"DISABLE_AUTOUPDATER": "1", **(model_env or {})},
     )
     if attach_knowledge:
         options.mcp_servers = _knowledge_mcp()
     if resume:
         options.resume = resume
-    if DEFAULT_MODEL:
-        options.model = DEFAULT_MODEL
+    if model or DEFAULT_MODEL:
+        options.model = model or DEFAULT_MODEL
 
-    outcome = await _collect(prompt, options, timeout_s, on_event=on_event)
+    outcome = await _collect(prompt, options, timeout_s, on_event=on_event, model_override=model)
     # 留痕：agent 的文本回复/会话 id/错误（此前 run_sync 只留 result.json，排障时看不到模型说了什么）
     try:
         (d / "log.json").write_text(

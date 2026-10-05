@@ -1450,22 +1450,53 @@ def compile_graph(
 # 入口：GraphIR → 完整代码
 # ---------------------------------------------------------------------------
 
-def _with_entry_class(code: str, root_id: str) -> str:
+def _entry_inputs(ir: dict) -> list[dict]:
+    """入口 forward 的输入清单：`[{name, dtype}]`，个数 = 根节点 forward 的形参个数。
+
+    根节点形参由 `input_spec.inputs`（按调用顺序列出吃外部输入的节点 id）声明；缺失即单输入。
+    多输入模型（如 scGPT 的 `forward(src, values, src_key_padding_mask)`）**必须**按这个个数转发，
+    否则 `GeneratedModel(x)` 会 `TypeError: missing 1 required positional argument`（2026-10-06 实测踩过：
+    导出的模型根本跑不起来，而训练模板只认 `GeneratedModel`）。
+    """
+    spec = ir.get("input_spec") or {}
+    n = len([s for s in (spec.get("inputs") or []) if isinstance(s, str)]) or 1
+    out = [{"name": "input", "dtype": str(spec.get("dtype") or "float32")}]
+    for i, extra in enumerate(spec.get("extra") or []):
+        dt = str((extra or {}).get("dtype") or "float32") if isinstance(extra, dict) else "float32"
+        out.append({"name": f"input_{i + 1}", "dtype": dt})
+    return out[:n]
+
+
+def _with_entry_class(code: str, ir: dict) -> str:
     """在再生成代码末尾追加 `GeneratedModel` 入口（委托根节点类 `Decomp_<root>`）。
 
     `templates/train.py` 只要求能从 model.py import 出 `GeneratedModel`；导出代码
     也带这个入口，于是**同一份代码**既能在画布上查看、又能直接落地训练，且是
     可直接实例化的自包含模型（模块四的 `Decomp_*` 类本身不含统一入口）。
+
+    入口的 `forward` 形参个数与根节点一致（`input_spec.inputs`，见 `_entry_inputs`），
+    并写出模块级 `MODEL_INPUTS` 清单（列名 + dtype）供训练模板按多输入/按 dtype 喂数据。
     """
+    root_id = ir["root_id"]
+    inputs = _entry_inputs(ir)
+    params = ", ".join(f"x{i}" for i in range(len(inputs)))
+    args = ", ".join(f"x{i}" for i in range(len(inputs)))
+    manifest = json.dumps(inputs, ensure_ascii=False)
     entry = (
+        f"MODEL_INPUTS = {manifest}\n"
+        "\n"
+        "\n"
         f"class {MAIN_CLASS}(nn.Module):\n"
-        '    """画布拆解图入口：委托根节点类（与模块四再生成同源；训练模板只认该类名）。"""\n'
+        '    """画布拆解图入口：委托根节点类（与模块四再生成同源；训练模板只认该类名）。\n'
+        "\n"
+        "    多输入模型按 `MODEL_INPUTS` 声明顺序逐个接受输入（与根节点 forward 形参一致）。\n"
+        '    """\n'
         "    def __init__(self):\n"
         "        super().__init__()\n"
         f"        self.root = Decomp_{root_id}()\n"
         "\n"
-        "    def forward(self, x):\n"
-        "        return self.root(x)\n"
+        f"    def forward(self, {params}):\n"
+        f"        return self.root({args})\n"
     )
     return code.rstrip("\n") + "\n\n\n" + entry
 
@@ -1488,7 +1519,7 @@ def generate_ir(graph: dict) -> str:
         code = ir_codegen.generate(ir)
     except ir_codegen.IrIncompleteError as e:
         raise ExportError(f"拆解 ir 图无法再生成代码：{e}") from e
-    return _with_entry_class(code, ir["root_id"])
+    return _with_entry_class(code, ir)
 
 
 def is_ir_graph(graph: dict) -> bool:

@@ -297,6 +297,88 @@ def test_run_decompose_stops_immediately_on_api_error(dec_env, monkeypatch):
     assert len(calls) == 1               # 只试了一次
 
 
+def test_reason_signature_ignores_numbers_and_paths():
+    """失败原因归一化：抹掉数字/路径后同类即同签名（无进展守卫的判据）。"""
+    sig = decompose_service._reason_signature
+    assert sig("IR 结构校验失败: 节点数 120 超过上限 60") == \
+        sig("IR 结构校验失败: 节点数 999 超过上限 60")
+    assert sig("真实模型有 2 个带参层未被 IR 覆盖：a.b") != sig("带参层数不一致：真实 87 / 再生成 86")
+
+
+def test_run_decompose_stops_when_same_failure_repeats(dec_env, monkeypatch):
+    """同一类失败连续出现（无改进）→ **提前停止**，不白跑十几轮（省 token）。
+
+    默认重试上限是 12 次；实测同一类失败会连着重试十几轮（如每次都漏同一个模块）。
+    """
+    pid = dec_env
+    calls: list = []
+
+    async def fake_run_sync(prompt, **kw):
+        calls.append(1)
+        return {"structured_output": {"nodes": [], "edges": []}, "session_id": "s"}   # nodes 为空，每轮同错
+
+    monkeypatch.setattr(agent_service, "run_sync", fake_run_sync)
+    tid = task_manager.create_task("decompose", params={"project_id": pid})
+
+    with pytest.raises(RuntimeError, match="无改进"):
+        asyncio.run(decompose_service._run_decompose({"project_id": pid}, tid))
+    assert len(calls) == 2          # 同类失败第 2 次即停（不是 12 次）
+
+
+def test_run_decompose_stops_immediately_on_credential_error(dec_env, monkeypatch):
+    """CLI 未登录（`Not logged in · Please run /login`）也**立刻中止**、不空跑。
+
+    2026-10-05 实测：后端进程没带模型凭证 → CLI 每轮都返回未登录，被当成「没产出 IR」白试 12 轮。
+    """
+    pid = dec_env
+    calls: list = []
+
+    async def fake_run_sync(prompt, **kw):
+        calls.append(1)
+        raise RuntimeError(agent_service._CREDENTIAL_HINT)
+
+    monkeypatch.setattr(agent_service, "run_sync", fake_run_sync)
+    tid = task_manager.create_task("decompose", params={"project_id": pid})
+
+    with pytest.raises(RuntimeError, match="未登录|凭证"):
+        asyncio.run(decompose_service._run_decompose({"project_id": pid}, tid))
+    assert len(calls) == 1               # 只试了一次，不再白试
+
+
+def test_decompose_model_override_threads_into_run_sync(dec_env, monkeypatch):
+    """`DECOMPOSE_MODEL/BASE_URL/API_KEY` 未配置 → 不带覆盖（行为不变）；配了 → 带进 run_sync。"""
+    pid = dec_env
+    seen: list[dict] = []
+
+    async def fake_run_sync(prompt, **kw):
+        seen.append(kw)
+        raise RuntimeError(agent_service._CREDENTIAL_HINT)   # 只需拿到 kw
+
+    monkeypatch.setattr(agent_service, "run_sync", fake_run_sync)
+    for name in ("DECOMPOSE_MODEL", "DECOMPOSE_BASE_URL", "DECOMPOSE_API_KEY"):
+        monkeypatch.setattr(decompose_service, name, None)
+
+    tid = task_manager.create_task("decompose", params={"project_id": pid})
+    with pytest.raises(RuntimeError):
+        asyncio.run(decompose_service._run_decompose({"project_id": pid}, tid))
+    assert seen[0].get("model") is None and seen[0].get("model_env") is None
+
+    # 配上「拆解专用模型/端点」
+    monkeypatch.setattr(decompose_service, "DECOMPOSE_MODEL", "claude-sonnet-4-6")
+    monkeypatch.setattr(decompose_service, "DECOMPOSE_BASE_URL", "https://api.anthropic.com")
+    monkeypatch.setattr(decompose_service, "DECOMPOSE_API_KEY", "sk-ant-x")
+    tid2 = task_manager.create_task("decompose", params={"project_id": pid})
+    with pytest.raises(RuntimeError):
+        asyncio.run(decompose_service._run_decompose({"project_id": pid}, tid2))
+    assert seen[-1]["model"] == "claude-sonnet-4-6"
+    assert seen[-1]["model_env"] == {
+        "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+        "ANTHROPIC_API_KEY": "sk-ant-x",
+        "ANTHROPIC_MODEL": "claude-sonnet-4-6",
+        "ANTHROPIC_DEFAULT_MODEL": "claude-sonnet-4-6",
+    }
+
+
 def test_run_decompose_rejects_non_node_ids_in_inputs(dec_env, monkeypatch):
     """`input_spec.inputs` 填成 forward 的参数名/描述 → 带原因重试（实测 agent 会这么填）。"""
     pid = dec_env

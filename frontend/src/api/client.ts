@@ -161,6 +161,10 @@ export interface IrResponse {
     ir: IrGraph;
     verification_status: VerificationStatus;
     verification: Verification | null;
+    /** 当前 IR 的可再生成性校验（validate_ir + incomplete_ir，与再生成闸门口径一致）。 */
+    ir_errors?: string[];
+    /** 不阻断的结构警告（如「外部输入模块子树里的外来入边」= 再生成时被忽略的死边）。 */
+    ir_warnings?: string[];
 }
 
 // 模块（module 表）
@@ -378,10 +382,47 @@ export const postVerifyDecompose = (projectId: string) =>
 export const getIr = (projectId: string) => request<IrResponse>(`/api/projects/${projectId}/ir`);
 
 export const putNodeParams = (projectId: string, nodeId: string, params: Record<string, unknown>) =>
-    request<Record<string, unknown>>(`/api/projects/${projectId}/ir/nodes/${nodeId}`, {
+    request<{ node: IrNode; errors: string[]; warnings?: string[] }>(`/api/projects/${projectId}/ir/nodes/${nodeId}`, {
         method: "PUT",
         body: JSON.stringify({ params }),
     });
+
+// ---------------- IR 结构编辑（6.2 延伸：边/节点增删改） ----------------
+// 每个改动都返回 `{ ..., errors }`：写回后 IR 变化 → 旧验证变 stale；
+// errors 是当前 IR 的可再生成性问题清单（供界面提示，不阻断写入）。
+
+/** 新增节点。 */
+export const addIrNode = (projectId: string, node: Partial<IrNode> & { id: string; kind: IrKind; class_name: string }) =>
+    request<{ node: IrNode; errors: string[]; warnings?: string[] }>(`/api/projects/${projectId}/ir/nodes`, {
+        method: "POST",
+        body: JSON.stringify(node),
+    });
+
+/** 改节点（kind/class_name/parent_id/params/code_hint/module_path/module_file）；传 null 可清除可选字段。 */
+export const patchIrNode = (projectId: string, nodeId: string, patch: Partial<IrNode>) =>
+    request<{ node: IrNode; errors: string[]; warnings?: string[] }>(`/api/projects/${projectId}/ir/nodes/${nodeId}`, {
+        method: "PUT",
+        body: JSON.stringify(patch),
+    });
+
+/** 删除节点及关联边（根节点不可删；有子节点须 recursive=true 连子树一起删）。 */
+export const deleteIrNode = (projectId: string, nodeId: string, recursive = false) =>
+    request<{ deleted: string[]; errors: string[]; warnings?: string[] }>(
+        `/api/projects/${projectId}/ir/nodes/${nodeId}${recursive ? "?recursive=true" : ""}`,
+        { method: "DELETE" });
+
+/** 新增边 from→to（两端须存在、非自环、无重边、不成环）。 */
+export const addIrEdge = (projectId: string, from: string, to: string, tensorShape?: number[]) =>
+    request<{ edge: IrEdge; errors: string[]; warnings?: string[] }>(`/api/projects/${projectId}/ir/edges`, {
+        method: "POST",
+        body: JSON.stringify({ from, to, ...(tensorShape ? { tensor_shape: tensorShape } : {}) }),
+    });
+
+/** 删除 from→to 的边。 */
+export const deleteIrEdge = (projectId: string, from: string, to: string) =>
+    request<{ deleted: number; errors: string[]; warnings?: string[] }>(
+        `/api/projects/${projectId}/ir/edges/${encodeURIComponent(from)}/${encodeURIComponent(to)}`,
+        { method: "DELETE" });
 
 /** 修正 IR 入口输入规格（6.1/6.2）：库型模型 agent 给不出具体维度时的补参通道；
  *  写回后 ir_hash 变化 → 旧验证变 stale（与调参同口径），入库前必须重新验证。 */

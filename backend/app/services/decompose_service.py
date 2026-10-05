@@ -14,6 +14,7 @@ error=failure_reason) 可检索供 agent/用户改进；入库前置强校验 ir
 import asyncio
 import hashlib
 import json
+import keyword
 import logging
 import os
 import shutil
@@ -33,7 +34,8 @@ from app.services import (
 )
 from app.services.ir_codegen import IrIncompleteError
 from app.services.ir_schema import (
-    SCHEMA_VERSION, TASK_TYPES, _as_ir, ir_hash, nodes_by_id, normalize_class_name, validate_ir,
+    KINDS, SCHEMA_VERSION, TASK_TYPES, _ID_RE, _as_ir, external_input_conflicts, incomplete_ir,
+    ir_hash, isolated_blocks, nodes_by_id, normalize_class_name, validate_ir,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,6 +73,35 @@ DECOMPOSE_STEPWISE = os.getenv("DECOMPOSE_STEPWISE", "0") != "0"
 DECOMPOSE_RETRY_RESUME = os.getenv("DECOMPOSE_RETRY_RESUME", "0") != "0"
 # 保真度自检开关：默认开。要求项目环境 + entry_args 才做（起不来就跳过，不误判）
 DECOMPOSE_FIDELITY_CHECK = os.getenv("DECOMPOSE_FIDELITY_CHECK", "1") != "0"
+# **拆解专用模型 / 端点**（可选）：拆解是最吃模型能力的步骤（一次要吐一份长且结构精确的 IR），
+# 可单独指定更强的模型/端点，**其余任务继续走全局配置**（DeepSeek）。三者任一为空即回退全局、行为不变。
+#   DECOMPOSE_MODEL=claude-sonnet-4-6
+#   DECOMPOSE_BASE_URL=https://api.anthropic.com
+#   DECOMPOSE_API_KEY=sk-ant-...
+# 背景：DeepSeek 端点不支持结构化输出 → SDK structured_output 恒空、只能靠文件兜底且形状漂移；
+# 强模型（真 Claude）原生支持结构化输出，正是拆解这类任务最需要的。
+DECOMPOSE_MODEL = os.getenv("DECOMPOSE_MODEL")
+DECOMPOSE_BASE_URL = os.getenv("DECOMPOSE_BASE_URL")
+DECOMPOSE_API_KEY = os.getenv("DECOMPOSE_API_KEY")
+
+
+def _model_override() -> tuple[Optional[str], Optional[dict]]:
+    """拆解所用模型 / 端点的按任务覆盖；未配置返回 (None, None) = 走全局。"""
+    env: dict = {}
+    if DECOMPOSE_BASE_URL:
+        env["ANTHROPIC_BASE_URL"] = DECOMPOSE_BASE_URL
+    if DECOMPOSE_API_KEY:
+        env["ANTHROPIC_API_KEY"] = DECOMPOSE_API_KEY
+    if DECOMPOSE_MODEL:
+        env["ANTHROPIC_MODEL"] = DECOMPOSE_MODEL
+        env["ANTHROPIC_DEFAULT_MODEL"] = DECOMPOSE_MODEL
+    return DECOMPOSE_MODEL, (env or None)
+
+
+async def _agent_run(ask: str, **kwargs) -> dict:
+    """拆解链路的 agent 调用：自动带上「拆解专用模型/端点」覆盖（未配置则等同全局配置）。"""
+    model, model_env = _model_override()
+    return await agent_service.run_sync(ask, model=model, model_env=model_env, **kwargs)
 
 
 def _now() -> str:
@@ -305,16 +336,220 @@ def update_entry_args(project_id: str, entry_args: dict) -> dict:
 
 def update_node_params(project_id: str, node_id: str, params: dict) -> dict:
     """PUT 调参回写（6.2「用户能手动调节层级的参数」）：写回后旧验证经 ir_hash 变 stale。"""
+    return update_node(project_id, node_id, {"params": params})["node"]
+
+
+# ---------------------------------------------------------------------------
+# IR 结构编辑（6.2 延伸：边/节点增删改，把「人工改 reports/ir.json」产品化）
+#
+# agent 产出的 IR 常「结构合法但不忠实」（漏子树、空 module、把标准层当 module、
+# inputs 填参数名…），此前只能人工改 ir.json。这里做成一小组原子操作：每个改动落盘后
+# 回传 `validate_ir + incomplete_ir` 的当前结果（供界面提示），但**不因软错误拒绝写入**
+# ——「新增 op 尚无入边」「module 暂无子节点」是走向完整图的合法中间态；再生成/验证/入库
+# 仍由既有闸门（`ir_codegen.generate` = validate_ir + incomplete_ir）兜底。
+# ---------------------------------------------------------------------------
+
+_NODE_PATCH_KEYS = ("kind", "class_name", "parent_id", "params", "code_hint",
+                    "module_path", "module_file")
+
+
+def _load_ir_for_edit(project_id: str) -> tuple[dict, dict]:
     project = _require_original(project_id)
     ir = _read_ir(project)
     if ir is None:
         raise LookupError("ir not found：请先 POST /api/projects/{id}/decompose")
+    return project, ir
+
+
+def edit_errors(ir: dict) -> list[str]:
+    """当前 IR 的可再生成性校验（与 `ir_codegen.generate` 闸门口径一致）。"""
+    return validate_ir(ir) + incomplete_ir(ir)
+
+
+def edit_warnings(ir: dict) -> list[str]:
+    """结构性**警告**（不阻断）：① 外部输入模块子树里的外来入边（再生成时被忽略的死边）；
+    ② 既无入边也无出边的孤立节点（再生成时的死模块）。"""
+    return external_input_conflicts(ir) + isolated_blocks(ir)
+
+
+def _edit_result(ir: dict) -> dict:
+    """结构改动后的当前校验结果（与再生成闸门口径一致）+ 不阻断的结构警告。"""
+    return {"errors": edit_errors(ir), "warnings": edit_warnings(ir)}
+
+
+def _require_ident(value, what: str) -> str:
+    if not isinstance(value, str) or not _ID_RE.match(value) or keyword.iskeyword(value):
+        raise ValueError(f"{what} 必须是合法 Python 标识符（再生成将用作类名/变量名）: {value!r}")
+    return value
+
+
+def _descendants(ir: dict, node_id: str) -> list[str]:
+    """node_id 的全部子孙 id（parent_id 归属，逐层展开）。"""
+    by_parent: dict[Optional[str], list[str]] = {}
+    for n in ir.get("nodes") or []:
+        by_parent.setdefault(n.get("parent_id"), []).append(n["id"])
+    out: list[str] = []
+    stack = [node_id]
+    while stack:
+        for c in by_parent.get(stack.pop(), []):
+            out.append(c)
+            stack.append(c)
+    return out
+
+
+def _check_parent(ir: dict, node_id: str, parent_id: Optional[str]) -> None:
+    """parent_id 必须存在、且不能指向自身或自身后代（否则父链成环，布局/渲染会死循环）。"""
+    if parent_id is None:
+        return
+    if not isinstance(parent_id, str):
+        raise ValueError(f"parent_id 必须是节点 id 字符串或 null: {parent_id!r}")
+    if parent_id not in {n["id"] for n in ir.get("nodes") or []}:
+        raise ValueError(f"parent_id 不存在: {parent_id}")
+    if parent_id == node_id or parent_id in _descendants(ir, node_id):
+        raise ValueError(f"parent_id 不能是自身或其后代（父链会成环）: {parent_id}")
+
+
+def _reaches(edges: list[dict], start: str, target: str) -> bool:
+    """沿 from→to 从 start 能否到达 target（新增边成环检测用）。"""
+    seen: set[str] = set()
+    stack = [start]
+    while stack:
+        cur = stack.pop()
+        if cur == target:
+            return True
+        if cur in seen:
+            continue
+        seen.add(cur)
+        stack.extend(e.get("to") for e in edges if e.get("from") == cur)
+    return False
+
+
+def add_node(project_id: str, node: dict) -> dict:
+    """新增节点（id 唯一且合法、kind 合法、parent 存在）。软错误不拒写，随响应回传。"""
+    project, ir = _load_ir_for_edit(project_id)
+    if not isinstance(node, dict):
+        raise ValueError("node 必须是对象")
+    nid = _require_ident(node.get("id"), "节点 id")
+    if nodes_by_id(ir).get(nid):
+        raise ValueError(f"节点 id 已存在: {nid}")
+    kind = node.get("kind")
+    if kind not in KINDS:
+        raise ValueError(f"kind 非法: {kind!r}（可选 {'/'.join(KINDS)}）")
+    class_name = node.get("class_name")
+    if not isinstance(class_name, str) or not class_name:
+        raise ValueError("class_name 不能为空")
+    out: dict = {"id": nid, "kind": kind, "class_name": class_name, "parent_id": None}
+    parent_id = node.get("parent_id")
+    _check_parent(ir, nid, parent_id)          # 新节点无后代，只需校验父存在
+    out["parent_id"] = parent_id
+    for key in ("params", "code_hint", "module_path", "module_file"):
+        if node.get(key) is not None:
+            out[key] = node[key]
+    if out.get("params") is not None and not isinstance(out["params"], dict):
+        raise ValueError("params 必须是对象")
+    ir.setdefault("nodes", []).append(out)
+    _write_ir(project, ir)
+    return {"node": out, **_edit_result(ir)}
+
+
+def update_node(project_id: str, node_id: str, patch: dict) -> dict:
+    """改节点（kind/class_name/parent_id/params/code_hint/module_path/module_file）。
+
+    不支持改 id（会破坏所有引用它的边）；改任何字段后 ir_hash 变化 → 旧验证变 stale。
+    """
+    project, ir = _load_ir_for_edit(project_id)
     node = nodes_by_id(ir).get(node_id)
     if node is None:
         raise LookupError(f"node not found: {node_id}")
-    node["params"] = params
+    if not isinstance(patch, dict):
+        raise ValueError("patch 必须是对象")
+    unknown = [k for k in patch if k not in _NODE_PATCH_KEYS]
+    if unknown:
+        raise ValueError(
+            f"不支持的字段: {', '.join(unknown)}（可改 {'/'.join(_NODE_PATCH_KEYS)}；"
+            "改 id 会破坏边引用，不支持）")
+    if "kind" in patch:
+        if patch["kind"] not in KINDS:
+            raise ValueError(f"kind 非法: {patch['kind']!r}（可选 {'/'.join(KINDS)}）")
+        node["kind"] = patch["kind"]
+    if "class_name" in patch:
+        if not isinstance(patch["class_name"], str) or not patch["class_name"]:
+            raise ValueError("class_name 不能为空")
+        node["class_name"] = patch["class_name"]
+    if "parent_id" in patch:
+        _check_parent(ir, node_id, patch["parent_id"])
+        node["parent_id"] = patch["parent_id"]
+    if "params" in patch:
+        if not isinstance(patch["params"], dict):
+            raise ValueError("params 必须是对象")
+        node["params"] = patch["params"]
+    for key in ("code_hint", "module_path", "module_file"):
+        if key in patch:
+            if patch[key] is None:
+                node.pop(key, None)
+            else:
+                node[key] = patch[key]
     _write_ir(project, ir)
-    return node
+    return {"node": node, **_edit_result(ir)}
+
+
+def delete_node(project_id: str, node_id: str, recursive: bool = False) -> dict:
+    """删除节点及其关联边。根节点不可删；有子节点时须 recursive=true 连子树一起删。"""
+    project, ir = _load_ir_for_edit(project_id)
+    by_id = nodes_by_id(ir)
+    if node_id not in by_id:
+        raise LookupError(f"node not found: {node_id}")
+    if node_id == ir.get("root_id"):
+        raise ValueError("不能删除根节点（root_id）；如需换根请改 parent 后另设 root_id")
+    children = [n["id"] for n in ir.get("nodes") or [] if n.get("parent_id") == node_id]
+    if children and not recursive:
+        raise ValueError(f"节点 {node_id} 还有 {len(children)} 个子节点"
+                         "（recursive=true 可连子树一起删，或先把子节点改挂到别处）")
+    doomed = {node_id, *_descendants(ir, node_id)} if recursive else {node_id}
+    ir["nodes"] = [n for n in ir.get("nodes") or [] if n["id"] not in doomed]
+    ir["edges"] = [e for e in ir.get("edges") or []
+                   if e.get("from") not in doomed and e.get("to") not in doomed]
+    _write_ir(project, ir)
+    return {"deleted": sorted(doomed), **_edit_result(ir)}
+
+
+def add_edge(project_id: str, from_node: str, to_node: str,
+             tensor_shape: Optional[list] = None) -> dict:
+    """新增边（from→to 两端须存在、非自环、无重边、不成环）。多输入模块的入边顺序即形参顺序。"""
+    project, ir = _load_ir_for_edit(project_id)
+    ids = {n["id"] for n in ir.get("nodes") or []}
+    if from_node not in ids:
+        raise ValueError(f"from 节点不存在: {from_node}")
+    if to_node not in ids:
+        raise ValueError(f"to 节点不存在: {to_node}")
+    if from_node == to_node:
+        raise ValueError("不允许自环边（from == to）")
+    edges = ir.get("edges") or []
+    if any(e.get("from") == from_node and e.get("to") == to_node for e in edges):
+        raise ValueError(f"边已存在: {from_node} → {to_node}")
+    if _reaches(edges, to_node, from_node):
+        raise ValueError(f"该边会形成环: {from_node} → {to_node}")
+    edge: dict = {"from": from_node, "to": to_node}
+    if tensor_shape:
+        if not isinstance(tensor_shape, list) or not all(isinstance(d, int) for d in tensor_shape):
+            raise ValueError("tensor_shape 必须是整数数组")
+        edge["tensor_shape"] = tensor_shape
+    edges.append(edge)
+    ir["edges"] = edges
+    _write_ir(project, ir)
+    return {"edge": edge, **_edit_result(ir)}
+
+
+def delete_edge(project_id: str, from_node: str, to_node: str) -> dict:
+    """删除 from→to 的边（可有多条同端点的对比：一并删除）。不存在即 404。"""
+    project, ir = _load_ir_for_edit(project_id)
+    edges = ir.get("edges") or []
+    kept = [e for e in edges if not (e.get("from") == from_node and e.get("to") == to_node)]
+    if len(kept) == len(edges):
+        raise LookupError(f"edge not found: {from_node} → {to_node}")
+    ir["edges"] = kept
+    _write_ir(project, ir)
+    return {"deleted": len(edges) - len(kept), **_edit_result(ir)}
 
 
 # --------------------------- 6.1 拆解 ---------------------------
@@ -646,7 +881,7 @@ async def _stepwise_decompose(source: Path, hierarchy: list[dict], entry_class: 
         budget = deadline - time.monotonic()
         if budget <= 30:
             break
-        r = await agent_service.run_sync(
+        r = await _agent_run(
             _skeleton_prompt(hierarchy, entry_class, hint), cwd=str(source),
             output_schema=_SKELETON_SCHEMA, max_turns=40, timeout_s=int(min(900, budget)),
             on_event=on_event)
@@ -678,7 +913,7 @@ async def _stepwise_decompose(source: Path, hierarchy: list[dict], entry_class: 
                     raise RuntimeError("分步拆解：预算用尽")
                 if set_stage:
                     set_stage(f"拆解中：展开模块 {m['id']}（{m.get('class_name')}）…")
-                r = await agent_service.run_sync(
+                r = await _agent_run(
                     prompt, cwd=str(source), output_schema=_MODULE_SCHEMA,
                     max_turns=40, timeout_s=int(min(900, budget)), on_event=on_event)
                 got = r.get("structured_output")
@@ -756,15 +991,19 @@ def _attempt_prompt(base: str, last_reason: str, prev_session: Optional[str], at
     return base + f"\n\n【上一次尝试未通过，请据此修正】{reason}", None
 
 
-def _progress_reporter(task_id: str):
+def _progress_reporter(task_id: str, model_label: str = ""):
     """返回 (set_stage, on_event)：把拆解的阶段与工具调用写进任务进度（进度打点）。
 
     `task_manager.update_progress` 是**整体覆盖**，故 on_event 每次都带上当前 stage，
     避免滚动 activity 时把 stage 冲掉。
+    `model_label` 非空时给每条 stage 加后缀，让「这一步用哪个模型」在界面上始终可见
+    （拆解可单独配模型，见 DECOMPOSE_MODEL）。
     """
     state = {"stage": "拆解中…"}
+    suffix = f"｜模型 {model_label}" if model_label else ""
 
     def set_stage(text: str) -> None:
+        text = text + suffix
         state["stage"] = text
         task_manager.update_progress(task_id, {"stage": text})
 
@@ -851,6 +1090,19 @@ async def _fidelity_issues(source: Path, ws: Path, ir: dict, task_id: str,
     return list(res.get("issues") or []), "不通过", _real_inventory_hint(res.get("real_param_modules") or [])
 
 
+def _reason_signature(reason: str) -> str:
+    """失败原因的**归一化签名**（抹掉数字/路径，只留「错在哪一类」）——用于判断重试是否在原地打转。
+
+    实测同一类失败（如每次都漏同一个模块、每次都「node 数超限」）会连着重试十几轮，
+    纯烧 token 而无进展（2026-10-05 实测：`Not logged in` 被当成「没产出」白试 12 轮）。
+    """
+    import re
+
+    s = re.sub(r"[A-Za-z]:\\[^\s;（]+", "<path>", str(reason or ""))
+    s = re.sub(r"\d+", "#", s)
+    return re.sub(r"\s+", " ", s).strip()[:300]
+
+
 async def _run_decompose(params: dict, task_id: str) -> None:
     project_id = params["project_id"]
     project = _require_original(project_id)
@@ -879,7 +1131,9 @@ async def _run_decompose(params: dict, task_id: str) -> None:
     last_reason = "agent 未产出有效 IR 结构（structured_output 缺失）"
     prev_session: Optional[str] = None   # 上一次尝试的 agent 会话 id（重试时续接复用已读上下文）
     fidelity_note = "未执行"             # 保真度自检结论（通过/跳过原因），随 run_record 留痕
-    set_stage, on_event = _progress_reporter(task_id)
+    set_stage, on_event = _progress_reporter(task_id, DECOMPOSE_MODEL or "")
+    prev_reason_sig = ""                 # 上一次失败原因的归一化签名（无进展守卫用）
+    stalled = 0
 
     def _record_fail(reason: str, bad_ir: Optional[dict] = None) -> None:
         """失败也要留 run_record（架构九.4：失败可检索供 agent 改进）。"""
@@ -894,6 +1148,15 @@ async def _run_decompose(params: dict, task_id: str) -> None:
         knowledge_service.record_run(entry)
 
     for attempt in range(1, DECOMPOSE_AGENT_RETRIES + 1):
+        # **无进展守卫**（省 token）：失败原因归一化后与上一次**同类**（抹掉数字/路径仍相同，
+        # 说明模型在原地打转）→ 连续 2 次即提前停止，不再白跑十几轮。
+        sig = _reason_signature(last_reason) if attempt > 1 else ""
+        stalled = stalled + 1 if (sig and sig == prev_reason_sig) else 0
+        prev_reason_sig = sig
+        if stalled >= 1:
+            last_reason = (f"连续 {stalled + 1} 次同一类失败、无改进，提前停止（省 token）："
+                           f"{last_reason[:200]}")
+            break
         budget = deadline - time.monotonic()
         if attempt > 1 and budget <= 30:
             last_reason = (
@@ -918,7 +1181,7 @@ async def _run_decompose(params: dict, task_id: str) -> None:
                                           allow_resume=DECOMPOSE_RETRY_RESUME)
 
             async def _one_run(ask: str, resume_: Optional[str]) -> dict:
-                return await agent_service.run_sync(
+                return await _agent_run(
                     ask,
                     cwd=str(source),
                     output_schema=ir_schema.IR_SCHEMA,

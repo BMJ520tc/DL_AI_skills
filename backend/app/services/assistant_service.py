@@ -154,16 +154,15 @@ def decide_confirmation(confirm_id: str, approved: bool) -> dict:
     return {"confirm_id": confirm_id, "status": rec["status"]}
 
 
-# CLI 未登录/凭证失效时会把这些原文当"回复"或报错吐出来 —— 对用户没有指引性，译制掉
-_AUTH_MARKERS = ("not logged in", "please run /login", "invalid api key",
-                 "authentication_error", "invalid x-api-key", "unauthorized")
+# CLI 未登录/凭证失效时会把这些原文当"回复"或报错吐出来 —— 对用户没有指引性，译制掉。
+# 判据（标记表）与 agent_service 共用一份，避免两处 drift。
+_AUTH_MARKERS = agent_service.AUTH_ERROR_MARKERS
 CREDENTIAL_HINT = ("尚未配置模型接口凭证（或凭证已失效）：请点右下「⚙ 设置 → 模型接口凭证」"
                    "填写 API Key 与接口地址后重试。")
 
 
 def _looks_unauthenticated(text: Optional[str]) -> bool:
-    low = (text or "").lower()
-    return any(m in low for m in _AUTH_MARKERS)
+    return agent_service.is_auth_error(text)
 
 
 # 续接目标失效（后端重启 / 会话过期）——不该报错给用户，自动丢掉续接重开

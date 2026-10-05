@@ -4,7 +4,7 @@
 analysis.py:22）；IR 读写与调参在 /ir/* 下（ir_router，前缀 /api/projects/{id}）。
 """
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.services import decompose_service, project_manager
 from app.services.ir_codegen import IrIncompleteError
@@ -88,17 +88,53 @@ def get_verification(project_id: str) -> dict:
 
 @ir_router.get("/ir")
 def get_ir(project_id: str) -> dict:
-    """IR 快照 + 验证新鲜度（none=未验证 / valid=一致 / stale=调参后未重验）。"""
+    """IR 快照 + 验证新鲜度（none=未验证 / valid=一致 / stale=调参后未重验）+ 可再生成性校验。"""
     _require_original(project_id)
     ir = decompose_service.read_ir(project_id)
     if ir is None:
         raise HTTPException(status_code=404, detail="ir not found：请先 POST /decompose")
     status, verification = decompose_service.verification_status(project_id)
-    return {"ir": ir, "verification_status": status, "verification": verification}
+    return {"ir": ir, "verification_status": status, "verification": verification,
+            "ir_errors": decompose_service.edit_errors(ir),
+            "ir_warnings": decompose_service.edit_warnings(ir)}
 
 
-class NodeParamsBody(BaseModel):
-    params: dict
+class NodeEditBody(BaseModel):
+    """改节点（PUT /ir/nodes/{id}）：只回写显式给出的字段（exclude_unset）。
+
+    parent_id/code_hint 传 `null` = 清除该字段；params 传 `{...}` = 整体替换。
+    """
+
+    kind: str | None = None
+    class_name: str | None = None
+    parent_id: str | None = None
+    params: dict | None = None
+    code_hint: str | None = None
+    module_path: str | None = None
+    module_file: str | None = None
+
+
+class NodeCreateBody(BaseModel):
+    """新增节点（POST /ir/nodes）。"""
+
+    id: str
+    kind: str
+    class_name: str
+    parent_id: str | None = None
+    params: dict | None = None
+    code_hint: str | None = None
+    module_path: str | None = None
+    module_file: str | None = None
+
+
+class EdgeBody(BaseModel):
+    """新增边（POST /ir/edges）。`from` 是 Python 关键字，用 alias 收。"""
+
+    from_: str = Field(alias="from")
+    to: str
+    tensor_shape: list[int] | None = None
+
+    model_config = {"populate_by_name": True}
 
 
 class InputSpecBody(BaseModel):
@@ -142,10 +178,71 @@ def update_entry_args(project_id: str, body: EntryArgsBody) -> dict:
 
 
 @ir_router.put("/ir/nodes/{node_id}")
-def update_node(project_id: str, node_id: str, body: NodeParamsBody) -> dict:
-    """调参回写（6.2）；写回后旧验证经 ir_hash 变 stale，入库前需重新验证。"""
+def update_node(project_id: str, node_id: str, body: NodeEditBody) -> dict:
+    """改节点（6.2 调参 + 结构编辑）；写回后旧验证经 ir_hash 变 stale，入库前需重新验证。"""
+    patch = body.model_dump(exclude_unset=True)
+    if not patch:
+        raise HTTPException(status_code=400, detail="patch 为空：请至少给出一个要改的字段")
     _require_original(project_id)
     try:
-        return decompose_service.update_node_params(project_id, node_id, body.params)
+        return decompose_service.update_node(project_id, node_id, patch)
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@ir_router.post("/ir/nodes")
+def add_node(project_id: str, body: NodeCreateBody) -> dict:
+    """新增节点；结构改动后 IR 变 stale，响应回传当前校验结果。"""
+    _require_original(project_id)
+    try:
+        return decompose_service.add_node(project_id, body.model_dump())
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@ir_router.delete("/ir/nodes/{node_id}")
+def delete_node(project_id: str, node_id: str, recursive: bool = False) -> dict:
+    """删除节点及关联边（根节点不可删；有子节点须 recursive=true）。"""
+    _require_original(project_id)
+    try:
+        return decompose_service.delete_node(project_id, node_id, recursive)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@ir_router.post("/ir/edges")
+def add_edge(project_id: str, body: EdgeBody) -> dict:
+    """新增边 from→to（两端须存在、非自环、无重边、不成环）。"""
+    _require_original(project_id)
+    try:
+        return decompose_service.add_edge(project_id, body.from_, body.to, body.tensor_shape)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@ir_router.delete("/ir/edges/{from_node}/{to_node}")
+def delete_edge(project_id: str, from_node: str, to_node: str) -> dict:
+    """删除 from→to 的边。"""
+    _require_original(project_id)
+    try:
+        return decompose_service.delete_edge(project_id, from_node, to_node)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=400, detail=str(e))

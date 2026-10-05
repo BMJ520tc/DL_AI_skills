@@ -1,7 +1,7 @@
 """任务状态机与启动收敛（《模块详细设计》2.1、D2）。
 
 覆盖：queued → running → success/failed、failed → retry → queued、
-running → cancelled，以及服务重启后残留 running 的收敛（GB-7）。
+running → cancelled，以及服务重启后残留 **running / queued** 的收敛（GB-7）。
 """
 from __future__ import annotations
 
@@ -48,22 +48,41 @@ async def _wait_terminal(task_id: str, timeout_s: float = 5.0) -> dict:
     raise AssertionError(f"任务 {task_id} 未在 {timeout_s}s 内到达终态：{task_manager.get_task(task_id)}")
 
 
-def test_reconcile_marks_stale_running_as_failed(isolated_db):
+def test_reconcile_marks_stale_running_and_queued_as_failed(isolated_db):
+    """残留 running **与 queued** 都要收敛——队列是内存态，重启后 queued 永远不会被拾取。"""
     _insert_raw_task("stale-1", "pdf_parse", "running")
     _insert_raw_task("done-1", "pdf_parse", "success")
     _insert_raw_task("queued-1", "pdf_parse", "queued")
 
-    assert task_manager.reconcile_stale_tasks() == 1
+    assert task_manager.reconcile_stale_tasks() == 2      # running + queued
 
     stale = task_manager.get_task("stale-1")
     assert stale["status"] == "failed"
     assert "重启" in (stale["error"] or "")
-    # 终态与 queued 不受影响
+    stuck = task_manager.get_task("queued-1")
+    assert stuck["status"] == "failed"
+    assert "重启" in (stuck["error"] or "")
+    # 终态不受影响
     assert task_manager.get_task("done-1")["status"] == "success"
-    assert task_manager.get_task("queued-1")["status"] == "queued"
     # 收敛后可经既有通道重新入队（failed → queued）
     assert task_manager.retry_task("stale-1") is True
     assert task_manager.get_task("stale-1")["status"] == "queued"
+
+
+def test_reconcile_unblocks_create_task_dedupe(isolated_db):
+    """残留 queued 会让 `create_task` 的「同参数复用」永久命中它 → 提交再也跑不起来。
+
+    2026-10-05 实测：昨天遗留的 `decompose_trace` 卡在 queued，用户点「补形状」后端明明收到
+    `POST …/decompose/trace`，却只把那个死 id 返回、什么都不执行（界面一直显示「在跑」）。
+    收敛后必须能建出**新**任务。
+    """
+    _insert_raw_task("stale-q", "decompose_trace", "queued")     # params='{}'、project NULL
+
+    # 收敛前：同参数提交被去重到那个死 id（真 bug 的表现）
+    assert task_manager.create_task("decompose_trace") == "stale-q"
+
+    assert task_manager.reconcile_stale_tasks() == 1
+    assert task_manager.create_task("decompose_trace") != "stale-q"   # 不再被死任务吃掉
 
 
 def test_reconcile_is_idempotent(isolated_db):

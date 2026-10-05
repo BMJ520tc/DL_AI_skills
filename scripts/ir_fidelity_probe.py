@@ -125,6 +125,24 @@ def main() -> None:
     if uncovered:
         issues.append(f"真实模型有 {len(uncovered)} 个带参层未被 IR 覆盖：{', '.join(uncovered[:MAX_EXAMPLES])}")
 
+    # **真实调用结构**（`torch.export` + `unflatten`，见 trace_structure）：带参层覆盖之外，还要看
+    # **无参但被调用**的模块在不在 IR 里——实测 scGPT 真实前向会调 `creterion_cce`（nn.CrossEntropyLoss，
+    # 0 参数）而 IR 整条没有，「只看带参层」永远发现不了（2026-10-06 用户实测坐实）。
+    # 追踪不可用（export 失败）时跳过、不误判。
+    from trace_structure import trace_model
+
+    traced = trace_model(orig, ir.get("input_spec") or {})
+    traced_modules = traced.get("modules") or []
+    if not traced.get("skipped"):
+        missing_mods = [m for m in traced_modules if not _covered_by_ir(ir, m["module_path"])]
+        if missing_mods:
+            names = ", ".join(f"{m['module_path']}({m['class_name']})" for m in missing_mods[:MAX_EXAMPLES])
+            issues.append(
+                f"真实模型调用了 {len(missing_mods)} 个模块，但 IR 里没有对应节点：{names}"
+                "（**含无参模块**；`nn.CrossEntropyLoss` 这类用 op 节点 + code_hint 表达，"
+                "如 code_hint=\"F.cross_entropy({inputs[0]}, {inputs[1]})\"，并给它接上真实输入）"
+            )
+
     # **前向自检**：结构对了不代表**接线**对——scGPT 实测过「参数完全相同、逐层类型全对，
     # 但前向 `mat1 and mat2 shapes cannot be multiplied (1x1200 and 1x512)`」：某条边把错的
     # 张量接进了某个 Linear。只看 state_dict 看不出来，必须真跑一遍。
@@ -177,6 +195,9 @@ def main() -> None:
         "regenerated_param_layers": len(g_layers),
         "uncovered": uncovered[:MAX_EXAMPLES],
         "real_param_modules": inventory[:120],
+        # 真实调用结构（含无参模块与算子），供宿主回喂 / 后续据其生成 IR
+        "traced_modules": traced_modules[:120],
+        "traced_skipped": None if not traced.get("skipped") else traced.get("reason"),
     })
 
 

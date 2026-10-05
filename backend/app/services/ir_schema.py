@@ -267,10 +267,25 @@ def validate_ir(ir: dict) -> list[str]:
                 errors.append(f"module 节点 {nid} 无子节点，无法重构其内部结构")
         elif n["kind"] == "op":
             n_in = len(in_edges(ir, nid))
-            if not n_in:
+            # 引用了**外部输入**（`{ext:名字}`）的算子可以没有入边——它的操作数直接来自根 forward 的实参
+            exts = re.findall(r"\{ext:(\w+)\}", str(n.get("code_hint") or ""))
+            if exts:
+                declared = {str(e.get("name")) for e in
+                            ((ir.get("input_spec") or {}).get("external") or [])
+                            if isinstance(e, dict) and e.get("name")}
+                unknown = [x for x in exts if x not in declared]
+                if unknown:
+                    errors.append(
+                        f"op 节点 {nid} 的 code_hint 引用了未声明的外部输入 {unknown}"
+                        "（应在 input_spec.external 里声明，根类会为它加一个同名形参）")
+            # 需要入边的判据 = code_hint **引用了操作数**（`{inputs…}`）。纯常量表达式
+            # （如 `torch.arange(0, 1200)`、`torch.eye(4)`——从标量造张量）本来就不消费任何节点。
+            hint_txt = str(n.get("code_hint") or "")
+            consumes = "{inputs}" in hint_txt or "{inputs[" in hint_txt
+            if not n_in and not exts and consumes:
                 errors.append(f"op 节点 {nid} 至少需要一条入边")
             cls = normalize_class_name(n.get("class_name") or "")
-            if cls in OP_BINARY and n_in < 2:
+            if cls in OP_BINARY and n_in + len(exts) < 2:
                 errors.append(f"op 节点 {nid}（{cls}）需要至少两条入边，当前 {n_in} 条")
             if cls in OP_UNARY and n_in > 1:
                 errors.append(f"op 节点 {nid}（{cls}）是单输入算子，当前有 {n_in} 条入边"
@@ -283,13 +298,19 @@ def validate_ir(ir: dict) -> list[str]:
                     "（缺失会生成运行期必错的表达式，如 x.view(())）"
                 )
 
-        # 多输入：`op` 天然多操作数；**module** 也多输入——按入边顺序成为它 forward 的形参
-        # （如 scGPT 的 MVCDecoder(cell_emb, gene_embs)）。叶子/容器仍是单张量输入。
+        # 多输入：`op` 天然多操作数；**module** 按入边序成为 forward 形参（如 MVCDecoder(cell_emb, gene_embs)）；
+        # **带 code_hint 的复合叶子**同样合法——如折叠出来的
+        # `nn.TransformerEncoder(src, mask, src_key_padding_mask)`（白名单叶子/容器仍是单张量）。
         if len(in_edges(ir, nid)) > 1 and n["kind"] not in ("op", "module"):
-            errors.append(
-                f"非 op 节点 {nid} 有多条入边（叶子/容器按 PyTorch 单张量输入建模；"
-                "多输入请用 **module 节点**——多个输入会按入边顺序成为它的 forward 形参，"
-                "或用一个 op 节点汇合）")
+            hint_leaf = (
+                n["kind"] == "leaf" and bool(n.get("code_hint"))
+                and normalize_class_name(n.get("class_name") or "") not in LEAF_REQUIRED_ARGS
+            )
+            if not hint_leaf:
+                errors.append(
+                    f"非 op 节点 {nid} 有多条入边（叶子/容器按 PyTorch 单张量输入建模；"
+                    "多输入请用 **module 节点**——多个输入会按入边顺序成为它的 forward 形参，"
+                    "或用一个 op 节点汇合）")
 
     # container 子节点的边只能在同 Sequential 子节点之间：进出 Sequential 的
     # 数据流由 container 节点自身的边表达（codegen 将子节点内联进 Sequential，
@@ -336,6 +357,75 @@ def incomplete_ir(ir: dict) -> list[str]:
         if cls not in OP_WHITELIST and not n.get("code_hint"):
             items.append(f"op 节点 {n.get('id')}（{n.get('class_name')}）既不在白名单也无 code_hint")
     return items
+
+
+def external_input_conflicts(ir: dict) -> list[str]:
+    """「外部输入模块」的子树里却又存在**外来入边** → 该边在再生成时被忽略（死边），返回警告清单。
+
+    `input_spec.inputs` 列出的节点直接吃根 forward 的外部输入，其子树的数据流由该输入起头；
+    若子树里某个节点还有一条来自子树**之外**的入边，再生成时那条边不会生效（模块拿的是外部输入），
+    画布上画出来是误导。实测 scGPT 的 IR 有 `encoder -> val_prep`（`val_prep` 属 `value_encoder`
+    的子树，而 `value_encoder` 在 `input_spec.inputs` 里）——生成代码里 `value_encoder(x1)` 直接吃 x1，
+    这条边被完全忽略。**只作警告、不阻断**（结构/数值验证都只看层与数值，不看边）。
+    """
+    spec = ir.get("input_spec") or {}
+    roots = [s for s in (spec.get("inputs") or []) if isinstance(s, str)]
+    if not roots:
+        return []
+    nodes = ir.get("nodes") or []
+    ids = {n.get("id") for n in nodes}
+
+    def subtree(root: str) -> set:
+        out = {root}
+        stack = [root]
+        while stack:
+            cur = stack.pop()
+            for n in nodes:
+                if n.get("parent_id") == cur and n.get("id") not in out:
+                    out.add(n["id"])
+                    stack.append(n["id"])
+        return out
+
+    warns: list[str] = []
+    for root in roots:
+        if root not in ids:
+            continue
+        sub = subtree(root)
+        for e in ir.get("edges") or []:
+            if e.get("to") in sub and e.get("from") not in sub:
+                warns.append(
+                    f"外部输入模块 {root} 的子树节点 {e.get('to')} 还有一条外来入边 "
+                    f"{e.get('from')} → {e.get('to')}；该边在再生成时**不生效**"
+                    f"（{root} 直接吃外部输入），画布上的这根连线是误导——请删除或改接线"
+                )
+    return warns
+
+
+def isolated_blocks(ir: dict) -> list[str]:
+    """既无入边也无出边的节点（非根、且父不是容器）→ 再生成时是**死模块**，返回警告清单。
+
+    实测 scGPT 的 IR 里 `mvc_decoder` 整棵子树孤立——真实模型里它**确实被调用**（forward hook 实测，
+    输出进返回 dict），但再生成的模型 `self.mvc_decoder` 只被实例化、从不调用；而结构比对看的是
+    state_dict/层序列、数值比对只比首个张量 → **两关都没发现**（2026-10-06 坐实）。
+    容器（`nn.Sequential`）的子节点本来就不带边（数据流隐式），故排除。
+    """
+    nodes = ir.get("nodes") or []
+    by_id = {n.get("id"): n for n in nodes}
+    targets = {e.get("to") for e in ir.get("edges") or []}
+    sources = {e.get("from") for e in ir.get("edges") or []}
+    warns: list[str] = []
+    for n in nodes:
+        nid = n.get("id")
+        if nid == ir.get("root_id") or nid in targets or nid in sources:
+            continue
+        parent = by_id.get(n.get("parent_id"))
+        if parent is not None and parent.get("kind") == "container":
+            continue
+        warns.append(
+            f"节点 {nid}（{n.get('class_name')}）既无入边也无出边 → 再生成时是**死模块**"
+            "（会被实例化但从不调用）：请接上它的输入/输出，或删除该节点"
+        )
+    return warns
 
 
 def canonical_ir(ir: dict) -> dict:

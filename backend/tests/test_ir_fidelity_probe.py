@@ -102,3 +102,44 @@ def test_probe_skips_when_real_model_cannot_instantiate(tmp_path):
     ir["entry_class"] = "DoesNotExist"     # 真实模型侧加载失败 → 无从比对，应跳过
     res = _run_probe(tmp_path, ir)
     assert res.get("skipped") is True and res["ok"] is True
+
+
+SOURCE_WITH_NON_PARAM = (
+    "import torch.nn as nn\n"
+    "class Net(nn.Module):\n"
+    "    def __init__(self):\n"
+    "        super().__init__()\n"
+    "        self.fc = nn.Linear(4, 4)\n"
+    "        self.drop = nn.Dropout(0.5)\n"          # 无参但**被调用**
+    "    def forward(self, x):\n"
+    "        return self.drop(self.fc(x))\n"
+)
+
+
+def _run_probe_with_source(tmp_path: Path, ir: dict, source: str) -> dict:
+    src = tmp_path / "source2"
+    src.mkdir()
+    (src / "model.py").write_text(source, encoding="utf-8")
+    ir_path = tmp_path / "ir2.json"
+    regen_path = tmp_path / "regenerated2.py"
+    out_path = tmp_path / "fidelity2.json"
+    ir_path.write_text(json.dumps(ir), encoding="utf-8")
+    regen_path.write_text(ir_codegen.generate(ir), encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, str(PROBE), str(src), str(ir_path), str(regen_path), str(out_path)],
+        capture_output=True, text=True, timeout=300,
+    )
+    assert out_path.exists(), f"探针未产出结果：rc={proc.returncode}\n{proc.stdout}\n{proc.stderr}"
+    return json.loads(out_path.read_text(encoding="utf-8"))
+
+
+def test_probe_flags_missing_non_param_called_module(tmp_path):
+    """IR 漏了**无参但被调用**的模块（实测 scGPT 的 `creterion_cce`）→ 由真实追踪点名报出。
+
+    原先只查「带参层覆盖」，这类模块参数为 0、永远查不到；而它在真实前向里确实被调用。
+    """
+    res = _run_probe_with_source(tmp_path, _ir(with_act=False), SOURCE_WITH_NON_PARAM)
+    assert res["ok"] is False, res
+    joined = "；".join(res["issues"])
+    assert "drop" in joined and "没有对应节点" in joined
+    assert any(m["module_path"] == "drop" for m in res.get("traced_modules") or [])

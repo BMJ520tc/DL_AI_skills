@@ -11,6 +11,8 @@
 #      - 返回列表 → 打开原始项目查看器：三并列入口（先复现/先使用/先拆解）齐备；
 #      - 模块一新增入口：独立环境/最小可运行命令验证按钮、结构报告内容渲染（报告页签）、
 #        参数区「入口输入规格」PUT 真写回后端；
+#      - 模块四 6.2 延伸「结构」页签：结构校验提示、新增节点 / 新增边 / 删除边 / 删除节点
+#        逐项经 HTTP 复核真写回后端（ir.json）；
 #      - 「先复现」面板：论文下拉含种子论文 → 实验条目五要素表 + 编辑入口 → 点「确认」过 4.2 闸门
 #        （按钮 ② 变为「已确认 1/1 条」）→ 「⓪ 解析论文」真的发起 pdf_parse 任务（失败原因可见）；
 #      - 「先使用」面板：数据集下拉含种子数据集、四个操作按钮齐备、「⓪ 数据预处理」真的发起
@@ -487,8 +489,11 @@ def main() -> int:
                         wait_for(cdp, "document.body.innerText.includes('旧验证变 stale')", True,
                                  "输入规格保存后提示旧验证变 stale", timeout=15)
                         spec = http_json(f"/api/projects/{ORIG_PROJECT_ID}/ir")["ir"].get("input_spec")
+                        # update_input_spec 会写入 user_edited=True（重拆解时用户补的 shape 优先于 agent 新值），
+                        # 故只断言 shape 被写回、且带该标记，不要求对象逐键相等。
                         check("PUT /ir/input_spec 真的写回后端",
-                              spec == {"shape": [1, 3, 8, 8]}, f"input_spec={spec}")
+                              (spec or {}).get("shape") == [1, 3, 8, 8]
+                              and spec.get("user_edited") is True, f"input_spec={spec}")
 
                 # 最小可运行命令验证：确实发起 verify 任务；环境未就绪时失败原因与 run_record 都要可见
                 if click_button(cdp, "最小可运行命令验证"):
@@ -501,6 +506,77 @@ def main() -> int:
                     verify_body = cdp.evaluate("document.body.innerText")
                     check("最小命令验证失败不静默（run_record 或失败横幅可见）",
                           ("最小可运行命令 run_record" in verify_body) or ("环境未就绪" in verify_body))
+
+                # --- 模块四 6.2 延伸：IR 结构编辑（边/节点增删改，「结构」页签） ---
+                if click_button(cdp, "结构", exact=True):
+                    wait_for(cdp, "document.body.innerText.includes('新增节点')", True,
+                             "「结构」页签渲染（新增节点入口）")
+                    struct_body = cdp.evaluate("document.body.innerText")
+                    check("「结构」页签显示结构校验提示",
+                          "结构校验通过" in struct_body or "当前 IR 有" in struct_body)
+
+                    # 新增节点 relu（叶子 nn.ReLU，顶层）
+                    if click_button(cdp, "＋ 新增节点"):
+                        set_input_by_placeholder(cdp, "如 mvc_decoder", "relu")
+                        set_input_by_placeholder(cdp, "如 nn.Linear / MVCDecoder / add", "nn.ReLU")
+                        if click_button(cdp, "添加节点"):
+                            wait_for(cdp, "document.body.innerText.includes('节点已新增')", True,
+                                     "新增节点成功提示", timeout=15)
+                            ir_now = http_json(f"/api/projects/{ORIG_PROJECT_ID}/ir")["ir"]
+                            check("POST /ir/nodes 真的写回后端（新增 relu）",
+                                  any(n["id"] == "relu" for n in ir_now["nodes"]),
+                                  f"nodes={[n['id'] for n in ir_now['nodes']]}")
+
+                    # 新增边 net→relu（from/to 两个下拉 + 「添加边」）
+                    edge_sel_ok = cdp.evaluate("""
+                        (() => {
+                            const sels = [...document.querySelectorAll('select')];
+                            const from = sels.find(s => [...s.options].some(o => o.textContent === 'from…'));
+                            const to = sels.find(s => [...s.options].some(o => o.textContent === 'to…'));
+                            if (!from || !to) return false;
+                            const set = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+                            set.call(from, 'net'); from.dispatchEvent(new Event('change', { bubbles: true }));
+                            set.call(to, 'relu'); to.dispatchEvent(new Event('change', { bubbles: true }));
+                            return from.value === 'net' && to.value === 'relu';
+                        })()""")
+                    check("边新增下拉（from/to）可选", bool(edge_sel_ok))
+                    if edge_sel_ok and click_button(cdp, "添加边", exact=True):
+                        wait_for(cdp, "document.body.innerText.includes('边已新增')", True,
+                                 "新增边成功提示", timeout=15)
+                        ir_now = http_json(f"/api/projects/{ORIG_PROJECT_ID}/ir")["ir"]
+                        check("POST /ir/edges 真的写回后端（net→relu）",
+                              any(e["from"] == "net" and e["to"] == "relu" for e in ir_now["edges"]),
+                              f"edges={ir_now['edges']}")
+                        # 删掉刚加的边（点该行 × 按钮）
+                        if cdp.evaluate("""
+                            (() => {
+                                const b = [...document.querySelectorAll('button[title="删除边"]')]
+                                    .find(x => (x.parentElement?.innerText || '').includes('net → relu'));
+                                if (!b) return false; b.click(); return true;
+                            })()"""):
+                            wait_for(cdp, "document.body.innerText.includes('边已删除')", True,
+                                     "删除边成功提示", timeout=15)
+                            ir_now = http_json(f"/api/projects/{ORIG_PROJECT_ID}/ir")["ir"]
+                            check("DELETE /ir/edges 真的写回后端",
+                                  not any(e["from"] == "net" and e["to"] == "relu" for e in ir_now["edges"]),
+                                  f"edges={ir_now['edges']}")
+
+                    # 删除节点 relu：树里选中该行 → 「删除节点 relu」
+                    if cdp.evaluate("""
+                        (() => {
+                            const els = [...document.querySelectorAll('div,span')]
+                                .filter(x => (x.textContent || '').includes('nn.ReLU'));
+                            if (!els.length) return false;
+                            els.sort((a, b) => a.textContent.length - b.textContent.length)[0].click();
+                            return true;
+                        })()"""):
+                        if click_button(cdp, "删除节点 relu", exact=True):
+                            wait_for(cdp, "document.body.innerText.includes('节点已删除')", True,
+                                     "删除节点成功提示", timeout=15)
+                            ir_now = http_json(f"/api/projects/{ORIG_PROJECT_ID}/ir")["ir"]
+                            check("DELETE /ir/nodes 真的写回后端",
+                                  all(n["id"] != "relu" for n in ir_now["nodes"]),
+                                  f"nodes={[n['id'] for n in ir_now['nodes']]}")
 
         # --- 先复现：选论文 → 看条目 → 过 4.2 确认闸门 ---
         if click_button(cdp, "先复现"):

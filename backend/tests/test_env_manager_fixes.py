@@ -287,6 +287,65 @@ def test_install_with_fix_applies_cpu_index_and_progress(tmp_path, monkeypatch, 
     assert captured["progress"][0]["env_cuda"]["action"] == "cpu_wheel"
 
 
+# --------------------------------------- ④ 额外依赖持久化（清单漏声明；重建环境不丢）
+
+def test_record_extra_dep_persists_and_dedupes(tmp_path):
+    """补装过的「清单漏声明」包记进工作区清单；大小写/版本约束不同视为同一个包。"""
+    ws = tmp_path / "ws"
+    env_manager.record_extra_dep(ws, "IPython")
+    env_manager.record_extra_dep(ws, "ipython")        # 大小写不同 → 不重复记
+    env_manager.record_extra_dep(ws, "ipython>=8")     # 带版本约束 → 同一个包
+    env_manager.record_extra_dep(ws, "somepkg")
+
+    assert env_manager.load_extra_deps(ws) == ["IPython", "somepkg"]
+    assert env_manager.extra_deps_path(ws).name == "deps_extra.txt"
+
+
+def test_install_with_fix_installs_recorded_extra_deps(tmp_path, monkeypatch, isolated_db):
+    """重建环境必须把「此前自动补装过的额外依赖」一并装回（2026-10-06 scGPT/IPython 实测）。"""
+    source = _src(tmp_path, "extra_src", {"requirements.txt": "torch\n"})
+    ws = tmp_path / "ws_extra"
+    env_manager.record_extra_dep(ws, "ipython")
+    monkeypatch.setattr(env_manager, "_detect_cuda", lambda: None)
+    calls: list[str] = []
+
+    async def fake_try_install(pip, req_file, index_url=None, extra_index_url=None):
+        calls.append(str(req_file))
+        return {"ok": True, "error": None, "command": "pip install", "index_url": index_url,
+                "extra_index_url": extra_index_url,
+                "started_at": env_manager._now(), "finished_at": env_manager._now()}
+
+    monkeypatch.setattr(env_manager, "_try_install", fake_try_install)
+    monkeypatch.setattr(env_manager.task_manager, "update_progress", lambda *a, **k: None)
+
+    ok = asyncio.run(env_manager._install_with_fix(
+        source, tmp_path / "envdir", "pid-x", "task-x", "venv", ws=ws))
+
+    assert ok is True
+    assert any(p.endswith("deps_extra.txt") for p in calls), calls
+
+
+def test_install_extras_failure_fails_env_creation(tmp_path, monkeypatch, isolated_db):
+    """额外依赖装不上 → 建环境判失败（不留「建成功但 import 起不来」的环境）。"""
+    source = _src(tmp_path, "extra_fail_src", {"requirements.txt": "torch\n"})
+    ws = tmp_path / "ws_extra_fail"
+    env_manager.record_extra_dep(ws, "nonexistent-pkg-xyz")
+    monkeypatch.setattr(env_manager, "_detect_cuda", lambda: None)
+
+    async def fake_try_install(pip, req_file, index_url=None, extra_index_url=None):
+        ok = not str(req_file).endswith("deps_extra.txt")
+        return {"ok": ok, "error": None if ok else "no such package", "command": "pip install",
+                "index_url": index_url, "extra_index_url": extra_index_url,
+                "started_at": env_manager._now(), "finished_at": env_manager._now()}
+
+    monkeypatch.setattr(env_manager, "_try_install", fake_try_install)
+    monkeypatch.setattr(env_manager.task_manager, "update_progress", lambda *a, **k: None)
+
+    ok = asyncio.run(env_manager._install_with_fix(
+        source, tmp_path / "envdir", "pid-y", "task-y", "venv", ws=ws))
+    assert ok is False
+
+
 # --------------------------------------- ③ 任务前带入：依赖冲突预检（模块详细设计 8.2）
 
 

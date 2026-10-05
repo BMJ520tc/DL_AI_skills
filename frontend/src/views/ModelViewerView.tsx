@@ -9,7 +9,11 @@ import "@xyflow/react/dist/style.css";
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
     ApiError,
+    addIrEdge,
+    addIrNode,
     createProjectEnv,
+    deleteIrEdge,
+    deleteIrNode,
     getIr,
     getProject,
     getProjectEnvStatus,
@@ -17,6 +21,7 @@ import {
     listModules,
     listProjects,
     listRunRecords,
+    patchIrNode,
     postAnalyze,
     postDecompose,
     postIngestModule,
@@ -27,6 +32,8 @@ import {
     putIrEntryArgs,
     putIrInputSpec,
     putNodeParams,
+    type IrGraph,
+    type IrKind,
     type IrNode,
     type IrResponse,
     type ModuleItem,
@@ -62,6 +69,9 @@ const KIND_LABELS: Record<string, string> = {
     container: "容器",
     leaf: "叶子层",
     op: "算子",
+};
+const TAB_LABELS: Record<string, string> = {
+    params: "参数", structure: "结构", code: "代码", verify: "验证", tree: "层级树", report: "报告",
 };
 
 type TaskKind = "analyze" | "decompose" | "trace" | "verify" | "ingest" | "smoke";
@@ -540,6 +550,255 @@ function StructureReportView({ report }: { report: Record<string, unknown> }) {
 }
 
 // ---------------------------------------------------------------------------
+// 结构编辑（6.2 延伸：边/节点增删改）——把「人工改 reports/ir.json」变成界面能力
+// ---------------------------------------------------------------------------
+const KIND_OPTIONS: IrKind[] = ["module", "leaf", "container", "op"];
+const fieldRow: CSSProperties = { display: "flex", gap: 6, alignItems: "center", marginBottom: 6 };
+const fieldLabel: CSSProperties = { width: 46, fontSize: 11, color: "#94a3b8", fontFamily: "monospace" };
+
+/** node 的全部子孙 id（改 parent 时不能指向自身或后代）。 */
+function descendantIds(nodes: IrNode[], id: string): Set<string> {
+    const out = new Set<string>();
+    const stack = [id];
+    while (stack.length) {
+        const cur = stack.pop()!;
+        for (const n of nodes) {
+            if ((n.parent_id ?? null) === cur && !out.has(n.id)) {
+                out.add(n.id);
+                stack.push(n.id);
+            }
+        }
+    }
+    return out;
+}
+
+/** 节点表单：新增（含 id/params）与编辑（kind/class/parent/code_hint）共用。 */
+function NodeForm({
+    nodes, mode, initial, saving, onSubmit, onCancel,
+}: {
+    nodes: IrNode[];
+    mode: "add" | "edit";
+    initial?: IrNode | null;
+    saving: boolean;
+    onSubmit: (payload: Record<string, unknown>) => Promise<void>;
+    onCancel?: () => void;
+}) {
+    const [id, setId] = useState("");
+    const [kind, setKind] = useState<IrKind>("leaf");
+    const [className, setClassName] = useState("");
+    const [parentId, setParentId] = useState("");
+    const [paramsText, setParamsText] = useState("");
+    const [codeHint, setCodeHint] = useState("");
+    const [err, setErr] = useState<string | null>(null);
+
+    useEffect(() => {
+        if (mode !== "edit" || !initial) return;
+        setKind(initial.kind);
+        setClassName(initial.class_name ?? "");
+        setParentId(initial.parent_id ?? "");
+        setCodeHint(initial.code_hint ?? "");
+    }, [mode, initial]);
+
+    const blocked = mode === "edit" && initial
+        ? new Set([initial.id, ...descendantIds(nodes, initial.id)])
+        : new Set<string>();
+
+    const submit = async () => {
+        const cls = className.trim();
+        if (!cls) { setErr("class_name 不能为空"); return; }
+        if (mode === "add" && !id.trim()) { setErr("id 不能为空"); return; }
+        let params: Record<string, unknown> | undefined;
+        if (mode === "add" && paramsText.trim()) {
+            try {
+                const parsed = JSON.parse(paramsText);
+                if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error();
+                params = parsed as Record<string, unknown>;
+            } catch {
+                setErr('params 需为 JSON 对象，如 {"in_features":8}');
+                return;
+            }
+        }
+        setErr(null);
+        const payload: Record<string, unknown> = {
+            kind, class_name: cls, parent_id: parentId || null, code_hint: codeHint.trim() || null,
+        };
+        if (mode === "add") {
+            payload.id = id.trim();
+            if (params) payload.params = params;
+        }
+        await onSubmit(payload);
+    };
+
+    return (
+        <div style={{ border: "1px solid #1f2937", borderRadius: 8, padding: "8px 10px", marginBottom: 10 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 6 }}>{mode === "add" ? "新增节点" : "编辑节点"}</div>
+            {mode === "add" && (
+                <div style={fieldRow}>
+                    <span style={fieldLabel}>id</span>
+                    <input style={{ ...inputStyle, flex: 1, fontFamily: "monospace" }} value={id}
+                        onChange={e => setId(e.target.value)} placeholder="如 mvc_decoder" />
+                </div>
+            )}
+            <div style={fieldRow}>
+                <span style={fieldLabel}>kind</span>
+                <select style={{ ...inputStyle, flex: 1 }} value={kind} onChange={e => setKind(e.target.value as IrKind)}>
+                    {KIND_OPTIONS.map(k => <option key={k} value={k}>{k}（{KIND_LABELS[k]}）</option>)}
+                </select>
+            </div>
+            <div style={fieldRow}>
+                <span style={fieldLabel}>class</span>
+                <input style={{ ...inputStyle, flex: 1, fontFamily: "monospace" }} value={className}
+                    onChange={e => setClassName(e.target.value)} placeholder="如 nn.Linear / MVCDecoder / add" />
+            </div>
+            <div style={fieldRow}>
+                <span style={fieldLabel}>parent</span>
+                <select style={{ ...inputStyle, flex: 1 }} value={parentId} onChange={e => setParentId(e.target.value)}>
+                    <option value="">（顶层）</option>
+                    {nodes.filter(n => !blocked.has(n.id)).map(n => <option key={n.id} value={n.id}>{n.id}</option>)}
+                </select>
+            </div>
+            {mode === "add" && (
+                <div style={fieldRow}>
+                    <span style={fieldLabel}>params</span>
+                    <input style={{ ...inputStyle, flex: 1, fontFamily: "monospace" }} value={paramsText}
+                        onChange={e => setParamsText(e.target.value)}
+                        placeholder='可选 JSON，如 {"in_features":8,"out_features":16}' />
+                </div>
+            )}
+            <div style={fieldRow}>
+                <span style={fieldLabel}>hint</span>
+                <input style={{ ...inputStyle, flex: 1, fontFamily: "monospace" }} value={codeHint}
+                    onChange={e => setCodeHint(e.target.value)} placeholder="op 内联表达式，输入用 {inputs}" />
+            </div>
+            {err && <div style={{ color: "#fca5a5", fontSize: 11, marginBottom: 6 }}>{err}</div>}
+            <div style={{ display: "flex", gap: 6 }}>
+                <button style={{ ...btnStyle, flex: 1 }} disabled={saving} onClick={() => void submit()}>
+                    {saving ? "保存中…" : mode === "add" ? "添加节点" : "保存改动"}
+                </button>
+                {onCancel && <button style={{ ...btnStyle, background: "#334155" }} disabled={saving} onClick={onCancel}>取消</button>}
+            </div>
+        </div>
+    );
+}
+
+/** 结构编辑页签：校验提示 + 节点增删改 + 边增删。 */
+function StructureEditor({
+    ir, irErrors, irWarnings, selectedNodeId, onSelect, collapsed, setCollapsed, saving,
+    onAddNode, onPatchNode, onDeleteNode, onAddEdge, onDeleteEdge,
+}: {
+    ir: IrGraph;
+    irErrors: string[];
+    irWarnings: string[];
+    selectedNodeId: string | null;
+    onSelect: (id: string) => void;
+    collapsed: Set<string>;
+    setCollapsed: React.Dispatch<React.SetStateAction<Set<string>>>;
+    saving: boolean;
+    onAddNode: (payload: Record<string, unknown>) => Promise<void>;
+    onPatchNode: (nodeId: string, patch: Record<string, unknown>) => Promise<void>;
+    onDeleteNode: (nodeId: string, recursive: boolean) => Promise<void>;
+    onAddEdge: (from: string, to: string) => Promise<void>;
+    onDeleteEdge: (from: string, to: string) => Promise<void>;
+}) {
+    const [adding, setAdding] = useState(false);
+    const [edgeFrom, setEdgeFrom] = useState("");
+    const [edgeTo, setEdgeTo] = useState("");
+    const selected = ir.nodes.find(n => n.id === selectedNodeId) ?? null;
+    const hasChildren = selected ? ir.nodes.some(n => (n.parent_id ?? null) === selected.id) : false;
+    const ids = ir.nodes.map(n => n.id);
+
+    return (
+        <div>
+            {irErrors.length === 0 ? (
+                <div style={{ ...infoBanner, fontSize: 11 }}>结构校验通过：当前 IR 可再生成。</div>
+            ) : (
+                <div style={{ ...infoBanner, background: "#3f2d1d", borderColor: "#d97706", color: "#fde68a", fontSize: 11 }}>
+                    <div style={{ fontWeight: 700, marginBottom: 4 }}>
+                        当前 IR 有 {irErrors.length} 处问题（再生成/验证/入库会被拦下）
+                    </div>
+                    <ul style={{ margin: 0, paddingLeft: 16 }}>
+                        {irErrors.slice(0, 12).map((e, i) => <li key={i}>{e}</li>)}
+                    </ul>
+                    {irErrors.length > 12 && <div>… 另有 {irErrors.length - 12} 处</div>}
+                </div>
+            )}
+            {irWarnings.length > 0 && (
+                <div style={{ ...infoBanner, background: "#3b2f14", borderColor: "#a16207", color: "#fde68a", fontSize: 11 }}>
+                    <div style={{ fontWeight: 700, marginBottom: 4 }}>
+                        {irWarnings.length} 条不阻断的结构警告（再生成/验证/入库不受影响）
+                    </div>
+                    <ul style={{ margin: 0, paddingLeft: 16 }}>
+                        {irWarnings.slice(0, 8).map((w, i) => <li key={i}>{w}</li>)}
+                    </ul>
+                </div>
+            )}
+            <div style={{ fontSize: 11, color: "#64748b", marginBottom: 10 }}>
+                结构改动会让旧验证变 stale（入库前需重新走 ③ 补形状 → ⑤ 两步验证）。
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", marginBottom: 6 }}>
+                <div style={{ fontWeight: 700, fontSize: 12, flex: 1 }}>节点（{ir.nodes.length}）</div>
+                <button style={btnStyle} onClick={() => setAdding(v => !v)}>{adding ? "收起" : "＋ 新增节点"}</button>
+            </div>
+            {adding && (
+                <NodeForm nodes={ir.nodes} mode="add" saving={saving}
+                    onSubmit={async p => { await onAddNode(p); setAdding(false); }}
+                    onCancel={() => setAdding(false)} />
+            )}
+            <IrTree nodes={ir.nodes} selectedNodeId={selectedNodeId} onSelect={onSelect}
+                collapsed={collapsed} setCollapsed={setCollapsed} />
+            {selected && (
+                <div style={{ marginTop: 10 }}>
+                    <NodeForm key={selected.id} nodes={ir.nodes} mode="edit" initial={selected} saving={saving}
+                        onSubmit={p => onPatchNode(selected.id, p)} />
+                    <button style={{ ...btnStyle, width: "100%", background: "#7f1d1d" }} disabled={saving}
+                        onClick={() => void onDeleteNode(selected.id, false)}>
+                        删除节点 {selected.id}
+                    </button>
+                    {hasChildren && (
+                        <button style={{ ...btnStyle, width: "100%", background: "#7f1d1d", marginTop: 6 }} disabled={saving}
+                            onClick={() => void onDeleteNode(selected.id, true)}>
+                            删除节点及其子树
+                        </button>
+                    )}
+                </div>
+            )}
+
+            <div style={{ fontWeight: 700, fontSize: 12, margin: "14px 0 6px" }}>边（{ir.edges.length}）</div>
+            <div style={{ marginBottom: 8 }}>
+                {ir.edges.map((e, i) => (
+                    <div key={`${e.from}→${e.to}#${i}`} style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                        <span style={{
+                            flex: 1, minWidth: 0, fontFamily: "monospace", fontSize: 11, color: "#cbd5e1",
+                            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                        }} title={`${e.from} → ${e.to}`}>
+                            {e.from} → {e.to}
+                        </span>
+                        <button title="删除边" disabled={saving}
+                            style={{ border: "none", background: "transparent", color: "#64748b", cursor: "pointer", fontSize: 12 }}
+                            onClick={() => void onDeleteEdge(e.from, e.to)}>×</button>
+                    </div>
+                ))}
+                {ir.edges.length === 0 && <div style={{ color: "#64748b", fontSize: 12 }}>无边</div>}
+            </div>
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <select style={{ ...inputStyle, flex: 1 }} value={edgeFrom} onChange={e => setEdgeFrom(e.target.value)}>
+                    <option value="">from…</option>
+                    {ids.map(x => <option key={x} value={x}>{x}</option>)}
+                </select>
+                <span style={{ color: "#64748b" }}>→</span>
+                <select style={{ ...inputStyle, flex: 1 }} value={edgeTo} onChange={e => setEdgeTo(e.target.value)}>
+                    <option value="">to…</option>
+                    {ids.map(x => <option key={x} value={x}>{x}</option>)}
+                </select>
+                <button style={btnStyle} disabled={saving || !edgeFrom || !edgeTo}
+                    onClick={() => void onAddEdge(edgeFrom, edgeTo)}>添加边</button>
+            </div>
+        </div>
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 主视图
 // ---------------------------------------------------------------------------
 export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: ModelViewerViewProps) {
@@ -550,10 +809,11 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
     const [code, setCode] = useState<string | null>(null);
     const [regenError, setRegenError] = useState<{ error: string; missing: string[] } | null>(null);
     const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
-    const [tab, setTab] = useState<"params" | "code" | "verify" | "tree" | "report">("params");
+    const [tab, setTab] = useState<"params" | "structure" | "code" | "verify" | "tree" | "report">("params");
     const [showDiagram, setShowDiagram] = useState(false);
     const [showShapes, setShowShapes] = useState(true);
     const [savingParams, setSavingParams] = useState(false);
+    const [savingStruct, setSavingStruct] = useState(false);
     const [task, setTask] = useState<{ id: string; kind: TaskKind; after: () => Promise<void> } | null>(null);
     const [taskInfo, setTaskInfo] = useState<Task | null>(null);
     const [banner, setBanner] = useState<string | null>(null);
@@ -820,6 +1080,24 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
             setSavingParams(false);
         }
     };
+
+    // ---------------- 结构编辑（6.2 延伸：边/节点增删改） ----------------
+    /** 跑一次结构改动 → 刷新 IR → 按响应里的 errors 提示；失败横幅。（每个改动都让旧验证 stale） */
+    const runStruct = useCallback(async (
+        fn: () => Promise<{ errors?: string[] }>, okMsg: string,
+    ) => {
+        setSavingStruct(true);
+        try {
+            const res = await fn();
+            await refreshIr();
+            const n = res.errors?.length ?? 0;
+            setFlash(n ? `${okMsg}；当前 IR 仍有 ${n} 处问题（见「结构」页提示）` : okMsg);
+        } catch (e) {
+            setBanner(e instanceof Error ? e.message : String(e));
+        } finally {
+            setSavingStruct(false);
+        }
+    }, [refreshIr]);
 
     // ---------------- 模块一：独立环境 + 最小可运行命令验证 ----------------
 
@@ -1403,14 +1681,14 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                 {/* 右：面板 */}
                 <div style={{ width: 380, borderLeft: "1px solid #1f2937", display: "flex", flexDirection: "column", minHeight: 0, background: "#0f172a" }}>
                     <div style={{ display: "flex", borderBottom: "1px solid #1f2937" }}>
-                        {(["params", "code", "verify", "tree", "report"] as const).map(t => (
+                        {(["params", "structure", "code", "verify", "tree", "report"] as const).map(t => (
                             <button
                                 key={t}
                                 onClick={() => setTab(t)}
                                 style={{
                                     flex: 1,
-                                    padding: "8px 4px",
-                                    fontSize: 12,
+                                    padding: "8px 2px",
+                                    fontSize: 11,
                                     fontWeight: 600,
                                     border: "none",
                                     borderBottom: tab === t ? "2px solid #0f766e" : "2px solid transparent",
@@ -1419,7 +1697,7 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                                     cursor: "pointer",
                                 }}
                             >
-                                {t === "params" ? "参数" : t === "code" ? "代码" : t === "verify" ? "验证" : t === "tree" ? "层级树" : "报告"}
+                                {TAB_LABELS[t]}
                             </button>
                         ))}
                     </div>
@@ -1524,6 +1802,34 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                                 <div style={{ color: "#64748b", fontSize: 12 }}>在结构图中点击节点查看/编辑参数</div>
                             )}
                             </div>
+                        )}
+
+                        {tab === "structure" && ir && (
+                            <StructureEditor
+                                ir={ir}
+                                irErrors={irResp?.ir_errors ?? []}
+                                irWarnings={irResp?.ir_warnings ?? []}
+                                selectedNodeId={selectedNodeId}
+                                onSelect={setSelectedNodeId}
+                                collapsed={treeCollapsed}
+                                setCollapsed={setTreeCollapsed}
+                                saving={savingStruct}
+                                onAddNode={p => runStruct(
+                                    () => addIrNode(projectId, p as unknown as Parameters<typeof addIrNode>[1]),
+                                    "节点已新增，旧验证已失效（stale）")}
+                                onPatchNode={(nodeId, patch) => runStruct(
+                                    () => patchIrNode(projectId, nodeId, patch as Partial<IrNode>),
+                                    "节点已修改，旧验证已失效（stale）")}
+                                onDeleteNode={(nodeId, recursive) => runStruct(
+                                    () => deleteIrNode(projectId, nodeId, recursive),
+                                    "节点已删除，旧验证已失效（stale）")}
+                                onAddEdge={(from, to) => runStruct(
+                                    () => addIrEdge(projectId, from, to),
+                                    "边已新增，旧验证已失效（stale）")}
+                                onDeleteEdge={(from, to) => runStruct(
+                                    () => deleteIrEdge(projectId, from, to),
+                                    "边已删除，旧验证已失效（stale）")}
+                            />
                         )}
 
                         {tab === "code" && (

@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import pytest
+
 from app.services import agent_service
 
 
@@ -74,3 +76,48 @@ def test_build_options_respects_caller_allowed_tools():
     assert agent_service.KNOWLEDGE_MCP_TOOL_RULE in options.allowed_tools
     assert "Read" in options.allowed_tools and "Grep" in options.allowed_tools
     assert "Bash" not in options.allowed_tools
+
+
+# ---------------------------------------------------- 按任务覆盖模型 / 端点（拆解专用）
+
+def test_build_options_model_override_and_env():
+    """`model` / `model_env` 写进 options（供「拆解单独走强模型/端点」）；基线 env 不被覆盖掉。"""
+    options = agent_service._build_options({
+        "model": "claude-sonnet-4-6",
+        "model_env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                      "ANTHROPIC_API_KEY": "sk-ant-x"},
+    })
+    assert options.model == "claude-sonnet-4-6"
+    assert options.env["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
+    assert options.env["ANTHROPIC_API_KEY"] == "sk-ant-x"
+    assert options.env["DISABLE_AUTOUPDATER"] == "1"     # 基线 env 保留
+
+
+def test_build_options_without_override_leaves_env_clean():
+    options = agent_service._build_options({})
+    assert "ANTHROPIC_BASE_URL" not in (options.env or {})
+    assert options.model == agent_service.DEFAULT_MODEL
+
+
+# ---------------------------------------------------- 未登录/凭证失效：立即中止（不重试）
+
+def test_raise_if_agent_error_classifies_not_logged_in():
+    """CLI 未登录被当「回复文本」返回 → 译制后抛出（此前被当成「没产出」白试十几轮）。"""
+    with pytest.raises(RuntimeError, match="未登录|凭证"):
+        agent_service.raise_if_agent_error("Not logged in · Please run /login")
+    with pytest.raises(RuntimeError, match="未登录|凭证"):
+        agent_service.raise_if_agent_error("Please run /login")
+    # API 层错误优先译制
+    with pytest.raises(RuntimeError, match="余额不足"):
+        agent_service.raise_if_agent_error("API Error: 402 Insufficient Balance")
+
+
+def test_raise_if_agent_error_passes_through_normal_output():
+    agent_service.raise_if_agent_error("已产出 IR：39 节点 / 30 边")
+    agent_service.raise_if_agent_error(None)
+
+
+def test_is_auth_error_markers():
+    assert agent_service.is_auth_error("Not logged in · Please run /login")
+    assert agent_service.is_auth_error("API Error: 401 invalid x-api-key")
+    assert not agent_service.is_auth_error("已将 IR 写入 result.json")

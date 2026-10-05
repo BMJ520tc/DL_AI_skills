@@ -102,14 +102,29 @@ def _leaf_expr(node: dict) -> str:
     return f"nn.{_leaf_name(node['class_name'])}({_render_kwargs(node.get('params') or {})})"
 
 
+def _ext_names(tpl: str) -> list[str]:
+    """code_hint 里引用的**外部输入**名（`{ext:labels}`）——根类 forward 的额外形参。"""
+    return re.findall(r"\{ext:(\w+)\}", str(tpl or ""))
+
+
 def _render_op(node: dict, in_vars: list[str]) -> str:
     cls = normalize_class_name(node.get("class_name") or "")
-    tpl = _OP_TEMPLATES.get(cls) or node.get("code_hint")
+    hint = str(node.get("code_hint") or "")
+    # 引用了**外部输入**（`{ext:…}`）的 code_hint **优先于**内置模板——内置模板只知道入边
+    # （`torch.add({inputs})`），会把外部输入那个操作数丢掉。
+    tpl = hint if (hint and _ext_names(hint)) else (_OP_TEMPLATES.get(cls) or hint)
     if not tpl:
         raise IrIncompleteError([f"op 节点 {node['id']}（{cls}）既不在白名单也无 code_hint"])
-    if "{inputs}" not in tpl and "{inputs[" not in tpl:
-        raise IrIncompleteError([f"op 节点 {node['id']} 的 code_hint 必须含 {{inputs}} 占位符: {tpl}"])
-    if cls in OP_BINARY and len(in_vars) < 2:
+    exts = _ext_names(tpl)
+    consumes = "{inputs}" in tpl or "{inputs[" in tpl
+    if not consumes and not exts and cls not in OP_WHITELIST:
+        # 既不引用操作数、也不引用外部输入：只允许**常量表达式**（如 torch.arange(0, 1200)）
+        raise IrIncompleteError(
+            [f"op 节点 {node['id']} 的 code_hint 必须含 {{inputs}} 占位符（或用 {{ext:名字}} 引用外部输入）: {tpl}"])
+    if not consumes and in_vars:
+        raise IrIncompleteError(
+            [f"op 节点 {node['id']} 有 {len(in_vars)} 条入边，但 code_hint 没有引用任何操作数（{{inputs}}）: {tpl}"])
+    if cls in OP_BINARY and len(in_vars) + len(exts) < 2:
         raise IrIncompleteError(
             [f"op 节点 {node['id']}（{cls}）需要至少两条入边，当前 {len(in_vars)} 条（生成的表达式调用会失败）"]
         )
@@ -129,6 +144,8 @@ def _render_op(node: dict, in_vars: list[str]) -> str:
         return in_vars[i]
 
     rendered = re.sub(r"\{inputs\[(\d+)\]\}", _sub_input_index, tpl)
+    # `{ext:名字}` → 直接用该名字（根类 forward 里已按 input_spec.external 声明了同名形参）
+    rendered = re.sub(r"\{ext:(\w+)\}", lambda m: m.group(1), rendered)
     return (
         rendered.replace("{inputs}", in_vars[0] if len(in_vars) == 1 else ", ".join(in_vars))
         .replace("{dim}", _py_value(_p("dim")))
@@ -338,11 +355,22 @@ def _module_class(ir: dict, node: dict) -> str:
     #   这样 `MVCDecoder(cell_emb, gene_embs)` 这类**多输入模块**才表达得出来
     #   （此前 schema 只许一条入边，要么表达不了、要么只能不连边把分支丢掉）。
     is_root = node["id"] == ir.get("root_id")
+    spec = ir.get("input_spec") or {}
     if is_root:
-        sources = [str(x) for x in ((ir.get("input_spec") or {}).get("inputs") or [])]
+        sources = [str(x) for x in (spec.get("inputs") or [])]
     else:
         sources = [str(e.get("from")) for e in in_edges(ir, node["id"])]
-    sig_params = ["x"] if not sources else [f"x{i}" for i in range(len(sources))]
+    # **外部输入**（`input_spec.external`）：不来自任何节点、而是根 forward 直接吃的原始实参
+    # （如 scGPT 的 `labels`——`creterion_cce(cos_sim, labels)` 的第二个操作数）。op 的 code_hint
+    # 用 `{ext:名字}` 引用它们；这里把它们追加成根类的额外形参。
+    base_params = ["x"] if not sources else [f"x{i}" for i in range(len(sources))]
+    ext_params = []
+    if is_root:
+        # 与已有形参**重名**的外部输入不再加形参——它指的就是同一个实参
+        # （如单输入模型里 `sig_params` 本来就是 `x`，而外部输入名字也是 `x`）
+        ext_params = [str(e.get("name")) for e in (spec.get("external") or [])
+                      if isinstance(e, dict) and e.get("name") and str(e.get("name")) not in base_params]
+    sig_params = base_params + ext_params
 
     def _ext_var(src: str) -> str:
         """「模块之外」的输入变量：来源在册就用对应形参，否则退回第一个（保持旧行为）。"""
@@ -375,8 +403,9 @@ def _module_class(ir: dict, node: dict) -> str:
             _check_self_refs(n)
             fwd_lines.append(f"        var_{nid} = {_render_op(n, in_vars)}")
         else:
-            # module 子节点按**全部**入边调用（多输入模块的形参与此对应）；叶子/容器仍是单张量入参
-            if in_vars and n["kind"] == "module":
+            # 多入边即按序全部传参：module 的形参按此对应；带 code_hint 的复合叶子（如折叠出来的
+            # `nn.TransformerEncoder`）也吃多个入参。单入边仍传一个（叶子/容器的常规情形）。
+            if len(in_vars) > 1:
                 args = ", ".join(in_vars)
             else:
                 args = in_vars[0] if in_vars else _ext_var(nid)
