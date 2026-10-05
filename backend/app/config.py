@@ -120,6 +120,29 @@ FRONTEND_DIST_DIR = (
 )
 
 
+def _default_env_root() -> Path:
+    """项目独立环境的默认根：数据在非系统盘 → `<盘>:\\DLenv`（盘根通常可写、无需管理员）；
+    否则 `%LOCALAPPDATA%\\DLenv`。刻意取短路径，规避 Windows 260 字符上限（见 ENV_ROOT 注释）。
+    """
+    drive = DATA_DIR.drive  # 如 "D:"
+    if drive and drive.upper() != "C:":
+        return Path(drive + "\\DLenv")
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    return Path(base) / "DLenv"
+
+
+# 项目独立环境的根目录：**刻意放在短路径**。背景（2026-10-05 实测）：环境原落在
+# `data/projects/<32位项目id>/env`，前缀就已 ~99 字符；装上 orbax 这类含深层测试夹具的包时
+# 完整路径 >260 → pip 报 `WinError 3 系统找不到指定的路径` 并中断整个安装（scGPT 建环境卡死即此因）。
+# 改为 `<ENV_ROOT>/<项目id前8位>`（≈ 70 字符，留足余量）；可用 `DL_AI_ENV_ROOT` 覆盖。
+ENV_ROOT = Path(os.getenv("DL_AI_ENV_ROOT") or _default_env_root())
+
+
+def project_env_dir(project_id: str) -> Path:
+    """项目独立环境目录：`<ENV_ROOT>/<项目id前8位>`（短路径，规避 MAX_PATH）。"""
+    return ENV_ROOT / str(project_id)[:8]
+
+
 def ensure_data_dirs() -> None:
     """确保 data/ 下各运行时目录存在。"""
     for d in (

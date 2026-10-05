@@ -23,8 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.config import CONDA_PATH, ENV_VENV_PYTHON, PIP_FALLBACK_INDEX, PIP_INDEX_URL
-from app.services import agent_service, knowledge_service, proc_util, project_manager, prompts, task_manager
+from app.config import CONDA_PATH, ENV_VENV_PYTHON, PIP_FALLBACK_INDEX, PIP_INDEX_URL, project_env_dir
+from app.services import agent_service, knowledge_service, long_paths, proc_util, project_manager, prompts, task_manager
 
 ENV_TASK_TYPE = "env_create"
 INSTALL_TIMEOUT_S = 600  # 单次 pip 安装上限（超时即杀进程树）
@@ -87,14 +87,41 @@ def _container_unavailable_reason() -> str:
     )
 
 
+def _progress_reporter(task_id: str):
+    """任务进度写手：`update_progress` 是**整体覆盖**，故这里维护一份累积 dict，
+    每次写入都带上既有键（env_precheck / env_cuda / env_fix …），滚动 stage 时不冲掉它们。
+    """
+    state: dict = {}
+
+    def report(stage: str, **extra) -> None:
+        state.update(extra)
+        task_manager.update_progress(task_id, {**state, "stage": stage})
+
+    return report
+
+
 def create_env(project_id: str) -> str:
     project_manager.require_type(project_id, {"original"})
     return task_manager.create_task(ENV_TASK_TYPE, project_id=project_id, params={"project_id": project_id})
 
 
 def get_env_status(project_id: str) -> dict:
+    """环境状态 + 路径：`env_dir` 为短路径根下的目录，`env_python` 为解释器（未就绪为 None）。
+
+    供界面与验收脚本**问后端**取环境位置，不必各自猜 `ws/env`（环境已迁到短路径根，见
+    config.project_env_dir）。
+    """
     project = project_manager.get_project(project_id)
-    return {"project_id": project_id, "status": project["status"] if project else None}
+    if project is None:
+        return {"project_id": project_id, "status": None}
+    from app.services import analysis_service  # 延迟导入：避免 env_manager ↔ analysis_service 环
+    ws = Path(project["workspace_path"])
+    return {
+        "project_id": project_id,
+        "status": project["status"],
+        "env_dir": str(project_env_dir(project_id)),
+        "env_python": analysis_service._project_python(ws, project_id),
+    }
 
 
 async def _run_env_create(params: dict, task_id: str) -> None:
@@ -110,39 +137,70 @@ async def _run_env_create(params: dict, task_id: str) -> None:
         # 2.3 步骤 1：先探测本机 docker 再决定提示——有 docker 也不假装能建容器环境（如实报错）。
         raise RuntimeError(_container_unavailable_reason())
 
-    env_dir = ws / "env"
+    # 环境落在**短路径根**（`<ENV_ROOT>/<项目id前8位>`），规避 Windows 260 上限（见 config.project_env_dir）。
+    env_dir = project_env_dir(project_id)
+    legacy_env = ws / "env"   # 迁移前的老位置；重建时一并清掉，避免新旧环境并存被误用
     created_at = _now()
+    report = _progress_reporter(task_id)
+
+    # 8 位 id 目录若已属别的项目 → 明确报错（碰撞概率极低，但绝不静默串环境）
+    marker = env_dir / ".project_id"
+    if env_dir.exists() and marker.exists():
+        try:
+            existing = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            existing = ""
+        if existing and existing != project_id:
+            raise RuntimeError(
+                f"环境目录 {env_dir} 已属于项目 {existing}（8 位 id 冲突）；"
+                f"请设置 DL_AI_ENV_ROOT 指向其它目录后重试"
+            )
+
     # 重建环境前必须清空目标目录：venv/conda 创建都不会清理已存在的目录，
     # 旧解释器的 site-packages（例如 cp312 的 numpy）会残留并与新环境混装 → 导入即失败。
-    if env_dir.exists():
-        shutil.rmtree(env_dir, ignore_errors=True)
-        if env_dir.exists():          # Windows 上可能因占用/杀软扫描短暂锁定 → 稍等重试一次
+    cleaned: list[str] = []
+    for target in (env_dir, legacy_env):
+        if not target.exists():
+            continue
+        shutil.rmtree(target, ignore_errors=True)
+        if target.exists():           # Windows 上可能因占用/杀软扫描短暂锁定 → 稍等重试一次
             time.sleep(2)
-            shutil.rmtree(env_dir, ignore_errors=True)
-        if env_dir.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        if target.exists():
             # 删除不完整时 venv 覆写 python.exe 会报 Permission denied，必须报清楚而不是让它神秘失败
             raise RuntimeError(
-                f"旧环境目录无法删除（可能被进程占用或杀软扫描中）: {env_dir}；请关闭占用后重试"
+                f"旧环境目录无法删除（可能被进程占用或杀软扫描中）: {target}；请关闭占用后重试"
             )
+        cleaned.append(str(target))
+    if cleaned:
         knowledge_service.record_run(
             {"project_id": project_id, "task_id": task_id, "run_type": "env_install",
              "environment": {"type": env_type}, "params": {"step": "env_clean"},
-             "command": f"清理旧环境目录 {env_dir}", "status": "success",
+             "command": f"清理旧环境目录 {'；'.join(cleaned)}", "status": "success",
              "started_at": created_at, "finished_at": _now()}
         )
+    env_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        marker.write_text(project_id, encoding="utf-8")
+    except OSError:
+        pass
+    interp = "python"
     if env_type == "conda":
         cmd = _conda_create_cmd(source, env_dir)
         python_note: dict = {}
+        report("创建 conda 环境…（首次可能较慢）")
     else:
         # 语言版本生效（2.3 步骤 2）：清单声明的 Python 要求 → venv 解释器选择；
         # 选不到匹配解释器时告警回退（不静默），没有要求时行为与旧版一致（后端解释器 / ENV_VENV_PYTHON）。
         python_cmd, python_note = resolve_env_python(source)
         cmd = [*python_cmd, "-m", "venv", str(env_dir)]
+        interp = Path(str(python_cmd[0])).name if python_cmd else "python"
+        report(f"创建 venv 环境（解释器 {interp}）…")
     create_params: dict = {"step": "env_create"}
     if python_note.get("required"):
         create_params["python_selection"] = python_note
         if python_note.get("warning"):
-            task_manager.update_progress(task_id, {"env_python": python_note})
+            report(f"创建 venv 环境（解释器回退：{interp}）…", env_python=python_note)
     err = await _create_env_dir(env_type, source, env_dir, cmd)
     if err is not None:
         knowledge_service.record_run(
@@ -162,13 +220,28 @@ async def _run_env_create(params: dict, task_id: str) -> None:
          "started_at": created_at, "finished_at": _now()}
     )
 
-    ok = await _install_with_fix(source, env_dir, project_id, task_id, env_type)
+    report("环境已创建，开始安装依赖…")
+    ok = await _install_with_fix(source, env_dir, project_id, task_id, env_type, report)
     if ok:
         project_manager.update_status(project_id, "env_ready")
+        report("环境就绪 ✓")
     else:
         project_manager.update_status(project_id, "env_failed")
         _draft_dependency_conflict(project_id, task_id, "依赖安装（修正循环耗尽）", "")
-        raise RuntimeError("环境安装失败（依赖修正循环耗尽）")
+        raise RuntimeError("环境安装失败（依赖修正循环耗尽）" + _long_path_hint(project_id))
+
+
+def _long_path_hint(project_id: str) -> str:
+    """安装失败若属 Windows 260 字符路径上限，附上可操作指引（界面据「长路径」字样给出开启按钮）。"""
+    try:
+        latest = knowledge_service.get_latest_run(project_id, "env_install", "failed") or {}
+        blocked = long_paths.is_long_path_error(latest.get("error") or "")
+    except Exception:  # noqa: BLE001 —— 提示失败不影响原始报错
+        return ""
+    if blocked and not long_paths.is_enabled():
+        return ("（原因：Windows 路径超过 260 字符上限——该依赖的深层路径过长；"
+                "请在界面上点「开启长路径支持」授权一次，再重试建环境）")
+    return ""
 
 
 def _draft_dependency_conflict(project_id: str, task_id: str, stage: str, err: str) -> None:
@@ -262,8 +335,13 @@ async def _create_env_dir(env_type: str, source: Path, env_dir: Path, cmd: list[
 
 
 async def _install_with_fix(
-    source: Path, env_dir: Path, project_id: str, task_id: str, env_type: str,
+    source: Path, env_dir: Path, project_id: str, task_id: str, env_type: str, report=None,
 ) -> bool:
+    def _report(stage: str, **extra) -> None:
+        if report is not None:
+            report(stage, **extra)
+        else:   # 未传写手（直接调用本函数的场景）：仍写进度，保持既有契约
+            task_manager.update_progress(task_id, {**extra, "stage": stage})
     pip = _env_pip(env_dir)
     req_file = _find_requirements(source)
     # 安装前预检（需求六.1、8.2「安装依赖前提示绕开方案」）：把已确认的 dependency_conflict
@@ -282,17 +360,18 @@ async def _install_with_fix(
         precheck_progress["env_precheck_applied"] = applied["applied"]
         req_file = Path(applied["path"])
     if precheck_progress:
-        task_manager.update_progress(task_id, precheck_progress)
+        _report("依赖预检完成（已应用已知版本钉）", **precheck_progress)
     versions = detect_versions(source, _env_python(env_dir))
     cuda_plan = versions.get("cuda_plan") or {}
     extra_index_url = None
     if cuda_plan.get("action") == "cpu_wheel":
         # CUDA 降级结论必须可见：进任务进度，且随 environment.cuda_plan 进每次安装的 run_record
         extra_index_url = cuda_plan.get("index")
-        task_manager.update_progress(task_id, {"env_cuda": cuda_plan})
+        _report("检测到 CUDA 要求，改用 CPU 版 wheel", env_cuda=cuda_plan)
     index_url = PIP_INDEX_URL  # None → 用 pip 自身配置（用户 pip.ini）
 
     for attempt in range(1, 4):
+        _report(f"安装依赖（第 {attempt}/3 次尝试）…（下载/安装可能数分钟）")
         result = await _try_install(pip, req_file, index_url, extra_index_url)
         _record_install(project_id, task_id, attempt, result, versions, env_type)
         if result["ok"]:
@@ -300,22 +379,29 @@ async def _install_with_fix(
         # 索引不可达（非依赖冲突）：切备源重试一次，不消耗依赖修正循环
         if index_url != PIP_FALLBACK_INDEX and _is_index_error(result["error"]):
             index_url = PIP_FALLBACK_INDEX
+            _report("主索引不可达，切换备源重试…")
             result = await _try_install(pip, req_file, index_url, extra_index_url)
             _record_install(project_id, task_id, attempt, result, versions, env_type, step="pip_install_fallback")
             if result["ok"]:
                 return True
+        # Windows 260 字符路径上限：同一路径必然再失败，重试只是白等几分钟 → 立刻中止，
+        # 由界面给出「开启长路径支持」入口（见 services/long_paths）
+        if long_paths.is_long_path_error(result["error"]) and not long_paths.is_enabled():
+            _report("安装中断：Windows 路径超过 260 字符上限（请先开启长路径支持再重试）")
+            break
         if attempt >= 3:
             break
+        _report(f"第 {attempt} 次安装失败，正在生成依赖修正建议…")
         advice = await _agent_fix_advice(source, result["error"])
         new_req = _apply_advice(req_file, advice)
         # 记录建议与是否真的改动了依赖（旧实现静默无输出，问题难定位）
-        task_manager.update_progress(task_id, {"env_fix": {
+        _report(f"已生成修正建议（第 {attempt} 次），准备重试…", env_fix={
             "attempt": attempt,
             "reason": advice.get("reason") if isinstance(advice, dict) else None,
             # 修正建议 agent 自身失败时如实记录（不掩盖 pip 的真实报错）
             "advice_error": advice.get("_advice_error") if isinstance(advice, dict) else None,
             "requirements_updated": new_req is not req_file,
-        }})
+        })
         req_file = new_req
     return False
 
@@ -332,6 +418,41 @@ def _env_pip(env_dir: Path) -> str:
         if c.exists():
             return str(c)
     return str(env_dir / "Scripts" / "pip.exe")
+
+
+async def install_missing_package(env_dir: Path, package: str, timeout_s: int = INSTALL_TIMEOUT_S) -> dict:
+    """补装一个「装完但 import 时报缺」的包（模块一 3.5 最小命令验证发现 ModuleNotFoundError 时调用）。
+
+    背景：依赖清单**漏声明**是常见情况（如 scGPT 用了 IPython 却没写进 pyproject），
+    pip 按清单装完不报错，直到 `import <pkg>` 才炸；此时按缺包名补装一次即可自愈。
+    返回 {"ok", "error", "command"}；是否留痕由调用方决定（这里不写 run_record）。
+    """
+    def _cmd(index_url: Optional[str]) -> list[str]:
+        c = [_env_pip(env_dir), "install", package,
+             "--retries", str(PIP_RETRIES), "--timeout", str(PIP_TIMEOUT_S)]
+        if index_url:
+            c += ["--index-url", index_url]
+        return c
+
+    # 索引可达性会瞬时抽风（实测：同一镜像前一刻 "from versions: none"、后一刻正常）→
+    # 与主安装同口径：索引类错误切备源重试一次，非索引错误（如包名不对）就不折腾了。
+    indexes: list[Optional[str]] = [PIP_INDEX_URL] if PIP_INDEX_URL else [None]
+    if PIP_FALLBACK_INDEX and PIP_FALLBACK_INDEX not in indexes:
+        indexes.append(PIP_FALLBACK_INDEX)
+    last: dict = {"ok": False, "error": "未执行", "command": ""}
+    for index_url in indexes:
+        cmd = _cmd(index_url)
+        env = {**os.environ, "PIP_INDEX_URL": index_url} if index_url else None
+        try:
+            rc, out = await proc_util.run_command(cmd, env=env, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": f"补装 {package} 超时（>{timeout_s}s）", "command": " ".join(cmd)}
+        if rc == 0:
+            return {"ok": True, "error": None, "command": " ".join(cmd)}
+        last = {"ok": False, "error": (out or "")[-1500:], "command": " ".join(cmd)}
+        if not _is_index_error(out or ""):
+            break
+    return last
 
 
 def _find_requirements(source: Path) -> Optional[Path]:

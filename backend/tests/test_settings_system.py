@@ -118,7 +118,7 @@ def test_env_check_shape(app_client, monkeypatch, tmp_path):
     body = app_client.get("/api/system/env-check").json()
     assert set(body) == {
         "git", "python", "conda", "claude_cli", "data_dir", "static_served",
-        "credentials_configured", "pip_index",
+        "credentials_configured", "pip_index", "long_paths_enabled",
     }
     assert set(body["git"]) == {"found", "path", "version"}
     assert set(body["python"]) == {"found", "python", "py_launcher"}

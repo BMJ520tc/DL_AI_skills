@@ -93,3 +93,19 @@ export function saveCredentials(creds: {
         body: JSON.stringify(creds),
     });
 }
+
+export interface LongPathsResult {
+    ok: boolean;
+    enabled: boolean;
+    cancelled?: boolean;
+    detail: string;
+}
+
+export function fetchLongPathStatus(): Promise<{ enabled: boolean; platform: string }> {
+    return request<{ enabled: boolean; platform: string }>("/api/system/long-paths");
+}
+
+/** 经 UAC 提权开启 Windows 长路径支持（装深层依赖 >260 字符会失败）。会弹一次管理员确认框。 */
+export function enableLongPaths(): Promise<LongPathsResult> {
+    return request<LongPathsResult>("/api/system/long-paths/enable", { method: "POST" });
+}

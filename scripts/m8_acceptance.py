@@ -170,10 +170,11 @@ def link_project_env_report(cli: Client, project: str) -> None:
     check("项目已加载源码（真实仓库）", proj.get("project_type") == "original" and src.exists(),
           f"{proj.get('name')} status={proj.get('status')} src={src.name}")
 
-    env_dirs = [ws / "env" / "Scripts" / "python.exe", ws / "env" / "python.exe", ws / "env" / "bin" / "python"]
-    env_py = next((e for e in env_dirs if e.exists()), None)
-    check("真实独立环境已就绪（env_manager 建）", env_py is not None,
-          str(env_py) if env_py else f"未见 env 解释器于 {ws / 'env'}")
+    # 环境落在短路径根（见 config.project_env_dir），位置**问后端**取，不猜 ws/env
+    env_info = cli.ok("GET", f"/api/projects/{project}/env")
+    env_py = env_info.get("env_python")
+    check("真实独立环境已就绪（env_manager 建）", bool(env_py),
+          str(env_py) if env_py else f"未见 env 解释器（env_dir={env_info.get('env_dir')}）")
 
     report = cli.ok("GET", f"/api/projects/{project}/report")
     hier = report.get("module_hierarchy") or []

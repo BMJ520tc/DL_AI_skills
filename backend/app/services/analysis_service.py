@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.config import PROJECT_ROOT
+from app.config import PROJECT_ROOT, project_env_dir
 from app.services import agent_service, download_service, knowledge_service, project_manager, prompts, task_manager
 
 VERIFY_TASK_TYPE = "verify"
@@ -104,15 +104,21 @@ def get_report(project_id: str) -> Optional[dict]:
     return json.loads(report_path.read_text(encoding="utf-8"))
 
 
-def _project_python(ws: Path) -> Optional[str]:
-    """项目独立环境的解释器；环境未就绪返回 None（不退回宿主解释器，见 2.3 独立环境）。"""
-    for candidate in (
-        ws / "env" / "Scripts" / "python.exe",  # Windows venv
-        ws / "env" / "python.exe",              # conda 环境（Windows）
-        ws / "env" / "bin" / "python",          # Linux/mac venv
-    ):
-        if candidate.exists():
-            return str(candidate)
+def _project_python(ws: Path, project_id: Optional[str] = None) -> Optional[str]:
+    """项目独立环境的解释器；环境未就绪返回 None（不退回宿主解释器，见 2.3 独立环境）。
+
+    环境落在**短路径根** `<ENV_ROOT>/<项目id前8位>`（规避 Windows 260 上限，见 config.project_env_dir）；
+    同时兼容迁移前的老位置 `ws/env`（旧环境仍可用）。`ws` 的末段即项目 id，未显式传入时据此推断。
+    """
+    pid = project_id or Path(ws).name
+    for root in (project_env_dir(pid), Path(ws) / "env"):
+        for candidate in (
+            root / "Scripts" / "python.exe",  # Windows venv
+            root / "python.exe",              # conda 环境（Windows）
+            root / "bin" / "python",          # Linux/mac venv
+        ):
+            if candidate.exists():
+                return str(candidate)
     return None
 
 
@@ -162,11 +168,22 @@ def _script_dir_candidates(source: Path) -> list[list[str]]:
     return found
 
 
+# 顶层目录里**不是产品包**的常见名字：把它们当「导入即跑通」的候选没有信息量
+# （`tests/` 尤其坑：`python -c "import tests"` 只是导入空壳包，恒成功 → 假阳性，
+# 会把真正的 `import scgpt` 失败稀释掉。2026-10-05 scGPT 实测）。
+NON_ENTRY_DIRS = {
+    "tests", "test", "testing", "docs", "doc", "examples", "example", "samples",
+    "scripts", "script", "bin", "build", "dist", "tools", "notebooks", "notebook",
+    "demos", "demo", "experiments", "experiment", "assets", "data", "misc", "tutorials",
+}
+
+
 def _package_candidates(source: Path) -> list[list[str]]:
     """库型项目（无入口脚本，如 GEARS）的兜底候选：导入顶层包即证明环境可加载。
 
     3.5 要求「从 README、脚本目录或 --help 输出定位最小可运行命令，跑通一遍」——
     对没有可执行入口的库，`python -c "import <包>"` 是等价的最小跑通验证。
+    跳过 `NON_ENTRY_DIRS`（tests/docs/examples…）这些无信息量的目录。
     """
     out: list[list[str]] = []
     try:
@@ -176,9 +193,38 @@ def _package_candidates(source: Path) -> list[list[str]]:
     for p in entries:
         name = p.name
         if (p.is_dir() and name.isidentifier() and not name.startswith(".")
+                and name.lower() not in NON_ENTRY_DIRS
                 and (p / "__init__.py").exists()):
             out.append(["-c", f"import {name}"])
     return out
+
+
+# ---- 装完但 import 缺包（依赖清单漏声明）→ 自动补装重试 ----
+
+_MISSING_MODULE_RE = re.compile(r"No module named '([A-Za-z0-9_.]+)'")
+
+# 模块名 ≠ 发行包名 的常见对照（其余按「下划线→连字符」交给 pip 归一）
+MODULE_PACKAGE_ALIASES = {
+    "cv2": "opencv-python", "sklearn": "scikit-learn", "skimage": "scikit-image",
+    "yaml": "pyyaml", "PIL": "pillow", "IPython": "ipython", "Bio": "biopython",
+    "dotenv": "python-dotenv", "dateutil": "python-dateutil", "attr": "attrs",
+    "OpenSSL": "pyopenssl", "serial": "pyserial", "git": "GitPython",
+    "google": "protobuf", "pkg_resources": "setuptools", "win32com": "pywin32",
+}
+
+# 一次验证最多自动补装几个包（防雪崩）
+MAX_MISSING_DEP_FIXES = 3
+
+
+def _missing_module(error: Optional[str]) -> Optional[str]:
+    """从最小命令报错里取缺失的顶层模块名（`ModuleNotFoundError: No module named 'x.y'` → `x`）。"""
+    m = _MISSING_MODULE_RE.search(error or "")
+    return m.group(1).split(".")[0] if m else None
+
+
+def _module_to_package(module: str) -> str:
+    """模块名 → pip 发行包名（有别名用别名，否则按 PEP 503 把 `_` 归一为 `-`）。"""
+    return MODULE_PACKAGE_ALIASES.get(module, module.replace("_", "-"))
 
 
 def _candidate(tokens: list[str], source: str) -> dict:
@@ -502,6 +548,17 @@ def _run_with_grace(full_cmd: list[str], cwd: str, grace_s: int) -> dict:
         return {"ok": True, "error": None, "mode": "started"}
 
 
+def _env_script(name: str, python: str) -> Optional[str]:
+    """项目环境 Scripts 下的同名可执行（如 `pytest` → `<env>/Scripts/pytest.exe`），没有则 None。"""
+    if not name:
+        return None
+    scripts = Path(python).parent
+    for cand in (scripts / name, scripts / f"{name}.exe", scripts / f"{name}.bat", scripts / f"{name}.cmd"):
+        if cand.exists():
+            return str(cand)
+    return None
+
+
 async def _try_command(python: str, cmd: list[str], source: Path, grace_s: int = GRACE_S) -> dict:
     """运行一条候选命令，返回 {ok, error, mode, command, started_at, finished_at}。
 
@@ -519,8 +576,15 @@ async def _try_command(python: str, cmd: list[str], source: Path, grace_s: int =
             return {"ok": False, "mode": "invalid", "error": "候选命令只有解释器、缺少脚本，已跳过",
                     "command": " ".join(cmd), "started_at": _now(), "finished_at": _now()}
         full_cmd = [python, *cmd[1:]]
+    elif cmd and (str(cmd[0]).lower().endswith(".py") or cmd[0] in ("-m", "-c")
+                  or (source / str(cmd[0])).is_file()):
+        full_cmd = [python, *cmd]              # 本地 .py / `-m 模块` / `-c 代码` / source 下的脚本文件
     else:
-        full_cmd = [python, *cmd]
+        # 其它裸命令（`pytest tests/…`、`make` 等）：**不能**加 python 前缀，否则变成
+        # `python pytest …` → can't open file 'pytest'（2026-10-05 scGPT 实测）；
+        # 优先用项目环境 Scripts 下的同名可执行，其次按原样跑。
+        exe = _env_script(cmd[0] if cmd else "", python)
+        full_cmd = [exe or cmd[0], *cmd[1:]]
     started = _now()
     try:
         result = await asyncio.to_thread(_run_with_grace, full_cmd, str(source), grace_s)
@@ -555,6 +619,32 @@ def _record_smoke(project_id: str, task_id: str, result: dict) -> None:
     )
 
 
+def _missing_dep_to_fix(error: Optional[str], already: list[str]) -> Optional[str]:
+    """报错缺包 → 待补装的发行包名；不适用（非缺包 / 已补过 / 超上限）返回 None。"""
+    if len(already) >= MAX_MISSING_DEP_FIXES:
+        return None
+    module = _missing_module(error)
+    if not module:
+        return None
+    package = _module_to_package(module)
+    return None if package in already else package
+
+
+async def _install_missing_dep(project_id: str, task_id: str, env_dir: Path, package: str) -> bool:
+    """补装缺包并留痕（run_type=env_install，step=smoke_missing_dep）；返回是否装成功。"""
+    from app.services import env_manager  # 延迟导入：避开 analysis_service ↔ env_manager 环
+
+    started = _now()
+    res = await env_manager.install_missing_package(env_dir, package)
+    knowledge_service.record_run({
+        "project_id": project_id, "task_id": task_id, "run_type": "env_install",
+        "params": {"step": "smoke_missing_dep", "package": package},
+        "command": res.get("command"), "status": "success" if res.get("ok") else "failed",
+        "error": res.get("error"), "started_at": started, "finished_at": _now(),
+    })
+    return bool(res.get("ok"))
+
+
 async def _run_verify(params: dict, task_id: str) -> None:
     project_id = params["project_id"]
     project = project_manager.get_project(project_id)
@@ -571,10 +661,23 @@ async def _run_verify(params: dict, task_id: str) -> None:
         raise RuntimeError("项目环境未就绪，无法在独立环境运行最小命令")
 
     last_error: Optional[str] = None
+    env_dir = project_env_dir(project_id)
+    fixed: list[str] = []      # 已补装过的包（防重复、限数量）
     for cand in await _candidate_commands(source, python):
         result = await _try_command(python, cand["command"], source)
         result["source"] = cand["source"]          # 逐条如实标注来源，写进 run_record
         _record_smoke(project_id, task_id, result)
+        if not result["ok"]:
+            # 装完但 import 缺包（依赖清单漏声明，如 scGPT 用了 IPython 却没写进 pyproject）：
+            # 按缺包名补装一次再重跑该命令 → 让这类项目自愈，不必人工装包。
+            pkg = _missing_dep_to_fix(result["error"], fixed)
+            if pkg:
+                fixed.append(pkg)
+                fix = await _install_missing_dep(project_id, task_id, env_dir, pkg)
+                if fix:
+                    result = await _try_command(python, cand["command"], source)
+                    result["source"] = cand["source"]
+                    _record_smoke(project_id, task_id, result)
         if result["ok"]:
             return
         last_error = result["error"]

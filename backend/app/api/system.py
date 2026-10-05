@@ -6,11 +6,13 @@ git / python（含 py launcher）/ conda / 数据目录可写性 / 静态服务 
 import os
 import shutil
 import subprocess
+import sys
 
 from fastapi import APIRouter
 
 from app import settings_store
 from app.config import DATA_DIR, PIP_INDEX_URL, SERVE_STATIC, _detect_conda
+from app.services import long_paths
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
@@ -81,4 +83,17 @@ def env_check() -> dict:
         "static_served": SERVE_STATIC,
         "credentials_configured": settings_store.status()["configured"],
         "pip_index": PIP_INDEX_URL,
+        "long_paths_enabled": long_paths.is_enabled(),
     }
+
+
+@router.get("/long-paths")
+def long_paths_status() -> dict:
+    """Windows 长路径支持是否已开启（装深层依赖 >260 字符会失败，见 services/long_paths）。"""
+    return {"enabled": long_paths.is_enabled(), "platform": sys.platform}
+
+
+@router.post("/long-paths/enable")
+def long_paths_enable() -> dict:
+    """经 UAC 提权把 LongPathsEnabled 置 1（前端点「开启长路径支持」时调用）。"""
+    return long_paths.enable()

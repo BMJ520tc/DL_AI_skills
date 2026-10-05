@@ -235,7 +235,9 @@ def seed_projects(ws: Path) -> tuple[str, str, Path]:
     network = http("POST", "/api/projects", {
         "project_type": "structured", "name": NETWORK_NAME,
         "parent_project_id": original_id})
-    return original_id, network["project_id"], proj_ws / "env"
+    # 环境落在短路径根（见 config.project_env_dir），位置**问后端**取，不猜 ws/env
+    env_python = http_json(f"/api/projects/{original_id}/env").get("env_python")
+    return original_id, network["project_id"], Path(env_python) if env_python else (proj_ws / "env")
 
 
 def graph_v1() -> dict:
@@ -321,8 +323,7 @@ def main() -> int:
     try:
         server = start_backend(ws)
         check("临时库后端启动（模块/数据集种子，不碰真实库）", True, BACKEND_URL)
-        original_id, network_id, env_dir = seed_projects(ws)
-        env_python = env_dir / "Scripts" / "python.exe"
+        original_id, network_id, env_python = seed_projects(ws)
         probe = subprocess.run([str(env_python), "-c", "import torch; print(torch.__version__)"],
                                capture_output=True, text=True, timeout=300)
         check("真建环境就绪（env_manager 建 venv + 装依赖）", probe.returncode == 0,
