@@ -45,16 +45,32 @@ TASK_INGEST = "module_ingest"
 
 TRACE_SCRIPT = PROJECT_ROOT / "scripts" / "trace_shapes.py"
 VERIFY_SCRIPT = PROJECT_ROOT / "scripts" / "verify_decompose.py"
+FIDELITY_SCRIPT = PROJECT_ROOT / "scripts" / "ir_fidelity_probe.py"
 
 # 数值比对阈值（实施约定；仿 REPRO_DEVIATION_* 环境变量覆盖先例）
 DECOMPOSE_NUM_RTOL = float(os.getenv("DECOMPOSE_NUM_RTOL", "1e-5"))
 DECOMPOSE_NUM_ATOL = float(os.getenv("DECOMPOSE_NUM_ATOL", "1e-6"))
 DECOMPOSE_NUM_SEEDS = os.getenv("DECOMPOSE_NUM_SEEDS", "42,1337,2024")
 DECOMPOSE_AGENT_TIMEOUT_S = 1800
-DECOMPOSE_AGENT_RETRIES = int(os.getenv("DECOMPOSE_AGENT_RETRIES", "3"))  # 结构化输出失败重试次数（3.9 风险）
+# 「跑到稳定为止」：重试上限给得足够高，让**时间预算**（DECOMPOSE_AGENT_BUDGET_S）成为真正的
+# 限制；每次失败都把「差多少 + 真实模型的带参层清单」回喂，agent 带着反馈修正。
+DECOMPOSE_AGENT_RETRIES = int(os.getenv("DECOMPOSE_AGENT_RETRIES", "12"))
 DECOMPOSE_AGENT_BUDGET_S = int(os.getenv("DECOMPOSE_AGENT_BUDGET_S", "3600"))  # 重试总预算
 DECOMPOSE_TRACE_TIMEOUT_S = 600
 DECOMPOSE_VERIFY_TIMEOUT_S = 1800
+DECOMPOSE_FIDELITY_TIMEOUT_S = int(os.getenv("DECOMPOSE_FIDELITY_TIMEOUT_S", "600"))
+# 节点数上限：一次要模型吐出的 IR 越长越不稳（漏字段/漏边/整份不产出）。把重复与标准结构
+# 用 code_hint 折叠后，真实模型通常 20~40 个节点就够；超上限即判失败并带原因重试。
+DECOMPOSE_MAX_NODES = int(os.getenv("DECOMPOSE_MAX_NODES", "60"))
+# **分步生成**（默认**关**，置 1 启用）：先模块骨架、再逐模块并行展开、最后合并。
+# 实测能显著改善稳定性（第 1 次就产出结构合法的 IR），但**每次拆解的会话数 × 模块数**，
+# token 消耗高得多；未经验证优于单次路径前，默认仍走单次生成。
+DECOMPOSE_STEPWISE = os.getenv("DECOMPOSE_STEPWISE", "0") != "0"
+# 重试时是否续接上一次 agent 会话。默认**不续接**（每轮全新会话）：实测续接的长会话到后期
+# 常直接「不产出 IR」（12 次里 8 次），换新会话给干净上下文；置 1 可切回续接（省一轮读源码）。
+DECOMPOSE_RETRY_RESUME = os.getenv("DECOMPOSE_RETRY_RESUME", "0") != "0"
+# 保真度自检开关：默认开。要求项目环境 + entry_args 才做（起不来就跳过，不误判）
+DECOMPOSE_FIDELITY_CHECK = os.getenv("DECOMPOSE_FIDELITY_CHECK", "1") != "0"
 
 
 def _now() -> str:
@@ -196,9 +212,25 @@ def _clean_extra_inputs(extra: list) -> list:
     return cleaned
 
 
+def _clean_inputs(ir: dict, inputs: list) -> list:
+    """校验 `input_spec.inputs`：按**调用顺序**列出吃外部输入的节点 id（root 的 forward 形参）。"""
+    if not isinstance(inputs, list):
+        raise ValueError("inputs 必须是数组（按调用顺序列出吃外部输入的节点 id）")
+    ids = {n["id"] for n in ir.get("nodes") or []}
+    cleaned: list[str] = []
+    for i, v in enumerate(inputs):
+        if not isinstance(v, str) or not v:
+            raise ValueError(f"inputs[{i}] 必须是节点 id 字符串")
+        if v not in ids:
+            raise ValueError(f"inputs[{i}] 的节点 id 不存在于 IR：{v}")
+        cleaned.append(v)
+    return cleaned
+
+
 def update_input_spec(project_id: str, shape: list, dtype: Optional[str] = None,
                       extra: Optional[list] = None,
-                      forward_kwargs: Optional[dict] = None) -> dict:
+                      forward_kwargs: Optional[dict] = None,
+                      inputs: Optional[list] = None) -> dict:
     """修正入口输入规格（6.1/6.2）：agent 对「尺寸由运行期构造参数决定」的模型给不出具体维度时，
     由用户/工具补上；写回后 ir_hash 变化 → 旧验证变 stale（与调参同口径）。
 
@@ -235,6 +267,12 @@ def update_input_spec(project_id: str, shape: list, dtype: Optional[str] = None,
             spec["forward_kwargs"] = forward_kwargs
         else:
             spec.pop("forward_kwargs", None)  # 传空对象 = 清除
+    if inputs is not None:
+        cleaned_inputs = _clean_inputs(ir, inputs)
+        if cleaned_inputs:
+            spec["inputs"] = cleaned_inputs
+        else:
+            spec.pop("inputs", None)          # 传空数组 = 清除（退回单输入）
     ir["input_spec"] = spec
     _write_ir(project, ir)
     return spec
@@ -314,7 +352,7 @@ _IR_EXAMPLE: dict = {
 # 重拆解时要带过去的**用户补参**字段：这些 agent 从不产出，只可能由用户经
 # PUT /ir/entry_args 与 PUT /ir/input_spec 补上；不带走的话，用户补完再点一次「拆解」
 # 就静默清空（2026-10-05 scGPT 实测：重拆解后 entry_args 丢失 → 补形状直接失败）。
-_CARRY_SPEC_KEYS = ("extra", "forward_kwargs")
+_CARRY_SPEC_KEYS = ("extra", "forward_kwargs", "inputs")
 
 
 def _carry_over_user_specs(prev_ir: Optional[dict], ir: dict) -> None:
@@ -364,15 +402,30 @@ def _decompose_prompt(hierarchy: list[dict], entry_class: str | None = None) -> 
         f"{json.dumps(list(TASK_TYPES), ensure_ascii=False)} 中选；"
         'input_spec 填入口模型输入（shape 数组 + dtype），如 {"shape":[1,3,32,32],"dtype":"float32"}；'
         "root_id 指向入口类对应的节点。\n"
+        "   **入口有多个输入时**（如 `forward(src, values, src_key_padding_mask)`）再加 `inputs`："
+        "**按调用顺序列出 root 的直接子节点里接收外部输入的那些节点的 id**"
+        '（是**节点 id**，如 `"inputs":["encoder","value_encoder"]`；'
+        "**不要**写 forward 的参数名或描述文字）；单输入模型省略此项。\n"
         "2. 每个 nn.Module 子类实例一个节点。入口模型实例为根节点（kind=module，parent_id=null，module_path=\"\"）。\n"
         "3. 自定义 nn.Module 子类（如 BasicBlock）必须作为 kind=module 节点，其内部子模块作为子节点"
         "（parent_id 指向它），逐层展开到叶子；class_name 用源码类名。\n"
         "4. 叶子层为 torch.nn 内置层：kind=leaf，class_name 用 nn.X 形式（nn.Conv2d、nn.BatchNorm2d、"
         "nn.ReLU、nn.Dropout 等）。params 为该层构造参数（PyTorch 构造器关键字，如 "
         '{"in_channels":64,"out_channels":128,"kernel_size":3}），必须从源码读出真实值，不要臆造；'
-        "读不出就留空并置 uncertain=true（后续可人工补参数）。\n"
+        "**必填构造参数必须给全**（缺了会被结构校验直接拒绝）：nn.Linear→in_features/out_features、"
+        "nn.Embedding→num_embeddings/embedding_dim、nn.Conv*d→in_channels/out_channels/kernel_size、"
+        "nn.LayerNorm→normalized_shape、nn.BatchNorm*d→num_features、池化→kernel_size；"
+        "这些值源码里一定有（构造调用或默认配置），从源码读准；**确实读不出**的次要参数可留空并置 "
+        "uncertain=true（它代替不了必填参数）。\n"
         "   叶子白名单：nn.Linear/Conv1d~3d/ConvTranspose*/BatchNorm*/LayerNorm/GroupNorm/Embedding/"
         "MaxPool*/AvgPool*/Adaptive*Pool*/Upsample/ReLU 系/Sigmoid/Tanh/Softmax/Dropout*/Flatten/Identity。\n"
+        "   **叶子的调用只接受一个输入张量**；因此**内部含多输入子层**的复合模块（如 "
+        "nn.MultiheadAttention、nn.TransformerEncoder/EncoderLayer、nn.CosineSimilarity）**不要展开成**"
+        "显式叶子，也不要硬塞进白名单——用**一个节点 + code_hint 给出完整构造表达式整体折叠**"
+        "（其内部子模块视为已覆盖，参数量自然对齐）；展开反而表达不了、且前向调用会参数不符。\n"
+        "   若某个子模块的 **forward 需要多个输入**（如 scGPT 的 MVCDecoder(cell_emb, gene_embs)）："
+        "**直接用 module 节点 + 多条入边**——入边顺序就是它 forward 的形参顺序，父模块会按序传参"
+        "（这是 module 节点与叶子/容器的区别：叶子/容器只能一条入边）。\n"
         "   **白名单外的 nn.* 类**（如 nn.TransformerEncoder、nn.MultiheadAttention、nn.TransformerEncoderLayer）："
         "优先继续展开为子模块；若整体当一层用，**必须给 code_hint 完整构造表达式、不要用 {params} 占位符**"
         "（如 \"code_hint\": \"nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=512, nhead=8), num_layers=6)\"），"
@@ -399,10 +452,277 @@ def _decompose_prompt(hierarchy: list[dict], entry_class: str | None = None) -> 
         "10. input_shape/output_shape 能静态推出就填数组（元素为整数），推不出填 null。拿不准的节点置 uncertain=true。\n"
         "11. 输出必须是单层 JSON 对象（不要用 {\"ir\":...} 包裹），顶层键：source_file、entry_class、"
         "task_type、input_spec、root_id、nodes、edges。\n"
+        "12. **提交前自查这 6 条高频被拒原因**（此前实测最容易踩，逐条确认再输出）：\n"
+        "   a) **节点 id 不能是路径**——`encoder.embedding` 非法；id 用属性名（`enc_embedding`），"
+        "路径只放 `module_path`；\n"
+        "   b) **不要建空的 module 节点**——某类没有任何子模块时，要么继续展开出子节点，"
+        "要么整体折叠为一个 leaf（+code_hint）；空 module 会被拒；\n"
+        "   c) **每个 op 节点至少一条入边**（没有入边的表达式无意义）；\n"
+        "   d) **leaf 的必填构造参数必须给全**（见第 4 条清单）；\n"
+        "   e) **入边数**：叶子/容器**最多 1 条**；**module 可多条**（多输入，按入边序成形参）；"
+        "op 可多条；\n"
+        "   f) **code_hint 里不要写 `self.xxx`**（除非 xxx 是该节点的子节点 id 或它的 params 键）；"
+        "取多入边里的某一个操作数写 `{inputs[0]}`，**不要**写 `{inputs}[0]`。\n"
+        "13. **节点要「粗」不要「细」**（重要，直接决定成败）：单次输出有长度限制，节点越多越容易"
+        "漏字段、漏边，甚至整份 JSON 都吐不出来。因此——\n"
+        "   · **同一构造重复多次的结构**（如 `encoder.layers.0..11` 共 12 层）**只建 1 个节点**，"
+        "用 code_hint 写构造表达式并按真实层数填参数，**不要**展开成 12 个节点；\n"
+        "   · **标准复合层**（torch.nn 自带：nn.TransformerEncoder / TransformerEncoderLayer / "
+        "MultiheadAttention / nn.Sequential 等）**整体折叠成 1 个节点**；\n"
+        "   · **关键：折叠后的节点写成 kind=`leaf` + code_hint（给完整构造表达式），"
+        "不要写成 kind=`module`**——module 的含义是「它的子模块要逐个展开列出」，"
+        "而 torch.nn 自带层的内部子模块**不需要也不应该**列出来（写空 module 会被直接拒绝）；\n"
+        "   · **code_hint 只能引用 `nn.*` / `torch.*` / `torch.nn.functional`**：再生成代码是"
+        "**自包含**的（只 import torch，不 import 你项目里的模块）——写项目里的类名"
+        "（如 `FlashTransformerEncoderLayer`）会在再生成时 `NameError`；\n"
+        "   · 判据：**项目源码里自定义的 nn.Module 子类 → kind=module（展开子节点）；"
+        "torch.nn 提供的标准层 → 折叠成 leaf/container（一条 code_hint 说完）**；\n"
+        "   · 经验值：一个 12 层 Transformer 的 IR **20~40 个节点**足够；"
+        f"**节点数上限 {DECOMPOSE_MAX_NODES}**，超了会被判失败打回。\n"
         "【完整示例（照此结构与粒度产出；数值须换成你读到的真实值）】\n"
         f"{json.dumps(_IR_EXAMPLE, ensure_ascii=False)}"
     )
     return "".join(parts)
+
+
+# 通用规则：**每一步都会随 prompt 重发**，所以尽量短（每字都是 token×步数）。
+_COMMON_RULES = (
+    "【规则】"
+    "① 节点 id 用属性名（合法标识符、不含点），路径只放 module_path；"
+    "② 叶子只收一个输入张量，必填构造参数给全（Linear→in_features/out_features、"
+    "Embedding→num_embeddings/embedding_dim、LayerNorm→normalized_shape）；"
+    "③ torch.nn 自带的标准层（TransformerEncoder/Layer、MultiheadAttention、CosineSimilarity…）"
+    "折叠成 leaf+code_hint（完整构造式，只用 nn.*/torch.*；不展开、不建空 module）；"
+    "④ 项目自定义的 nn.Module 子类才是 module（其子节点由展开步给）；"
+    "⑤ 函数式操作建 op（白名单外给 code_hint；第 N 个操作数写 {inputs[N]}），每个 op 至少一条入边；"
+    "⑥ code_hint 不引用 self.xxx。\n"
+)
+
+_SKELETON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "source_file": {"type": "string"}, "entry_class": {"type": "string"},
+        "task_type": {"type": "string"}, "root_id": {"type": "string"},
+        "input_spec": {"type": "object"},
+        "modules": {"type": "array"},
+    },
+    "required": ["source_file", "entry_class", "root_id", "modules"],
+}
+
+_MODULE_SCHEMA = {
+    "type": "object",
+    "properties": {"nodes": {"type": "array"}, "edges": {"type": "array"}},
+    "required": ["nodes", "edges"],
+}
+
+
+def _skeleton_prompt(hierarchy: list[dict], entry_class: str | None, hint: str,
+                     feedback: str = "") -> str:
+    """第 1 步：只要**模块骨架**（项目自定义 nn.Module 的层级 + 入口输入规格），输出很短。"""
+    fb = f"\n【上一次尝试失败原因（务必避开）】{feedback}\n" if feedback else ""
+    return (
+        "任务（第 1 步 / 共 2 步）：阅读项目代码，先给出入口模型的**模块骨架**——"
+        "只列**项目自定义的 nn.Module 子类实例**及其层级，**先不要列叶子层**。\n"
+        "【红线】只允许读取文件（Read/Glob/Grep），禁止修改项目内任何文件。\n\n"
+        "【静态结构报告】识别到的 nn.Module 子类：\n"
+        f"{json.dumps(hierarchy, ensure_ascii=False)}\n\n"
+        + (f"【指定入口类】entry_class={entry_class}，必须作为根模块。\n\n" if entry_class else "")
+        + "【输出】单层 JSON：\n"
+        '{"source_file":"入口类所在文件(相对路径)","entry_class":"入口类名",'
+        '"task_type":"classification|regression|generation|embedding|other 之一",'
+        '"input_spec":{"shape":[1,...],"dtype":"float32",'
+        '"inputs":["按调用顺序列出根的直接子模块中接收外部输入的节点 id（单输入省略）"]},'
+        '"root_id":"根模块 id","modules":[{"id","class_name","parent_id","module_path"}]}\n'
+        "【要求】\n"
+        "· modules 只含**项目自定义的 nn.Module 子类实例**（含入口模型本身）；"
+        "torch.nn 自带的标准层**不要**列进来（下一步会折叠表达）；\n"
+        "· parent_id 指向所属模块的 id（根为 null）；module_path 填 named_modules 路径"
+        "（如 layer1.0 / encoder.embedding 所属模块），根为 \"\"；\n"
+        "· 不要建空的模块——此步只列**类的层级**，别放叶子。\n" + _COMMON_RULES + hint + fb
+    )
+
+
+def _extract_class_source(source_dir: Path, class_name: Optional[str], cap: int = 6000) -> str:
+    """在项目里定位 `class <class_name>` 并**把其源码切片塞进 prompt**。
+
+    动机（省 token）：分步展开时，agent 为了看某个类会反复 Read/Grep——那些文件内容都是**输入
+    token**，才是这一步真正的大头。宿主直接用 `ast` 定位类定义、把它作为文本给出去，agent
+    多数情况就不必再读了（也确实要求它「先用给到的源码」）。
+    """
+    if not class_name or not source_dir.is_dir():
+        return ""
+    import ast as _ast
+
+    for p in sorted(source_dir.rglob("*.py")):
+        if any(part in (".git", "build", "dist", "__pycache__", "node_modules") for part in p.parts):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if f"class {class_name}" not in text:
+            continue
+        try:
+            tree = _ast.parse(text)
+        except SyntaxError:
+            continue
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ClassDef) and node.name == class_name:
+                seg = _ast.get_source_segment(text, node) or ""
+                if seg:
+                    rel = p.relative_to(source_dir).as_posix()
+                    return f"# --- {rel} :: class {class_name} ---\n{seg[:cap]}"
+    return ""
+
+
+def _module_prompt(parent: dict, child_modules: list[dict], module_path: str,
+                   class_source: str = "") -> str:
+    """第 2 步：展开**一个**模块的直接子节点与模块内边（每次输出都很短）。"""
+    known = [{"id": c["id"], "class_name": c.get("class_name"), "module_path": c.get("module_path")}
+             for c in child_modules]
+    src_block = (f"\n【该类的源码（已替你取出）】**优先只依据它作答，不要再去读文件**"
+                 "（省时间与额度）；确实缺信息时才读，且最多 1 次。\n"
+                 f"{class_source}\n" if class_source else "")
+    return (
+        f"任务（第 2 步 / 共 2 步）：展开模块 `{parent['id']}`"
+        f"（类 {parent.get('class_name')}，module_path=\"{module_path}\"）的**直接子节点**"
+        "与这些子节点之间的数据流边。\n"
+        "【红线】只允许读取文件（Read/Glob/Grep），禁止修改项目内任何文件。\n"
+        + src_block +
+        "\n【已由骨架确定的子模块（**不要**在 nodes 里重复列出）】\n"
+        f"{json.dumps(known, ensure_ascii=False)}\n\n"
+        "【输出】单层 JSON：\n"
+        '{"nodes":[{"id","kind":"leaf|op|container","class_name","module_path",'
+        '"parent_id":"' + str(parent['id']) + '","params":{...},"code_hint":"(可选)"}],'
+        '"edges":[{"from":"节点 id","to":"节点 id"}]}\n'
+        "【要求】\n"
+        "· nodes 只放**叶子/函数式操作/Sequential 容器**（module 子节点来自骨架，不要重复）；\n"
+        "· edges 覆盖本模块内**全部**数据流：从本模块的外部输入（或上一步给的子模块）"
+        "到子节点、子节点之间、子节点到子模块、以及最终汇点；\n"
+        "· 本模块有**多个输入**时，各输入分别连给它真正消费的那个子节点/子模块"
+        "（不要把所有输入接到同一个节点上）；\n"
+        "· 本模块的直接子节点（含子模块）**必须只有一个汇点**，多分支要用 op 汇合。\n"
+        + _COMMON_RULES
+    )
+
+
+def _merge_stepwise(skeleton: dict, expansions: dict[str, dict]) -> dict:
+    """确定性合并：骨架的模块 + 各模块展开出的子节点与边 → 完整 IR。
+
+    `expansions[module_id] = {"nodes": [...], "edges": [...]}`（该模块的直接子节点与其内部边）。
+    """
+    nodes: list[dict] = [{"id": m["id"], "kind": "module", "class_name": m.get("class_name"),
+                          "parent_id": m.get("parent_id"), "module_path": m.get("module_path") or ""}
+                         for m in skeleton.get("modules") or []]
+    seen = {n["id"] for n in nodes}
+    edges: list[dict] = []
+    for items in expansions.values():
+        for n in items.get("nodes") or []:
+            if n.get("id") in seen:            # 去重（骨架里已有的模块节点不重复）
+                continue
+            seen.add(n["id"])
+            nodes.append(n)
+        edges.extend(items.get("edges") or [])
+    return {
+        "source_file": skeleton.get("source_file"), "entry_class": skeleton.get("entry_class"),
+        "task_type": skeleton.get("task_type"), "input_spec": skeleton.get("input_spec") or {},
+        "root_id": skeleton.get("root_id"), "nodes": nodes, "edges": edges,
+    }
+
+
+async def _stepwise_decompose(source: Path, hierarchy: list[dict], entry_class: Optional[str],
+                              hint: str, task_id: str, deadline: float,
+                              on_event=None, set_stage=None, feedback: str = "") -> Optional[dict]:
+    """**分步生成** IR：先骨架，再逐个模块展开，最后合并。
+
+    为什么：一次吐出 90 个节点的整份 IR 太不稳（漏字段/漏边/整份不产出）。分步后每步输出都短，
+    单步出错只重跑那一步（这里简化为「整体重来一次」，由外层重试循环兜底）。
+    """
+    set_stage = set_stage
+    # 第 1 步：骨架（自带 3 次重试）
+    skeleton = None
+    reason = ""
+    for i in range(3):
+        budget = deadline - time.monotonic()
+        if budget <= 30:
+            break
+        r = await agent_service.run_sync(
+            _skeleton_prompt(hierarchy, entry_class, hint), cwd=str(source),
+            output_schema=_SKELETON_SCHEMA, max_turns=40, timeout_s=int(min(900, budget)),
+            on_event=on_event)
+        skeleton = r.get("structured_output")
+        errs = _skeleton_errors(skeleton)
+        if not errs:
+            break
+        reason = "；".join(errs)
+        skeleton = None
+    if skeleton is None:
+        raise RuntimeError(f"分步拆解：模块骨架未通过（{reason or '未产出'}）")
+
+    # 第 2 步：逐模块展开。**模块之间彼此独立**（各自只看自己的类源码与子模块清单）→ 并发跑，
+    # 墙钟从「模块数 × 单步」降到约「单步」（9 个模块 ≈ 10 分钟 → ≈ 2 分钟）；限 3 并发躲限流。
+    expansions: dict[str, dict] = {}
+    by_id = {m["id"]: m for m in skeleton["modules"]}
+    sem = asyncio.Semaphore(int(os.getenv("DECOMPOSE_MODULE_CONCURRENCY", "3")))
+
+    async def _expand(m: dict) -> tuple[str, dict]:
+        children = [c for c in skeleton["modules"] if c.get("parent_id") == m["id"]]
+        prompt = _module_prompt(m, children, m.get("module_path") or "",
+                                class_source=_extract_class_source(source, m.get("class_name")))
+        # 模块级重试 3 次：实测 agent 会偶发「某一步返回空」（没写结果文件也没回文本），
+        # 重试这一模块比让整条分步流程从头再来便宜得多。
+        async with sem:
+            for _ in range(3):
+                budget = deadline - time.monotonic()
+                if budget <= 30:
+                    raise RuntimeError("分步拆解：预算用尽")
+                if set_stage:
+                    set_stage(f"拆解中：展开模块 {m['id']}（{m.get('class_name')}）…")
+                r = await agent_service.run_sync(
+                    prompt, cwd=str(source), output_schema=_MODULE_SCHEMA,
+                    max_turns=40, timeout_s=int(min(900, budget)), on_event=on_event)
+                got = r.get("structured_output")
+                if isinstance(got, dict) and isinstance(got.get("nodes"), list):
+                    return m["id"], got
+        raise RuntimeError(f"分步拆解：模块 {m['id']} 展开失败（未产出）")
+
+    results = await asyncio.gather(*(_expand(m) for m in skeleton["modules"]),
+                                   return_exceptions=True)
+    for item in results:
+        if isinstance(item, BaseException):
+            raise item
+        mid, got = item
+        expansions[mid] = got
+    ir = _merge_stepwise(skeleton, expansions)
+    logger.info("分步拆解完成：模块 %d 个，节点 %d，边 %d", len(by_id), len(ir["nodes"]), len(ir["edges"]))
+    return ir
+
+
+def _skeleton_errors(skeleton) -> list[str]:
+    """骨架的形态校验（便宜）：id/父子引用/根存在。"""
+    if not isinstance(skeleton, dict):
+        return ["骨架不是 JSON 对象"]
+    mods = skeleton.get("modules")
+    if not isinstance(mods, list) or not mods:
+        return ["modules 缺失或为空"]
+    errs: list[str] = []
+    ids = [m.get("id") for m in mods if isinstance(m, dict)]
+    for i, m in enumerate(mods):
+        if not isinstance(m, dict):
+            errs.append(f"modules[{i}] 不是对象")
+            continue
+        nid = m.get("id")
+        if not isinstance(nid, str) or not nid.isidentifier():
+            errs.append(f"模块 id 非法（须为 Python 标识符）：{nid!r}")
+        elif not isinstance(m.get("class_name"), str) or not m.get("class_name"):
+            errs.append(f"模块 {nid} 缺 class_name")
+    if skeleton.get("root_id") not in ids:
+        errs.append(f"root_id {skeleton.get('root_id')!r} 不在 modules 里")
+    for m in mods:
+        pid = m.get("parent_id")
+        if pid is not None and pid not in ids:
+            errs.append(f"模块 {m.get('id')} 的 parent_id {pid!r} 不存在")
+    return errs[:6]
 
 
 def _attempt_stage(attempt: int, total: int, last_reason: str) -> str:
@@ -413,16 +733,21 @@ def _attempt_stage(attempt: int, total: int, last_reason: str) -> str:
     return f"第 {attempt}/{total} 次尝试：按上次失败原因修正中…（上次：{tail[:100]}）"
 
 
-def _attempt_prompt(base: str, last_reason: str, prev_session: Optional[str], attempt: int):
+def _attempt_prompt(base: str, last_reason: str, prev_session: Optional[str], attempt: int,
+                    allow_resume: bool = True):
     """返回 (prompt, resume)。
 
-    第 2 次起：**能续接就只发修正指令**（`resume=prev_session`），复用上一次已读进上下文的源码，
-    不再整轮重读 → 直接砍掉重试的重复开销；不能续接（首轮无 session / 续接已失效）时退回完整 prompt。
+    第 2 次起两种打法：
+    - `allow_resume=True`（默认）：**能续接就只发修正指令**（`resume=prev_session`），复用上一次
+      已读进上下文的源码、省掉整轮重读；
+    - `allow_resume=False`：**每轮全新会话**（完整 prompt + 修正要点）。用于「长会话退化」——
+      实测 12 次重试里 8 次 agent 根本没产出 IR（resume 的会话越堆越长就越容易丢步），
+      换新会话给它干净的上下文。
     """
     if attempt <= 1:
         return base, None
     reason = (last_reason or "").strip()
-    if prev_session:
+    if allow_resume and prev_session:
         msg = ("【上一次尝试未通过，请据此修正后，重新输出完整、合法的 IR JSON】\n"
                f"修正要点：{reason}\n"
                "**必须用 Write 工具把完整的 IR JSON 一次性写入下方系统指令给出的结果文件路径**"
@@ -454,6 +779,78 @@ def _progress_reporter(task_id: str):
     return set_stage, on_event
 
 
+def _real_inventory_hint(modules: list) -> str:
+    """把探针给出的**真实带参层清单**渲染成回喂给 agent 的提示。
+
+    **按路径模式归并**（数字段折叠成 `{i}` 并计数）：真实模型常是「N 个同构层」（scGPT 的
+    `transformer_encoder.layers.{i}.*` 有 12 份），平铺 87 行既撑 prompt 又看不出规律；
+    归并后是「`…layers.{i}.self_attn` ×12 :: nn.MultiheadAttention（每个 787968 参数）」——
+    直接告诉 agent 要建几份、每份多大。
+    """
+    if not modules:
+        return ""
+    groups: dict[str, dict] = {}
+    for m in modules:
+        # 只折叠**整段是数字**的路径段（`layers.0.` → `layers.{i}.`）：`linear1`/`linear2`
+        # 里的数字是名字的一部分，一并折叠会把两种不同的层混成一种，反而把信息抹平。
+        pattern = ".".join("{i}" if seg.isdigit() else seg
+                           for seg in str(m.get("path") or "").split("."))
+        g = groups.setdefault(pattern, {"n": 0, "cls": m.get("class"), "params": m.get("params")})
+        g["n"] += 1
+    rows = []
+    for pattern, g in list(groups.items())[:48]:
+        times = f" ×{g['n']}" if g["n"] > 1 else ""
+        rows.append(f"- {pattern}{times} :: {g['cls']}（每个 {g['params']} 参数）")
+    more = f"\n（共 {len(groups)} 种路径模式、{len(modules)} 个带参层，仅列前 48 种）" if len(groups) > 48 else ""
+    return ("\n【真实模型的带参层清单（**以此为准**重建 IR：module_path 取这里的 path，"
+            "带数字段的写成同一模式、按 ×N 建 N 份）】\n" + "\n".join(rows) + more)
+
+
+async def _fidelity_issues(source: Path, ws: Path, ir: dict, task_id: str,
+                           attempt: int) -> tuple[list[str], str, str]:
+    """把候选 IR 与**真实模型**比一遍 → `(差异清单, 备注)`。
+
+    差异为空即通过。真实模型起不来（项目环境未就绪、缺 entry_args、依赖装不上）时**跳过**而不是
+    误判「不忠实」，但**把跳过原因回传给调用方留痕**（否则「跳过」与「通过」在结果里长得一样）。
+    比对口径与 6.4 两步验证一致（带参层数 / 参数量 / state_dict 形状 / 模块覆盖）。
+    """
+    if not DECOMPOSE_FIDELITY_CHECK:
+        return [], "保真度自检已关闭（DECOMPOSE_FIDELITY_CHECK=0）", ""
+    python = analysis_service._project_python(ws)
+    if python is None:
+        return [], "项目环境未就绪，跳过保真度自检", ""
+    run_dir = ws / "runs" / "decompose" / task_id / f"fidelity_a{attempt}"
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        ir_path = run_dir / "candidate_ir.json"
+        regen_path = run_dir / "regenerated.py"
+        args_path = run_dir / "entry_args.json"
+        out_path = run_dir / "fidelity.json"
+        ir_path.write_text(json.dumps(ir, ensure_ascii=False), encoding="utf-8")
+        regen_path.write_text(ir_codegen.generate(ir), encoding="utf-8")
+        args_path.write_text(json.dumps(ir.get("entry_args") or {}, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 —— 自检自身的准备失败不该阻断拆解
+        return [], f"保真度自检准备失败，跳过：{e}", ""
+    try:
+        rc, log = await proc_util.run_command(
+            [python, str(FIDELITY_SCRIPT), str(source), str(ir_path), str(regen_path),
+             str(out_path), str(args_path)],
+            cwd=str(run_dir), timeout=DECOMPOSE_FIDELITY_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return [], "保真度自检超时，跳过", ""
+    if rc != 0:
+        return [], f"保真度自检脚本异常（rc={rc}），跳过：{(log or '')[-200:]}", ""
+    try:
+        res = json.loads(out_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        return [], f"保真度自检结果不可解析，跳过：{e}", ""
+    if res.get("skipped"):
+        return [], f"跳过（{res.get('reason')}）", ""
+    if res.get("ok"):
+        return [], "通过", ""
+    return list(res.get("issues") or []), "不通过", _real_inventory_hint(res.get("real_param_modules") or [])
+
+
 async def _run_decompose(params: dict, task_id: str) -> None:
     project_id = params["project_id"]
     project = _require_original(project_id)
@@ -481,6 +878,7 @@ async def _run_decompose(params: dict, task_id: str) -> None:
     ir: Optional[dict] = None
     last_reason = "agent 未产出有效 IR 结构（structured_output 缺失）"
     prev_session: Optional[str] = None   # 上一次尝试的 agent 会话 id（重试时续接复用已读上下文）
+    fidelity_note = "未执行"             # 保真度自检结论（通过/跳过原因），随 run_record 留痕
     set_stage, on_event = _progress_reporter(task_id)
 
     def _record_fail(reason: str, bad_ir: Optional[dict] = None) -> None:
@@ -504,47 +902,85 @@ async def _run_decompose(params: dict, task_id: str) -> None:
             break
         set_stage(_attempt_stage(attempt, DECOMPOSE_AGENT_RETRIES, last_reason))
         # 重试时把上一次的失败原因回喂（能续接则只发修正指令，复用上一轮已读的源码上下文）
-        ask, resume = _attempt_prompt(prompt, last_reason, prev_session, attempt)
-
-        async def _one_run(ask: str, resume_: Optional[str]) -> dict:
-            return await agent_service.run_sync(
-                ask,
-                cwd=str(source),
-                output_schema=ir_schema.IR_SCHEMA,
-                max_turns=60,
-                timeout_s=int(min(DECOMPOSE_AGENT_TIMEOUT_S, max(30, budget))),
-                resume=resume_,
-                on_event=on_event,
-            )
-
-        try:
+        if DECOMPOSE_STEPWISE:
+            # **分步生成**：骨架 → 逐模块展开 → 合并（每步输出短，稳定性好得多）
+            hint_all = prompt[len(_decompose_prompt(hierarchy, entry_class)):]  # 知识带入等附注
             try:
-                result = await _one_run(ask, resume)
-            except Exception as exc:  # noqa: BLE001
-                if resume and agent_service.is_stale_session_error(exc):
-                    # 续接目标已失效 → 退回完整 prompt 重跑一次（不带续接）
+                candidate = await _stepwise_decompose(
+                    source, hierarchy, entry_class, hint_all, task_id, deadline,
+                    on_event=on_event, set_stage=set_stage, feedback=last_reason)
+            except Exception as e:  # noqa: BLE001
+                last_reason = f"分步拆解失败：{e}"
+                _record_fail(last_reason)
+                continue
+        else:
+            ask, resume = _attempt_prompt(prompt, last_reason, prev_session, attempt,
+                                          allow_resume=DECOMPOSE_RETRY_RESUME)
+
+            async def _one_run(ask: str, resume_: Optional[str]) -> dict:
+                return await agent_service.run_sync(
+                    ask,
+                    cwd=str(source),
+                    output_schema=ir_schema.IR_SCHEMA,
+                    max_turns=60,
+                    timeout_s=int(min(DECOMPOSE_AGENT_TIMEOUT_S, max(30, budget))),
+                    resume=resume_,
+                    on_event=on_event,
+                )
+
+            try:
+                try:
+                    result = await _one_run(ask, resume)
+                except Exception as exc:  # noqa: BLE001
+                    if resume and agent_service.is_stale_session_error(exc):
+                        # 续接目标已失效 → 退回完整 prompt 重跑一次（不带续接）
+                        result = await _one_run(prompt, None)
+                    else:
+                        raise
+                if resume and _as_ir(result.get("structured_output")) is None:
+                    # 续接后**没写出结果文件**（模型只回了文字 / 写去了旧路径）→ 用完整 prompt 立刻重跑，
+                    # 不占用一次重试名额、也不静默失败（2026-10-05 实测踩过：续接那轮 2s 空手而归）
                     result = await _one_run(prompt, None)
-                else:
-                    raise
-            if resume and _as_ir(result.get("structured_output")) is None:
-                # 续接后**没写出结果文件**（模型只回了文字 / 写去了旧路径）→ 用完整 prompt 立刻重跑，
-                # 不占用一次重试名额、也不静默失败（2026-10-05 实测踩过：续接那轮 2s 空手而归）
-                result = await _one_run(prompt, None)
-        except Exception as e:  # noqa: BLE001 —— agent 失败记 run_record 供检索（先例 4.3）
-            _record_fail(f"第 {attempt}/{DECOMPOSE_AGENT_RETRIES} 次尝试失败: {e}")
-            raise
-        prev_session = result.get("session_id") or prev_session
-        candidate = _as_ir(result.get("structured_output"))
+            except Exception as e:  # noqa: BLE001 —— agent 失败记 run_record 供检索（先例 4.3）
+                _record_fail(f"第 {attempt}/{DECOMPOSE_AGENT_RETRIES} 次尝试失败: {e}")
+                raise
+            candidate = _as_ir(result.get("structured_output"))
+            if DECOMPOSE_RETRY_RESUME:      # 不续接时不必记会话 id
+                prev_session = result.get("session_id") or prev_session
         if candidate is None:
             last_reason = (
                 f"agent 未产出有效 IR 结构（structured_output 缺失，第 {attempt}/{DECOMPOSE_AGENT_RETRIES} 次）"
             )
+            _record_fail(last_reason)   # 也要留痕：否则「没产出」这类尝试在 run_record 里查不到
             # 仍拿不到结果文件 → 下一轮退回完整 prompt，避免反复踩同一坑
             prev_session = None
             continue
         errors = validate_ir(candidate)
         if errors:
             last_reason = "IR 结构校验失败: " + "；".join(errors)
+            _record_fail(last_reason, candidate)
+            continue
+        # input_spec.inputs 的**形态**校验（便宜且确定）：必须是 root 直接子节点的 id——
+        # 实测 agent 会填成 forward 的参数名/描述（`["src (gene token ids)", …]`），匹配不上任何节点
+        # → 所有外部输入都落到第一个形参（value encoder 收到 token id → 前向 dtype 错）。
+        bad_inputs = [x for x in ((candidate.get("input_spec") or {}).get("inputs") or [])
+                      if x not in {n["id"] for n in candidate.get("nodes") or []}]
+        if bad_inputs:
+            last_reason = (
+                f"input_spec.inputs 必须是 root 子节点的**节点 id**（按调用顺序），但 {bad_inputs} "
+                "不是任何节点 id——不要写 forward 的参数名或描述文字；单输入模型请省略该项"
+            )
+            _record_fail(last_reason, candidate)
+            continue
+        # 节点数上限（便宜且确定，先于保真度自检）：IR 越长越不稳——漏字段/漏边/整份不产出都
+        # 与输出长度相关。把重复结构折叠掉，既短又稳（参数量不受影响：code_hint 实例化同一构造）。
+        if len(candidate.get("nodes") or []) > DECOMPOSE_MAX_NODES:
+            last_reason = (
+                f"节点数 {len(candidate['nodes'])} 超过上限 {DECOMPOSE_MAX_NODES}：单次输出越长越容易"
+                "漏字段/漏边甚至整份不产出——请把**同一构造重复多次的结构**（如 encoder 的 N 层）"
+                "与**标准复合层**（nn.TransformerEncoder/EncoderLayer 等）用 code_hint **折叠成 1 个节点**，"
+                "节点数控制在 40 以内再提交"
+            )
             _record_fail(last_reason, candidate)
             continue
         # 结构自检：能否再生成（纯函数、秒级）。agent 对「结构由运行期构造参数决定」的模型
@@ -556,6 +992,19 @@ async def _run_decompose(params: dict, task_id: str) -> None:
             last_reason = "IR 结构自检未通过（再生成失败）: " + str(e)
             _record_fail(last_reason, candidate)
             continue
+        # **保真度自检前先把用户补参带进来**（entry_args/extra/forward_kwargs/inputs）：
+        # agent 不产出这些，而真实模型往往正是靠它们才实例化得起来；不带就必然「跳过」自检
+        # ——那样等于把「静默放行坏 IR」原样保留（本函数第一版就踩了这个坑，靠独立复跑才发现）。
+        _carry_over_user_specs(prev_ir, candidate)
+        # **保真度自检**：与真实模型比参数量/带参层/逐层形状/模块覆盖。上面两道自检只看
+        # 「IR 内部合法 + 能再生成」，从不与真实模型比对——少拆子树（scGPT 漏 mvc_decoder）、
+        # 尺寸算错都会被放行，拖到「⑤ 两步验证」才暴露，且换一次拆解复现一次。这里拦下并重试。
+        set_stage(f"第 {attempt}/{DECOMPOSE_AGENT_RETRIES} 次尝试：保真度自检（与真实模型比对结构/前向）…")
+        issues, fidelity_note, fidelity_hint = await _fidelity_issues(source, ws, candidate, task_id, attempt)
+        if issues:
+            last_reason = ("IR 保真度自检未通过（与真实模型比对）：" + "；".join(issues) + fidelity_hint)
+            _record_fail(last_reason, candidate)
+            continue
         ir = candidate
         break
     if ir is None:
@@ -563,7 +1012,6 @@ async def _run_decompose(params: dict, task_id: str) -> None:
         raise RuntimeError(last_reason)
     ir["schema_version"] = SCHEMA_VERSION
     ir["project_id"] = project_id
-    _carry_over_user_specs(prev_ir, ir)
     ir_path = ws / "reports" / "ir.json"
     ir_path.write_text(json.dumps(ir, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -576,6 +1024,7 @@ async def _run_decompose(params: dict, task_id: str) -> None:
             "nodes": len(ir["nodes"]),
             "edges": len(ir["edges"]),
             "uncertain": sum(1 for n in ir["nodes"] if n.get("uncertain")),
+            "fidelity": fidelity_note,
             "knowledge_brought": {
                 "param_advice": len(knowledge.get("param_advice") or []),
                 "dependency_conflict": len(knowledge.get("dependency_conflict") or []),
@@ -743,6 +1192,26 @@ def _infer_missing_shapes(ir: dict) -> int:
     return filled
 
 
+def _uncovered_modules(ir: dict, trace_output: dict) -> list[str]:
+    """trace **实际执行到**、但 IR 里没有对应节点的子模块路径（agent 漏拆的子树）。
+
+    用「真实实例 + 真前向」的结果做完备性核对，而不是静态报告——后者列出源码里**所有** nn.Module
+    子类（scGPT 41 个里有 20 个属于别的模型变体/测试替身），照它校验会满屏假阳性。
+    实测价值：scGPT 的 IR 漏了整棵 `mvc_decoder`（2 个 Linear / 52.5 万参数），此前要等到「⑤ 两步
+    验证」看到「87 vs 85 层」才间接暴露；这里当场点名。
+    """
+    shapes = trace_output.get("shapes") if isinstance(trace_output.get("shapes"), dict) else trace_output
+    covered = {str(n.get("module_path") or "") for n in ir["nodes"]}
+    covered.add("")
+
+    def _is_covered(path: str) -> bool:
+        # 命中某个 IR 节点自身，**或落在它的子树里**：`nn.TransformerEncoder` 由一条 code_hint
+        # 节点折叠表达时，它下面 100+ 个真实子模块不该被算成「漏拆」。
+        return any(path == mp or path.startswith(mp + ".") for mp in covered)
+
+    return sorted(p for p in (shapes or {}) if not _is_covered(p))
+
+
 def _fill_edge_shapes(ir: dict) -> int:
     """把边上流动的张量形状写入 `edges[].tensor_shape`。
 
@@ -889,20 +1358,25 @@ async def _run_trace(params: dict, task_id: str) -> None:
     filled = _merge_shapes(ir, shapes)
     inferred = _infer_missing_shapes(ir)  # op 节点兜底（hook 抓不到）
     edges_filled = _fill_edge_shapes(ir)  # 边形状（此前无写入方，见该函数 docstring）
+    uncovered = _uncovered_modules(ir, shapes)   # 实际执行到、IR 却没拆的子树（agent 漏拆）
     _write_ir(project, ir)
     knowledge_service.record_run({
         "project_id": project_id, "task_id": task_id, "run_type": "decompose_trace",
         "command": command, "status": "success",
         "metrics": {"captured_paths": len(shapes.get("shapes", shapes)) if isinstance(shapes, dict) else 0,
-                    "filled": filled, "inferred": inferred, "edges_filled": edges_filled},
+                    "filled": filled, "inferred": inferred, "edges_filled": edges_filled,
+                    "uncovered": len(uncovered), "uncovered_examples": uncovered[:5]},
         "artifact_path": str(out_json),
         "started_at": started, "finished_at": _now(),
     })
     _captured = len(shapes.get("shapes", shapes)) if isinstance(shapes, dict) else 0
+    _gap = (f"；⚠ IR 未覆盖 {len(uncovered)} 个实际子模块（如 {uncovered[0]}），"
+            "建议重新拆解或手工补节点" if uncovered else "")
     task_manager.update_progress(task_id, {
-        "stage": f"补形状完成：捕获 {_captured} 个模块，回填 {filled + inferred + edges_filled} 处",
+        "stage": f"补形状完成：捕获 {_captured} 个模块，回填 {filled + inferred + edges_filled} 处{_gap}",
         "captured_paths": _captured,
         "filled": filled, "inferred": inferred, "edges_filled": edges_filled,
+        "uncovered": len(uncovered), "uncovered_examples": uncovered[:5],
     })
 
 

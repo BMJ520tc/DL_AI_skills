@@ -165,6 +165,28 @@ def is_stale_session_error(text) -> bool:
     return any(m in low for m in _STALE_SESSION_MARKERS)
 
 
+_API_ERROR_RE = re.compile(r"API Error:\s*(.+?)(?:\s*\(request_id|$)", re.IGNORECASE | re.MULTILINE)
+
+
+def _api_error_message(text) -> Optional[str]:
+    """识别「CLI 把 API 层错误当回复文本返回」的情况（实测：`API Error: 402 Insufficient Balance`）。"""
+    m = _API_ERROR_RE.search(str(text or ""))
+    return m.group(1).strip() if m else None
+
+
+def _api_error_hint(message: str) -> str:
+    """把 API 层错误译成可操作的提示——**这类错误重试没有意义，必须如实抛出并中止**。"""
+    low = message.lower()
+    if "insufficient balance" in low or "402" in low:
+        return (f"模型接口余额不足（{message}）：请充值或更换凭证后重试。"
+                "**重试无意义，已中止**（此前会把这类错误当成「模型没产出内容」白试十几轮）")
+    if "401" in low or "unauthorized" in low or "invalid" in low:
+        return f"模型接口鉴权失败（{message}）：请到设置页检查凭证后重试（重试无意义，已中止）"
+    if "429" in low or "rate limit" in low:
+        return f"模型接口限流（{message}）：请稍后重试（重试无意义，已中止）"
+    return f"模型接口错误：{message}"
+
+
 def _emit_tool_uses(msg, on_event) -> None:
     """把一次 AssistantMessage 里的工具调用回调给 on_event（供拆解等长任务报进度）。
 
@@ -405,6 +427,11 @@ async def _collect(prompt: str, options: ClaudeAgentOptions, timeout_s: int, ret
             if not saw_result:
                 # 会话流结束却没有 ResultMessage：属异常终止，不能当成功返回空结果
                 raise RuntimeError("agent 会话未返回 ResultMessage（会话异常终止，无结果可用）")
+            # API 层错误（余额不足/鉴权/限流）会被 CLI 当成「回复文本」返回：必须如实抛出中止，
+            # 否则会被上层当成「模型没产出内容」反复重试（实测白试 11 轮，还把诊断带偏）。
+            api_err = _api_error_message(outcome.get("result"))
+            if api_err:
+                raise RuntimeError(_api_error_hint(api_err))
             return outcome
         except asyncio.TimeoutError as e:
             last_error = e

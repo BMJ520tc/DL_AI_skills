@@ -88,6 +88,20 @@ def test_update_input_spec_forward_kwargs_writes_clears_and_validates(ir_env):
         decompose_service.update_input_spec(pid, [1, 1200], None, None, {"not-an-ident": 1})
 
 
+def test_update_input_spec_inputs_validates_node_ids(ir_env):
+    """多输入声明：按调用顺序列节点 id；不存在的 id 拒绝（免得生成出对不上的 forward）。"""
+    pid = ir_env
+    spec = decompose_service.update_input_spec(pid, [1, 8], None, None, None, ["net"])
+    assert spec["inputs"] == ["net"]
+    assert decompose_service.read_ir(pid)["input_spec"]["inputs"] == ["net"]
+
+    spec = decompose_service.update_input_spec(pid, [1, 8], None, None, None, [])   # 空 = 清除
+    assert "inputs" not in spec
+
+    with pytest.raises(ValueError, match="不存在于 IR"):
+        decompose_service.update_input_spec(pid, [1, 8], None, None, None, ["nope"])
+
+
 def test_call_kwargs_reads_forward_kwargs():
     sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
     from _model_loader import call_kwargs

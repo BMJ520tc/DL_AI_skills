@@ -28,6 +28,10 @@ _PARAM_ATTRS = (
     # 维度类
     "in_features", "out_features", "num_features", "in_channels", "out_channels",
     "num_embeddings", "embedding_dim", "num_groups", "num_channels", "normalized_shape",
+    # Embedding 的索引类参数：**必须与 num_embeddings 同源**——agent 常给出源码里的真实
+    # `padding_idx`（如 60694），而 num_embeddings 由实例回填（可能因 entry_args 的 ntoken
+    # 而不同）→ 生成 `nn.Embedding(num_embeddings=1000, padding_idx=60694)` 构造即 AssertionError。
+    "padding_idx",
     # 卷积/池化/上采样形状类
     "kernel_size", "stride", "padding", "output_padding", "dilation", "groups",
     "output_size", "size", "scale_factor",

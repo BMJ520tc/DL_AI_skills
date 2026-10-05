@@ -283,8 +283,13 @@ def validate_ir(ir: dict) -> list[str]:
                     "（缺失会生成运行期必错的表达式，如 x.view(())）"
                 )
 
-        if len(in_edges(ir, nid)) > 1 and n["kind"] != "op":
-            errors.append(f"非 op 节点 {nid} 有多条入边（PyTorch 模块单张量输入，多输入汇合请用 op 节点）")
+        # 多输入：`op` 天然多操作数；**module** 也多输入——按入边顺序成为它 forward 的形参
+        # （如 scGPT 的 MVCDecoder(cell_emb, gene_embs)）。叶子/容器仍是单张量输入。
+        if len(in_edges(ir, nid)) > 1 and n["kind"] not in ("op", "module"):
+            errors.append(
+                f"非 op 节点 {nid} 有多条入边（叶子/容器按 PyTorch 单张量输入建模；"
+                "多输入请用 **module 节点**——多个输入会按入边顺序成为它的 forward 形参，"
+                "或用一个 op 节点汇合）")
 
     # container 子节点的边只能在同 Sequential 子节点之间：进出 Sequential 的
     # 数据流由 container 节点自身的边表达（codegen 将子节点内联进 Sequential，

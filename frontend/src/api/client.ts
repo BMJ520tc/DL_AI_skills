@@ -105,6 +105,8 @@ export interface IrGraph {
         extra?: Array<{ shape: number[]; dtype?: string }>;
         /** 传给 forward 的关键字参数（如分支开关 CLS/MVC/ECS）。 */
         forward_kwargs?: Record<string, unknown>;
+        /** 多输入模型：按调用顺序列出吃外部输入的节点 id（root 的 forward 形参）。 */
+        inputs?: string[];
     } | null;
     /** 入口类构造参数（补形状/验证要实例化入口类；参数来自运行期配置时由用户补）。 */
     entry_args?: Record<string, unknown> | null;
@@ -389,6 +391,7 @@ export const putIrInputSpec = (
     dtype?: string | null,
     extra?: Array<Record<string, unknown>> | null,
     forwardKwargs?: Record<string, unknown> | null,
+    inputs?: string[] | null,
 ) =>
     request<{ shape: number[]; dtype?: string }>(`/api/projects/${projectId}/ir/input_spec`, {
         method: "PUT",
@@ -397,6 +400,7 @@ export const putIrInputSpec = (
             ...(dtype ? { dtype } : {}),
             ...(extra !== undefined && extra !== null ? { extra } : {}),
             ...(forwardKwargs !== undefined && forwardKwargs !== null ? { forward_kwargs: forwardKwargs } : {}),
+            ...(inputs !== undefined && inputs !== null ? { inputs } : {}),
         }),
     });
 

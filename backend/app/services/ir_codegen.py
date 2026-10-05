@@ -214,6 +214,15 @@ def _subtree_sink(ir: dict, root_id: str) -> str:
     return sinks[0] if len(sinks) == 1 else root_id
 
 
+def _is_literal(v) -> bool:
+    """能否直接写成 Python 字面量（标量 / 标量序列）——用于模块普通属性 `self.<k> = 值`。"""
+    if isinstance(v, (bool, int, float, str)):
+        return True
+    if isinstance(v, (list, tuple)):
+        return all(isinstance(x, (bool, int, float, str)) for x in v)
+    return False
+
+
 def _module_class(ir: dict, node: dict) -> str:
     """一个自定义 module → 一个自包含类：只实例化其**直接子节点**。
 
@@ -242,12 +251,31 @@ def _module_class(ir: dict, node: dict) -> str:
     ordered = _level_order(ir, child_set)
     order_index = {n["id"]: i for i, n in enumerate(ordered)}
 
+    # 本模块自身的**标量参数**（如 ContinuousValueEncoder.max_value、Similarity.temp）→
+    # `self.<k> = 值`。它们是模型的普通属性、不是子模块；agent 的 code_hint 常写
+    # `torch.clamp({inputs}, max=self.max_value)`，不落这句就 AttributeError。
+    param_keys = {k for k in (node.get("params") or {}) if isinstance(k, str) and k.isidentifier()}
+    allowed_self = child_set | param_keys | container_children
+
+    def _check_self_refs(n: dict) -> None:
+        """code_hint 里的 `self.<name>` 必须是本模块的子节点或参数——否则再生成代码里没有它。"""
+        for name in re.findall(r"self\.(\w+)", str(n.get("code_hint") or "")):
+            if name not in allowed_self:
+                raise IrIncompleteError(
+                    [f"节点 {n['id']} 的 code_hint 引用了 self.{name}，但它既不是 {node['id']} 的子节点"
+                     f"也不是它的 params：请把该常量**内联**进 code_hint（如 max=512、/ 0.5），"
+                     f"或把 {name} 写进 {node['id']} 节点的 params"])
+
     init_lines, fwd_lines = [], []
+    for k, v in sorted((node.get("params") or {}).items()):
+        if isinstance(k, str) and k.isidentifier() and k not in child_set and _is_literal(v):
+            init_lines.append(f"        self.{k} = {_py_value(v)}")
     for n in ordered:
         nid = n["id"]
         if nid in container_children:
             continue
         if n["kind"] == "leaf":
+            _check_self_refs(n)
             init_lines.append(f"        self.{nid} = {_leaf_expr(n)}")
         elif n["kind"] == "container":
             gc = [c["id"] for c in children_of(ir, nid)]
@@ -270,11 +298,17 @@ def _module_class(ir: dict, node: dict) -> str:
     # 注意「孤立子节点」：既无入边也无出边（典型如定义了但 forward 未使用的 self.relu），
     # 不应算作汇点——否则真实仓库里这类模型会被判「多汇点」而无法再生成。
     def _isolated(cid: str) -> bool:
-        # 「未参与数据流」= 整棵子树不与任何边相连（如定义了但 forward 未使用的 self.relu）。
-        # 注意不能只看「模块内」的边：模块的输入子节点只有一条来自父模块（owner 之外）的入边，
-        # 若把 owner 之外的边排除，输入子节点会被误判为孤立。
+        # 「未参与数据流」= 整棵子树**不跨子树边界**与外界相连（如定义了但 forward 未使用的 self.relu）。
+        # 判据只看**跨边界**的边：子树**内部**的边不算「接上了」——否则一个自身内部有连接、
+        # 但父模块从不调用的子模块（如 scGPT 的 mvc_decoder：内部 gene2query→W 串着、
+        # 却因 forward 需要两个输入而未被接入）会被误判为「本模块的汇点」→ 多汇点报错。
         members = {cid} | _subtree_ids(ir, cid)
-        return not any(in_edges(ir, m) or out_edges(ir, m) for m in members)
+        for m in members:
+            if any(e["from"] not in members for e in in_edges(ir, m)):
+                return False
+            if any(e["to"] not in members for e in out_edges(ir, m)):
+                return False
+        return True
 
     candidates = [cid for cid in child_ids
                   if cid not in container_children and not _isolated(cid)]
@@ -295,6 +329,27 @@ def _module_class(ir: dict, node: dict) -> str:
              "（多分支输出请用 op 节点汇合）"]
         )
 
+    # 多输入模型（如 scGPT 的 forward(src, values, mask)）：root 的 forward 按
+    # `input_spec.inputs` 声明多个形参——否则所有「模块之外」的源节点都拿到同一个 x，
+    # 把 token id 喂进 value encoder 的 Linear 就会 dtype 不符（边界 ⑯）。
+    # 本模块的**外部输入来源**（决定 forward 形参个数）：
+    # - root：由 `input_spec.inputs` 声明（用户可补，见 update_input_spec）；
+    # - 嵌套模块：由其**入边**推断——有几条入边就几个形参，边序即参数序，父模块按序传参。
+    #   这样 `MVCDecoder(cell_emb, gene_embs)` 这类**多输入模块**才表达得出来
+    #   （此前 schema 只许一条入边，要么表达不了、要么只能不连边把分支丢掉）。
+    is_root = node["id"] == ir.get("root_id")
+    if is_root:
+        sources = [str(x) for x in ((ir.get("input_spec") or {}).get("inputs") or [])]
+    else:
+        sources = [str(e.get("from")) for e in in_edges(ir, node["id"])]
+    sig_params = ["x"] if not sources else [f"x{i}" for i in range(len(sources))]
+
+    def _ext_var(src: str) -> str:
+        """「模块之外」的输入变量：来源在册就用对应形参，否则退回第一个（保持旧行为）。"""
+        if src in sources:
+            return sig_params[sources.index(src)]
+        return sig_params[0] if sig_params else "x"
+
     for n in ordered:
         nid = n["id"]
         if nid in container_children:
@@ -306,7 +361,7 @@ def _module_class(ir: dict, node: dict) -> str:
             src = e.get("from")
             ow = owner.get(src)
             if ow is None:
-                in_vars.append("x")  # 模块之外的输入（含来自父层的残差）
+                in_vars.append(_ext_var(src))  # 模块之外的输入（外部输入或来自父层的残差）
             elif src == ow or src == _sink_of(ow):
                 in_vars.append(f"var_{ow}")  # 直接子节点，或该子节点子树的输出节点
             else:
@@ -317,17 +372,22 @@ def _module_class(ir: dict, node: dict) -> str:
                      f"（属于 {ow} 的内部节点，不是 {ow} 的输出）：请改从 {ow} 自身或其子树输出节点连边"]
                 )
         if n["kind"] == "op":
+            _check_self_refs(n)
             fwd_lines.append(f"        var_{nid} = {_render_op(n, in_vars)}")
         else:
-            in_var = in_vars[0] if in_vars else "x"
-            fwd_lines.append(f"        var_{nid} = self.{nid}({in_var})")
+            # module 子节点按**全部**入边调用（多输入模块的形参与此对应）；叶子/容器仍是单张量入参
+            if in_vars and n["kind"] == "module":
+                args = ", ".join(in_vars)
+            else:
+                args = in_vars[0] if in_vars else _ext_var(nid)
+            fwd_lines.append(f"        var_{nid} = self.{nid}({args})")
 
     return (
         f"class Decomp_{node['id']}(nn.Module):\n"
         "    def __init__(self):\n"
         "        super().__init__()\n"
         + "\n".join(init_lines) + "\n\n"
-        "    def forward(self, x):\n"
+        f"    def forward(self, {', '.join(sig_params)}):\n"
         + "\n".join(fwd_lines) + "\n"
         f"        return var_{sinks[0]}\n"
     )

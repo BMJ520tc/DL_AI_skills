@@ -108,6 +108,8 @@ class InputSpecBody(BaseModel):
     extra: list[dict] | None = None
     # forward 关键字参数（如 scGPT 的 CLS/MVC/ECS 开关）；{} = 清除
     forward_kwargs: dict | None = None
+    # 多输入模型：按调用顺序列出吃外部输入的节点 id（root 的 forward 形参）；[] = 清除
+    inputs: list[str] | None = None
 
 
 @ir_router.put("/ir/input_spec")
@@ -116,7 +118,7 @@ def update_input_spec(project_id: str, body: InputSpecBody) -> dict:
     _require_original(project_id)
     try:
         return decompose_service.update_input_spec(
-            project_id, body.shape, body.dtype, body.extra, body.forward_kwargs)
+            project_id, body.shape, body.dtype, body.extra, body.forward_kwargs, body.inputs)
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:

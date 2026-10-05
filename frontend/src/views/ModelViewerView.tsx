@@ -581,6 +581,7 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
     const [savingSpec, setSavingSpec] = useState(false);
     const [specExtra, setSpecExtra] = useState("");   // 多输入模型的额外入参（JSON 数组）
     const [specFwdKwargs, setSpecFwdKwargs] = useState("");   // forward 关键字参数（JSON 对象）
+    const [specInputs, setSpecInputs] = useState("");          // 多输入：吃外部输入的节点 id（逗号分隔）
     // 入口类构造参数补参（补形状/验证要实例化入口类；参数来自运行期配置时 agent 给不出）
     const [entryArgsDraft, setEntryArgsDraft] = useState("");
     const [entryArgsError, setEntryArgsError] = useState<string | null>(null);
@@ -920,10 +921,12 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                 return;
             }
         }
+        // 多输入：逗号/空格分隔的节点 id（留空 = 单输入）
+        const inputs = specInputs.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
         setSpecError(null);
         setSavingSpec(true);
         try {
-            await putIrInputSpec(projectId, shape, specDtype.trim() || null, extra, fkw);
+            await putIrInputSpec(projectId, shape, specDtype.trim() || null, extra, fkw, inputs);
             await refreshIr();
             setFlash("输入规格已保存；IR 已变化，旧验证变 stale，入库前需重新验证");
         } catch (e) {
@@ -1461,6 +1464,15 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                                             placeholder='{"CLS":true,"MVC":true,"ECS":true}'
                                             value={specFwdKwargs}
                                             onChange={e => setSpecFwdKwargs(e.target.value)}
+                                        />
+                                        <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>
+                                            多输入节点（按调用顺序填吃外部输入的节点 id，逗号分隔；留空 = 单输入）
+                                        </div>
+                                        <input
+                                            style={{ ...inputStyle, width: "100%", fontFamily: "monospace", marginBottom: 6 }}
+                                            placeholder="如 encoder_embedding, vc_unsqueeze"
+                                            value={specInputs}
+                                            onChange={e => setSpecInputs(e.target.value)}
                                         />
                                         {specError && <div style={{ color: "#fca5a5", fontSize: 11, marginBottom: 6 }}>{specError}</div>}
                                         <button style={{ ...btnStyle, width: "100%" }} disabled={savingSpec} onClick={() => void handleSaveInputSpec()}>
