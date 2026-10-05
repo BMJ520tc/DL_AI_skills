@@ -8,6 +8,7 @@
 本引擎为唯一实现，前端仅用 CodeViewer 展示返回代码。
 """
 import json
+import re
 
 from app.services.ir_schema import (
     OP_BINARY, OP_WHITELIST, children_of, in_edges, incomplete_ir, nodes_by_id,
@@ -106,7 +107,7 @@ def _render_op(node: dict, in_vars: list[str]) -> str:
     tpl = _OP_TEMPLATES.get(cls) or node.get("code_hint")
     if not tpl:
         raise IrIncompleteError([f"op 节点 {node['id']}（{cls}）既不在白名单也无 code_hint"])
-    if "{inputs}" not in tpl:
+    if "{inputs}" not in tpl and "{inputs[" not in tpl:
         raise IrIncompleteError([f"op 节点 {node['id']} 的 code_hint 必须含 {{inputs}} 占位符: {tpl}"])
     if cls in OP_BINARY and len(in_vars) < 2:
         raise IrIncompleteError(
@@ -118,8 +119,18 @@ def _render_op(node: dict, in_vars: list[str]) -> str:
         v = params.get(key)
         return OP_PARAM_DEFAULTS[key] if v is None else v
 
+    # `{inputs[N]}` = 第 N 个操作数（多入边时 `{inputs}` 会展开成「a, b, c」逗号串，
+    # 想单独取某一个操作数必须用索引形式，如 `{inputs[0]} + {inputs[1]}`）。
+    def _sub_input_index(m: "re.Match") -> str:
+        i = int(m.group(1))
+        if i >= len(in_vars):
+            raise IrIncompleteError(
+                [f"op 节点 {node['id']} 的 code_hint 用了 {{inputs[{i}]}}，但只有 {len(in_vars)} 条入边"])
+        return in_vars[i]
+
+    rendered = re.sub(r"\{inputs\[(\d+)\]\}", _sub_input_index, tpl)
     return (
-        tpl.replace("{inputs}", in_vars[0] if len(in_vars) == 1 else ", ".join(in_vars))
+        rendered.replace("{inputs}", in_vars[0] if len(in_vars) == 1 else ", ".join(in_vars))
         .replace("{dim}", _py_value(_p("dim")))
         .replace("{start_dim}", _py_value(_p("start_dim")))
         .replace("{end_dim}", _py_value(_p("end_dim")))
@@ -334,4 +345,24 @@ def generate(ir: dict) -> str:
         )
     module_nodes = [n for n in ir["nodes"] if n["kind"] == "module"]
     module_nodes.sort(key=lambda n: -_depth(ir, n["id"]))
-    return HEADER + "\n\n".join(_module_class(ir, n) for n in module_nodes) + "\n"
+    code = HEADER + "\n\n".join(_module_class(ir, n) for n in module_nodes) + "\n"
+    _check_syntax(code)
+    return code
+
+
+def _check_syntax(code: str) -> None:
+    """生成代码必须**能编译**——否则是 IR 里某条 code_hint 拼错了（如 `{inputs}[0]` 被展开成
+    逗号串、`dict(a=x, b, c)` 这类位置参数跟在关键字参数之后）。
+
+    此前不校验：坏代码一路走到「⑤ 两步验证」才以脚本 SyntaxError 爆出，且拆解的自检
+    （`ir_codegen.generate`）放行 → 白跑一轮。这里提前拦下，报出错行，让拆解能带着
+    原因重试、再生成能给出可读错误。
+    """
+    try:
+        compile(code, "<ir_codegen>", "exec")
+    except SyntaxError as e:
+        lines = code.splitlines()
+        bad = lines[e.lineno - 1].strip() if (e.lineno and 0 < e.lineno <= len(lines)) else ""
+        raise IrIncompleteError(
+            [f"再生成代码存在语法错误（第 {e.lineno} 行）：{e.msg}；该行: {bad[:160]}"]
+        ) from e

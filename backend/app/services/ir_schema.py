@@ -341,6 +341,10 @@ def canonical_ir(ir: dict) -> dict:
     """
     out = {k: ir.get(k) for k in
            ("schema_version", "project_id", "source_file", "entry_class", "task_type", "input_spec", "root_id")}
+    # entry_args（入口类构造参数，用户补的）也要进哈希：改了它 → 旧验证 stale。
+    # 仅在**存在且非空**时加入，避免给既有 IR 凭空插键、把所有历史验证打成 stale。
+    if ir.get("entry_args"):
+        out["entry_args"] = ir["entry_args"]
     out["nodes"] = [
         {k: n.get(k) for k in
          ("id", "kind", "class_name", "module_file", "params", "parent_id", "code_hint")}

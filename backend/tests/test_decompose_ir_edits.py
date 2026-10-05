@@ -164,7 +164,7 @@ def test_update_input_spec_writes_spec_and_keeps_dtype(ir_env):
 
     spec = decompose_service.update_input_spec(project_id, [1, 32], "float16")
 
-    assert spec == {"shape": [1, 32], "dtype": "float16"}
+    assert spec == {"shape": [1, 32], "dtype": "float16", "user_edited": True}
     assert decompose_service.read_ir(project_id)["input_spec"]["shape"] == [1, 32]
 
 

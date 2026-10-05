@@ -12,7 +12,10 @@ from pathlib import Path
 
 import torch
 
-from _model_loader import instantiate, load_entry_class
+from _model_loader import (
+    call_kwargs, first_tensor, _shape_of, instantiate, load_entry_class, make_dummy_input,
+    make_extra_inputs, prepare_torch,
+)
 
 # 从实例化出来的层上读取构造参数。两个用途：
 # ① 回填 agent 给不出的值（库型模型的层尺寸由运行期构造参数决定）；
@@ -134,7 +137,7 @@ def _derive_input_shape(model) -> list[int]:
     return [1, 3, 32, 32]
 
 
-def _capture(model, x) -> dict:
+def _capture(model, inputs, kwargs: dict | None = None) -> dict:
     """注册 hook 捕获各子模块（含根，路径 ""）的输入/输出形状。
 
     产物：{"shapes": {path: {input_shape, output_shape}}, "order": [{path, class_name}…]}。
@@ -145,10 +148,15 @@ def _capture(model, x) -> dict:
     def _hook(path):
         def _fn(_module, args, output):
             rec = captured.setdefault(path, {})
-            if args and isinstance(args[0], torch.Tensor):
-                rec["input_shape"] = list(args[0].shape)
-            if isinstance(output, torch.Tensor):
-                rec["output_shape"] = list(output.shape)
+            if args:
+                t = first_tensor(args[0])           # 入参也可能是 dict/tuple
+                shape = _shape_of(t) if t is not None else None   # NestedTensor 等无 .shape → None
+                if shape:
+                    rec["input_shape"] = shape
+            t = first_tensor(output)                # 输出可能是 dict/tuple（取第一个张量）
+            shape = _shape_of(t) if t is not None else None
+            if shape:
+                rec["output_shape"] = shape
 
         return _fn
 
@@ -156,7 +164,7 @@ def _capture(model, x) -> dict:
     handles = [sub.register_forward_hook(_hook(path)) for path, sub in modules]
     try:
         with torch.no_grad():
-            model(x)
+            model(*inputs, **(kwargs or {}))
     finally:
         for h in handles:
             h.remove()
@@ -172,9 +180,10 @@ def main() -> None:
         sys.exit(2)
     source_dir, ir_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
 
+    prepare_torch()
     ir = json.loads(Path(ir_path).read_text(encoding="utf-8"))
     cls = load_entry_class(source_dir, ir["source_file"], ir["entry_class"])
-    model = instantiate(cls).eval()
+    model = instantiate(cls, ir.get("entry_args")).eval()
 
     spec = ir.get("input_spec") or {}
     shape = list(spec.get("shape") or [])
@@ -186,9 +195,9 @@ def main() -> None:
               "（可用 PUT /api/projects/{id}/ir/input_spec 覆盖）", file=sys.stderr)
     dtype = getattr(torch, str(spec.get("dtype") or "float32"), torch.float32)
     torch.manual_seed(0)
-    x = torch.randn(*shape, dtype=dtype)
+    inputs = (make_dummy_input(shape, dtype), *make_extra_inputs(spec))
 
-    result = _capture(model, x)
+    result = _capture(model, inputs, call_kwargs(spec))
     result["input_shape"] = shape
     params: dict = {}
     delta: dict = {}

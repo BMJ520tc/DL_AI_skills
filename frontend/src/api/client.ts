@@ -98,7 +98,16 @@ export interface IrGraph {
     source_file?: string | null;
     entry_class?: string | null;
     task_type?: string | null;
-    input_spec?: { shape: number[]; dtype?: string } | null;
+    input_spec?: {
+        shape: number[];
+        dtype?: string;
+        /** 多输入模型的额外入参（按序追加在主输入之后）。 */
+        extra?: Array<{ shape: number[]; dtype?: string }>;
+        /** 传给 forward 的关键字参数（如分支开关 CLS/MVC/ECS）。 */
+        forward_kwargs?: Record<string, unknown>;
+    } | null;
+    /** 入口类构造参数（补形状/验证要实例化入口类；参数来自运行期配置时由用户补）。 */
+    entry_args?: Record<string, unknown> | null;
     root_id?: string | null;
     nodes: IrNode[];
     edges: IrEdge[];
@@ -374,10 +383,29 @@ export const putNodeParams = (projectId: string, nodeId: string, params: Record<
 
 /** 修正 IR 入口输入规格（6.1/6.2）：库型模型 agent 给不出具体维度时的补参通道；
  *  写回后 ir_hash 变化 → 旧验证变 stale（与调参同口径），入库前必须重新验证。 */
-export const putIrInputSpec = (projectId: string, shape: number[], dtype?: string | null) =>
+export const putIrInputSpec = (
+    projectId: string,
+    shape: number[],
+    dtype?: string | null,
+    extra?: Array<Record<string, unknown>> | null,
+    forwardKwargs?: Record<string, unknown> | null,
+) =>
     request<{ shape: number[]; dtype?: string }>(`/api/projects/${projectId}/ir/input_spec`, {
         method: "PUT",
-        body: JSON.stringify(dtype ? { shape, dtype } : { shape }),
+        body: JSON.stringify({
+            shape,
+            ...(dtype ? { dtype } : {}),
+            ...(extra !== undefined && extra !== null ? { extra } : {}),
+            ...(forwardKwargs !== undefined && forwardKwargs !== null ? { forward_kwargs: forwardKwargs } : {}),
+        }),
+    });
+
+/** 修正入口类构造参数（补形状/验证要实例化入口类，参数来自运行期配置时 agent 给不出）；
+ *  写回后 ir_hash 变化 → 旧验证变 stale。传空对象 = 清除。 */
+export const putIrEntryArgs = (projectId: string, entryArgs: Record<string, unknown>) =>
+    request<Record<string, unknown>>(`/api/projects/${projectId}/ir/entry_args`, {
+        method: "PUT",
+        body: JSON.stringify({ entry_args: entryArgs }),
     });
 
 // ---------------------------------------------------------------------------

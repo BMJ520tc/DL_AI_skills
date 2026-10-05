@@ -24,6 +24,7 @@ import {
     postRegenerate,
     postTrace,
     postVerifyDecompose,
+    putIrEntryArgs,
     putIrInputSpec,
     putNodeParams,
     type IrNode,
@@ -34,6 +35,7 @@ import {
     type Task,
     type Verification,
 } from "../api/client";
+import { enableLongPaths, fetchLongPathStatus } from "../api/systemClient";
 import CodeViewer from "../components/CodeViewer";
 import DiagramView from "../components/DiagramView";
 import { useTaskPolling } from "../hooks/useTaskPolling";
@@ -414,6 +416,22 @@ function asStringList(value: unknown): string[] {
     return Array.isArray(value) ? value.map(v => String(v)) : [];
 }
 
+/** 任务进度（DB 里的 JSON 文本）→ 一行可读文案；无 stage/activity 时退回原文（其余任务类型不受影响）。 */
+function formatTaskProgress(raw?: string | null): string {
+    if (!raw) return "";
+    try {
+        const p = JSON.parse(raw) as Record<string, unknown>;
+        if (p && typeof p === "object") {
+            const parts = [p.stage, p.activity, p.failure_reason, p.reason]
+                .filter(v => typeof v === "string" && v).map(v => String(v));
+            if (parts.length) return Array.from(new Set(parts)).join(" · ");
+        }
+    } catch {
+        /* 非 JSON 进度：按原文显示 */
+    }
+    return raw;
+}
+
 /** 折叠小节（报告只读展示用；默认展开，长清单可收起）。 */
 function ReportSection({
     title,
@@ -549,7 +567,10 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
     // 模块一：独立环境（建/重建）+ 最小可运行命令验证（run_record）
     const [envStatus, setEnvStatus] = useState<string | null>(null);
     const [envTaskId, setEnvTaskId] = useState<string | null>(null);
+    const [envStage, setEnvStage] = useState<string>("");
     const [envError, setEnvError] = useState<string | null>(null);
+    const [enablingLongPaths, setEnablingLongPaths] = useState(false);
+    const [longPathsEnabled, setLongPathsEnabled] = useState<boolean | null>(null);
     // 安装依赖前的知识库冲突预检（模块详细设计 8.2）：env_create 任务进度里的 env_precheck（③ 界面可见）
     const [envPrecheck, setEnvPrecheck] = useState<{ count: number; items: Array<{ title?: string; content?: string }> } | null>(null);
     const [smokeRuns, setSmokeRuns] = useState<RunRecord[]>([]);
@@ -558,6 +579,12 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
     const [specDtype, setSpecDtype] = useState("");
     const [specError, setSpecError] = useState<string | null>(null);
     const [savingSpec, setSavingSpec] = useState(false);
+    const [specExtra, setSpecExtra] = useState("");   // 多输入模型的额外入参（JSON 数组）
+    const [specFwdKwargs, setSpecFwdKwargs] = useState("");   // forward 关键字参数（JSON 对象）
+    // 入口类构造参数补参（补形状/验证要实例化入口类；参数来自运行期配置时 agent 给不出）
+    const [entryArgsDraft, setEntryArgsDraft] = useState("");
+    const [entryArgsError, setEntryArgsError] = useState<string | null>(null);
+    const [savingEntryArgs, setSavingEntryArgs] = useState(false);
 
     // 同步重入保护：点击即写 ref（同一 tick 内后续点击被拦截），state 同步驱动按钮 disabled
     const [busy, setBusy] = useState<Set<string>>(() => new Set());
@@ -620,6 +647,11 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
             await refreshEnvStatus();
             await refreshSmokeRuns();
             try {
+                setLongPathsEnabled((await fetchLongPathStatus()).enabled);
+            } catch {
+                setLongPathsEnabled(null);   // 查不到就不提示（不误报）
+            }
+            try {
                 setIrResp(await getIr(projectId));
             } catch (e) {
                 if (e instanceof ApiError && e.status === 404) setIrResp(null);
@@ -666,6 +698,8 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
     useTaskPolling({
         taskId: envTaskId,
         onProgress: t => {
+            // 建环境可能耗时数分钟：progress 里有 stage（清理/建 venv/第几次装依赖），透出到界面
+            setEnvStage(formatTaskProgress(t.progress));
             // 安装依赖前的冲突预检结论（8.2）在任务进度里，透出到界面（③）
             if (!t.progress) return;
             try {
@@ -677,12 +711,14 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
         },
         onDone: async () => {
             setEnvTaskId(null);
+            setEnvStage("");
             setEnvError(null);
             await refreshEnvStatus();
             setFlash("独立环境已就绪（可重跑最小命令验证或补形状）");
         },
         onError: async message => {
             setEnvTaskId(null);
+            setEnvStage("");
             setEnvError(message);
             await refreshEnvStatus();
         },
@@ -790,6 +826,7 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
     const handleCreateEnv = () => {
         if (envTaskId) return;
         setEnvError(null);
+        setEnvStage("排队中…");
         setEnvPrecheck(null);
         setBanner(null);
         void (async () => {
@@ -798,6 +835,25 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                 setEnvTaskId(task_id);
             } catch (e) {
                 setEnvError(e instanceof Error ? e.message : String(e));
+            }
+        })();
+    };
+
+    /** 开启 Windows 长路径支持（装深层依赖 >260 字符会失败；后端经 UAC 提权写注册表）。 */
+    const handleEnableLongPaths = () => {
+        if (enablingLongPaths) return;
+        setEnablingLongPaths(true);
+        void (async () => {
+            try {
+                const r = await enableLongPaths();
+                setFlash(r.detail);
+                setLongPathsEnabled(r.enabled);
+                if (r.ok) setEnvError(null);
+                else setEnvError(`开启长路径支持未完成：${r.detail}`);
+            } catch (e) {
+                setEnvError(e instanceof Error ? e.message : String(e));
+            } finally {
+                setEnablingLongPaths(false);
             }
         })();
     };
@@ -832,16 +888,77 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
             setSpecError(error);
             return;
         }
+        // 额外入参（多输入模型）：留空 = 清除；非空须为 JSON 数组
+        const rawExtra = specExtra.trim();
+        let extra: Array<Record<string, unknown>> = [];
+        if (rawExtra) {
+            try {
+                const parsed = JSON.parse(rawExtra);
+                if (!Array.isArray(parsed)) {
+                    setSpecError("额外入参需为 JSON 数组，如 [{\"shape\":[1,1200],\"dtype\":\"float32\"}]；留空 = 清除");
+                    return;
+                }
+                extra = parsed as Array<Record<string, unknown>>;
+            } catch {
+                setSpecError("额外入参不是合法 JSON；留空 = 清除");
+                return;
+            }
+        }
+        // forward 关键字参数（分支开关）：留空 = 清除；非空须为 JSON 对象
+        const rawFkw = specFwdKwargs.trim();
+        let fkw: Record<string, unknown> = {};
+        if (rawFkw) {
+            try {
+                const parsed = JSON.parse(rawFkw);
+                if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+                    setSpecError("forward 关键字参数需为 JSON 对象，如 {\"CLS\":true,\"MVC\":true}；留空 = 清除");
+                    return;
+                }
+                fkw = parsed as Record<string, unknown>;
+            } catch {
+                setSpecError("forward 关键字参数不是合法 JSON；留空 = 清除");
+                return;
+            }
+        }
         setSpecError(null);
         setSavingSpec(true);
         try {
-            await putIrInputSpec(projectId, shape, specDtype.trim() || null);
+            await putIrInputSpec(projectId, shape, specDtype.trim() || null, extra, fkw);
             await refreshIr();
             setFlash("输入规格已保存；IR 已变化，旧验证变 stale，入库前需重新验证");
         } catch (e) {
             setBanner(e instanceof Error ? e.message : String(e));
         } finally {
             setSavingSpec(false);
+        }
+    };
+
+    /** 保存入口类构造参数（JSON 对象）；留空 = 清除。 */
+    const handleSaveEntryArgs = async () => {
+        const raw = entryArgsDraft.trim();
+        let parsed: unknown = {};
+        if (raw) {
+            try {
+                parsed = JSON.parse(raw);
+            } catch {
+                setEntryArgsError("不是合法 JSON，如 {\"ntoken\":1000,\"d_model\":64}");
+                return;
+            }
+            if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+                setEntryArgsError("需为 JSON 对象（键为构造参数名）");
+                return;
+            }
+        }
+        setEntryArgsError(null);
+        setSavingEntryArgs(true);
+        try {
+            await putIrEntryArgs(projectId, parsed as Record<string, unknown>);
+            await refreshIr();
+            setFlash("入口构造参数已保存；IR 已变化，旧验证变 stale，需重新补形状与验证");
+        } catch (e) {
+            setBanner(e instanceof Error ? e.message : String(e));
+        } finally {
+            setSavingEntryArgs(false);
         }
     };
 
@@ -1100,6 +1217,17 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                             <span style={{ fontSize: 11, color: "#94a3b8" }}>
                                 独立环境：
                                 <b style={{ color: envTone(envStatus).color, marginLeft: 4 }}>{envLabel(envStatus)}</b>
+                                {envTaskId && envStage ? (
+                                    <span style={{ color: "#7dd3fc", marginLeft: 8 }}>· {envStage}</span>
+                                ) : null}
+                                {longPathsEnabled === false ? (
+                                    <span style={{ color: "#fcd34d", marginLeft: 8 }}>
+                                        · ⚠ 未开启 Windows 长路径支持，装深层依赖（&gt;260 字符）会失败
+                                        <button style={{ ...btnStyle, marginLeft: 6 }} onClick={handleEnableLongPaths} disabled={enablingLongPaths}>
+                                            {enablingLongPaths ? "等待授权…" : "开启长路径支持（需管理员）"}
+                                        </button>
+                                    </span>
+                                ) : null}
                             </span>
                             <button style={btnStyle} onClick={handleCreateEnv} disabled={!!envTaskId || busy.has("smoke")}>
                                 {envTaskId ? "创建中…" : envStatus === "env_ready" ? "重建独立环境" : "建独立环境"}
@@ -1121,6 +1249,11 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                         {envError && (
                             <div style={{ ...infoBanner, background: "#3f1d1d", borderColor: "#b91c1c", color: "#fecaca" }}>
                                 环境创建失败：{envError}
+                                {envError.includes("长路径") ? (
+                                    <button style={{ ...btnStyle, marginLeft: 10 }} onClick={handleEnableLongPaths} disabled={enablingLongPaths}>
+                                        {enablingLongPaths ? "等待授权…" : "开启长路径支持（需管理员）"}
+                                    </button>
+                                ) : null}
                                 <button style={{ ...btnStyle, marginLeft: 10 }} onClick={() => setEnvError(null)}>关闭</button>
                             </div>
                         )}
@@ -1166,7 +1299,7 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                     {task && taskInfo && (
                         <div style={{ ...infoBanner, background: "#1e293b", borderColor: "#334155" }}>
                             任务 {taskInfo.task_type}：{taskInfo.status}
-                            {taskInfo.progress ? ` · ${taskInfo.progress}` : ""}
+                            {taskInfo.progress ? ` · ${formatTaskProgress(taskInfo.progress)}` : ""}
                         </div>
                     )}
                     {task && !taskInfo && <div style={infoBanner}>任务排队中…</div>}
@@ -1311,12 +1444,51 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                                                 onChange={e => setSpecDtype(e.target.value)}
                                             />
                                         </div>
+                                        <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>
+                                            额外入参（多输入模型，如 <code>forward(src, values, mask)</code>；留空 = 清除）
+                                        </div>
+                                        <input
+                                            style={{ ...inputStyle, width: "100%", fontFamily: "monospace", marginBottom: 6 }}
+                                            placeholder='JSON 数组，如 [{"shape":[1,1200],"dtype":"float32"},{"shape":[1,1200],"dtype":"bool"}]'
+                                            value={specExtra}
+                                            onChange={e => setSpecExtra(e.target.value)}
+                                        />
+                                        <div style={{ fontSize: 11, color: "#94a3b8", marginBottom: 4 }}>
+                                            forward 关键字参数（分支开关，如 <code>{'{"CLS":true,"MVC":true}'}</code>；留空 = 清除）
+                                        </div>
+                                        <input
+                                            style={{ ...inputStyle, width: "100%", fontFamily: "monospace", marginBottom: 6 }}
+                                            placeholder='{"CLS":true,"MVC":true,"ECS":true}'
+                                            value={specFwdKwargs}
+                                            onChange={e => setSpecFwdKwargs(e.target.value)}
+                                        />
                                         {specError && <div style={{ color: "#fca5a5", fontSize: 11, marginBottom: 6 }}>{specError}</div>}
                                         <button style={{ ...btnStyle, width: "100%" }} disabled={savingSpec} onClick={() => void handleSaveInputSpec()}>
                                             {savingSpec ? "保存中…" : "保存输入规格（旧验证将变 stale）"}
                                         </button>
                                         <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
                                             shape 需为正整数数组；写回后旧验证失效，入库前需重新走「⑤ 两步验证」。
+                                        </div>
+                                    </div>
+                                )}
+                                {ir && (
+                                    <div style={{ border: "1px solid #1f2937", borderRadius: 8, padding: "8px 10px", marginBottom: 12 }}>
+                                        <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4 }}>入口构造参数（entry_args）</div>
+                                        <div style={{ fontSize: 11, color: "#94a3b8", fontFamily: "monospace", marginBottom: 6 }}>
+                                            当前：{ir.entry_args && Object.keys(ir.entry_args).length ? JSON.stringify(ir.entry_args) : "（未设置）"}
+                                        </div>
+                                        <input
+                                            style={{ ...inputStyle, width: "100%", fontFamily: "monospace", marginBottom: 6 }}
+                                            placeholder='JSON 对象，如 {"ntoken":1000,"d_model":64,"nhead":8,"d_hid":64,"nlayers":2,"vocab":{"<pad>":0}}'
+                                            value={entryArgsDraft}
+                                            onChange={e => setEntryArgsDraft(e.target.value)}
+                                        />
+                                        {entryArgsError && <div style={{ color: "#fca5a5", fontSize: 11, marginBottom: 6 }}>{entryArgsError}</div>}
+                                        <button style={{ ...btnStyle, width: "100%" }} disabled={savingEntryArgs} onClick={() => void handleSaveEntryArgs()}>
+                                            {savingEntryArgs ? "保存中…" : "保存入口构造参数（旧验证将变 stale；留空 = 清除）"}
+                                        </button>
+                                        <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>
+                                            补形状/验证要**实例化入口类**；当构造参数来自运行期配置或数据（如 scGPT 的 <code>vocab</code>）时，脚本猜不到，需在此给出最小可构造参数。
                                         </div>
                                     </div>
                                 )}

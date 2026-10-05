@@ -12,7 +12,10 @@ from pathlib import Path
 
 import torch
 
-from _model_loader import instantiate, load_entry_class
+from _model_loader import (
+    accepted_kwargs, accepted_positional, call_kwargs, first_tensor, _shape_of, instantiate,
+    load_entry_class, make_dummy_input, make_extra_inputs, prepare_torch,
+)
 
 _NUM_DIFF_LIMIT = 10  # 数值失败定位的差异层上报上限
 
@@ -100,7 +103,7 @@ def _compare_structure(orig, regen, output_shape_match: bool) -> dict:
     }
 
 
-def _run_capture(model, x):
+def _run_capture(model, inputs, kwargs: dict | None = None):
     """前向并捕获各子模块输出（named_modules 顺序的 (path, 张量) 列表）。
 
     用位置列表而非路径字典：两模型的子模块命名不同（原模型 layer1.0.conv1 vs 再生成
@@ -110,15 +113,17 @@ def _run_capture(model, x):
 
     def _hook(path):
         def _fn(_module, _args, output):
-            if isinstance(output, torch.Tensor):
-                captured.append((path, output.detach()))
+            # dict/tuple 输出取第一个张量；NestedTensor（MHA 快速路径）不支持 .shape → 跳过
+            t = first_tensor(output)
+            if t is not None and _shape_of(t) is not None:
+                captured.append((path, t.detach()))
 
         return _fn
 
     handles = [sub.register_forward_hook(_hook(path)) for path, sub in model.named_modules()]
     try:
         with torch.no_grad():
-            y = model(x)
+            y = model(*inputs, **(kwargs or {}))
     finally:
         for h in handles:
             h.remove()
@@ -163,6 +168,7 @@ def main() -> None:
     seeds = [int(s) for s in sys.argv[5].split(",") if s.strip()]
     rtol, atol = float(sys.argv[6]), float(sys.argv[7])
 
+    prepare_torch()
     ir = json.loads(Path(ir_path).read_text(encoding="utf-8"))
     cls = load_entry_class(source_dir, ir["source_file"], ir["entry_class"])
     spec = ir.get("input_spec") or {}
@@ -173,7 +179,7 @@ def main() -> None:
         sys.exit(3)
     dtype = getattr(torch, str(spec.get("dtype") or "float32"), torch.float32)
 
-    orig = instantiate(cls).eval()
+    orig = instantiate(cls, ir.get("entry_args")).eval()
     regen = getattr(_load_generated(Path(regen_path)), f"Decomp_{ir['root_id']}")().eval()
 
     # 权重同源（实施约定 6.6-3）：两模型各自随机初始化，直接比对必然不等。按结构比对
@@ -190,11 +196,16 @@ def main() -> None:
     forward_error: str | None = None
     yo = yr = None
     torch.manual_seed(seeds[0])
-    x0 = torch.randn(*shape, dtype=dtype)
+    fkw = call_kwargs(spec)          # forward 关键字参数（如 CLS/MVC 分支开关）
+    fkw_o = accepted_kwargs(orig.forward, fkw)    # 原模型按开关跑对应分支
+    fkw_g = accepted_kwargs(regen.forward, fkw)   # 再生成模型的 forward 是 IR 生成的，未必有这些开关
+    x0 = (make_dummy_input(shape, dtype), *make_extra_inputs(spec))
+    x0_o = accepted_positional(orig.forward, x0)    # 原模型可能消费多输入（src/values/mask）
+    x0_g = accepted_positional(regen.forward, x0)   # 再生成模型只声明它消费的输入
     try:
         with torch.no_grad():
-            yo = orig(x0)
-            yr = regen(x0)
+            yo = first_tensor(orig(*x0_o, **fkw_o))   # dict/tuple 输出取首个张量（如 scGPT 返回 Mapping）
+            yr = first_tensor(regen(*x0_g, **fkw_g))
     except Exception as e:  # noqa: BLE001
         forward_error = f"{type(e).__name__}: {e}"
     output_shape_match = yo is not None and yr is not None and list(yo.shape) == list(yr.shape)
@@ -209,17 +220,18 @@ def main() -> None:
         if forward_error:
             break
         torch.manual_seed(seed)
-        x = torch.randn(*shape, dtype=dtype)
+        x = (make_dummy_input(shape, dtype), *make_extra_inputs(spec))
         if seed == seeds[0]:
             y_ref, y_test = yo, yr
         else:
-            y_ref, y_test = _run_capture(orig, x)[0], _run_capture(regen, x)[0]
+            y_ref = first_tensor(_run_capture(orig, accepted_positional(orig.forward, x), fkw_o)[0])
+            y_test = first_tensor(_run_capture(regen, accepted_positional(regen.forward, x), fkw_g)[0])
         rel_max, abs_max = _max_errors(y_ref, y_test)
         passed = _numeric_pass(rel_max, abs_max, rtol, atol)
         record = {"seed": seed, "max_rel_err": rel_max, "max_abs_err": abs_max, "passed": passed}
         if not passed:
-            _y, ref_cap = _run_capture(orig, x)
-            _y2, test_cap = _run_capture(regen, x)
+            _y, ref_cap = _run_capture(orig, x, fkw)
+            _y2, test_cap = _run_capture(regen, x, fkw)
             record["diff_layers"] = _diff_paths(ref_cap, test_cap, rtol, atol)
             if first_fail is None:
                 first_fail = record

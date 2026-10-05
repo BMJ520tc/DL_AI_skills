@@ -178,11 +178,35 @@ def regenerate(project_id: str) -> str:
     return ir_codegen.generate(ir)
 
 
-def update_input_spec(project_id: str, shape: list, dtype: Optional[str] = None) -> dict:
+def _clean_extra_inputs(extra: list) -> list:
+    """校验并规范化 `input_spec.extra`（多输入模型的额外入参）：`[{shape, dtype?}, …]`。"""
+    if not isinstance(extra, list):
+        raise ValueError("extra 必须是数组（每个元素形如 {shape, dtype}）")
+    cleaned: list[dict] = []
+    for i, e in enumerate(extra):
+        if not isinstance(e, dict):
+            raise ValueError(f"extra[{i}] 必须是对象，如 {{\"shape\":[1,1200],\"dtype\":\"float32\"}}")
+        eshape = e.get("shape")
+        if not isinstance(eshape, list) or not eshape or not all(isinstance(d, int) and d > 0 for d in eshape):
+            raise ValueError(f"extra[{i}].shape 必须是非空正整数数组")
+        item: dict = {"shape": list(eshape)}
+        if e.get("dtype"):
+            item["dtype"] = str(e["dtype"])
+        cleaned.append(item)
+    return cleaned
+
+
+def update_input_spec(project_id: str, shape: list, dtype: Optional[str] = None,
+                      extra: Optional[list] = None,
+                      forward_kwargs: Optional[dict] = None) -> dict:
     """修正入口输入规格（6.1/6.2）：agent 对「尺寸由运行期构造参数决定」的模型给不出具体维度时，
     由用户/工具补上；写回后 ir_hash 变化 → 旧验证变 stale（与调参同口径）。
 
     shape 必须是非空正整数数组（不允许 null 维度：无法据此构造输入）。
+    `extra` 是**多输入模型**的补充入参（如 scGPT 的 forward(src, values, src_key_padding_mask)）：
+    按序追加在主输入之后；传 `[]` 表示清除，传 None 表示不改。
+    `forward_kwargs` 是传给 **forward 的关键字参数**（如 scGPT 的 `CLS/MVC/ECS` 开关）：
+    默认关着的分支不执行 → hook 抓不到形状；打开开关即可让那些节点被捕获。传 {} 清除。
     """
     project = _require_original(project_id)
     ir = _read_ir(project)
@@ -192,11 +216,53 @@ def update_input_spec(project_id: str, shape: list, dtype: Optional[str] = None)
         raise ValueError("shape 必须是非空正整数数组（如 [1, 64]），不接受 null/非正数维度")
     spec = dict(ir.get("input_spec") or {})
     spec["shape"] = shape
+    spec["user_edited"] = True       # 标记：重拆解时这版 shape/dtype 优先于 agent 的新值
     if dtype:
         spec["dtype"] = dtype
+    if extra is not None:
+        cleaned = _clean_extra_inputs(extra)
+        if cleaned:
+            spec["extra"] = cleaned
+        else:
+            spec.pop("extra", None)          # 传空数组 = 清除
+    if forward_kwargs is not None:
+        if not isinstance(forward_kwargs, dict):
+            raise ValueError("forward_kwargs 必须是 JSON 对象（键为 forward 的形参名）")
+        bad = [k for k in forward_kwargs if not isinstance(k, str) or not k.isidentifier()]
+        if bad:
+            raise ValueError(f"forward_kwargs 的键必须是合法标识符：{bad}")
+        if forward_kwargs:
+            spec["forward_kwargs"] = forward_kwargs
+        else:
+            spec.pop("forward_kwargs", None)  # 传空对象 = 清除
     ir["input_spec"] = spec
     _write_ir(project, ir)
     return spec
+
+
+def update_entry_args(project_id: str, entry_args: dict) -> dict:
+    """修正入口类构造参数（agent 给不出、模型需要外部数据时的补参通道）。
+
+    形状追踪/两步验证都要实例化入口类；像 scGPT 的 `TransformerModel(ntoken, d_model, nhead,
+    d_hid, nlayers, vocab=…)` 参数来自运行期配置与数据，脚本猜不到（`_model_loader` 的固定
+    猜测列表必然失败）——由用户在这里给出最小可构造的 args（如 `{"ntoken":1000,...,
+    "vocab":{"<pad>":0}}`），trace/verify 会优先用它实例化。写回后 ir_hash 变化 → 旧验证 stale。
+    """
+    project = _require_original(project_id)
+    ir = _read_ir(project)
+    if ir is None:
+        raise LookupError("ir not found：请先 POST /api/projects/{id}/decompose")
+    if not isinstance(entry_args, dict):
+        raise ValueError("entry_args 必须是一个 JSON 对象（键为构造参数名）")
+    for k in entry_args:
+        if not isinstance(k, str) or not k.isidentifier():
+            raise ValueError(f"构造参数名必须是合法标识符：{k!r}")
+    if entry_args:
+        ir["entry_args"] = entry_args
+    else:
+        ir.pop("entry_args", None)          # 传空对象 = 清除
+    _write_ir(project, ir)
+    return entry_args
 
 
 def update_node_params(project_id: str, node_id: str, params: dict) -> dict:
@@ -214,6 +280,64 @@ def update_node_params(project_id: str, node_id: str, params: dict) -> dict:
 
 
 # --------------------------- 6.1 拆解 ---------------------------
+
+# few-shot：一份**完整且合法**的最小 IR（module + leaf + op + 边 + input_spec/root_id 齐备）。
+# 只给「片段」时模型常写出漏边/缺必填参数/op 无入边的结构，触发 IR 校验或再生成自检失败 →
+# 整轮重试（真库实测重试是主要时间乘数）。给一份可照抄的完整样例以降低失败率。
+# 该样例在用例中被 validate_ir + ir_codegen.generate 校验，防止示例本身失效。
+_IR_EXAMPLE: dict = {
+    "source_file": "model.py",
+    "entry_class": "Net",
+    "task_type": "classification",
+    "input_spec": {"shape": [1, 3, 32, 32], "dtype": "float32"},
+    "root_id": "net",
+    "nodes": [
+        {"id": "net", "kind": "module", "class_name": "Net", "parent_id": None, "module_path": ""},
+        {"id": "conv1", "kind": "leaf", "class_name": "nn.Conv2d", "parent_id": "net",
+         "module_path": "conv1",
+         "params": {"in_channels": 3, "out_channels": 16, "kernel_size": 3, "padding": 1},
+         "input_shape": [1, 3, 32, 32], "output_shape": [1, 16, 32, 32]},
+        {"id": "relu1", "kind": "leaf", "class_name": "nn.ReLU", "parent_id": "net",
+         "module_path": "relu1"},
+        {"id": "flatten", "kind": "op", "class_name": "flatten", "parent_id": "net"},
+        {"id": "fc", "kind": "leaf", "class_name": "nn.Linear", "parent_id": "net",
+         "module_path": "fc", "params": {"in_features": 16, "out_features": 10}},
+    ],
+    "edges": [
+        {"from": "conv1", "to": "relu1"},
+        {"from": "relu1", "to": "flatten"},
+        {"from": "flatten", "to": "fc"},
+    ],
+}
+
+
+# 重拆解时要带过去的**用户补参**字段：这些 agent 从不产出，只可能由用户经
+# PUT /ir/entry_args 与 PUT /ir/input_spec 补上；不带走的话，用户补完再点一次「拆解」
+# 就静默清空（2026-10-05 scGPT 实测：重拆解后 entry_args 丢失 → 补形状直接失败）。
+_CARRY_SPEC_KEYS = ("extra", "forward_kwargs")
+
+
+def _carry_over_user_specs(prev_ir: Optional[dict], ir: dict) -> None:
+    """把上一版 IR 里的**用户补参**带进新 IR（重拆解不该让用户白填一次）。"""
+    if not prev_ir:
+        return
+    if prev_ir.get("entry_args") and not ir.get("entry_args"):
+        ir["entry_args"] = prev_ir["entry_args"]
+    prev_spec = prev_ir.get("input_spec") or {}
+    spec = dict(ir.get("input_spec") or {})
+    for key in _CARRY_SPEC_KEYS:
+        if prev_spec.get(key) and not spec.get(key):
+            spec[key] = prev_spec[key]
+    if prev_spec.get("user_edited"):
+        # 用户改过的 shape/dtype 优先于 agent 的新值（agent 每次产出的维度可能不同）
+        if prev_spec.get("shape"):
+            spec["shape"] = prev_spec["shape"]
+        if prev_spec.get("dtype"):
+            spec["dtype"] = prev_spec["dtype"]
+        spec["user_edited"] = True
+    if spec:
+        ir["input_spec"] = spec
+
 
 def _decompose_prompt(hierarchy: list[dict], entry_class: str | None = None) -> str:
     roots = [h for h in hierarchy if h.get("parent") == "Module"]
@@ -247,15 +371,27 @@ def _decompose_prompt(hierarchy: list[dict], entry_class: str | None = None) -> 
         "nn.ReLU、nn.Dropout 等）。params 为该层构造参数（PyTorch 构造器关键字，如 "
         '{"in_channels":64,"out_channels":128,"kernel_size":3}），必须从源码读出真实值，不要臆造；'
         "读不出就留空并置 uncertain=true（后续可人工补参数）。\n"
+        "   叶子白名单：nn.Linear/Conv1d~3d/ConvTranspose*/BatchNorm*/LayerNorm/GroupNorm/Embedding/"
+        "MaxPool*/AvgPool*/Adaptive*Pool*/Upsample/ReLU 系/Sigmoid/Tanh/Softmax/Dropout*/Flatten/Identity。\n"
+        "   **白名单外的 nn.* 类**（如 nn.TransformerEncoder、nn.MultiheadAttention、nn.TransformerEncoderLayer）："
+        "优先继续展开为子模块；若整体当一层用，**必须给 code_hint 完整构造表达式、不要用 {params} 占位符**"
+        "（如 \"code_hint\": \"nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=512, nhead=8), num_layers=6)\"），"
+        "否则该节点会被拒绝。\n"
         "5. nn.Sequential 为 kind=container、class_name=\"nn.Sequential\"，其成员按顺序作为子节点。"
         "nn.ModuleList 展开为父模块的直接子节点（不建 container）。\n"
         "6. forward 中的函数式操作建 kind=op 节点：class_name 用小写名（白名单: add/sub/mul/div/"
         "matmul/bmm/cat/relu/sigmoid/tanh/softmax/flatten/mean/max/min/sum/view/reshape/permute）；"
         "白名单外的操作填 code_hint 内联表达式模板，输入变量用 {inputs} 占位。op 是叶子（无子节点）；"
         "op 可有多条入边（如残差相加），非 op 节点最多 1 条入边。\n"
+        "   **占位符规则**：多入边时 `{inputs}` 展开成「a, b, c」逗号串（适合 `torch.add({inputs})`、"
+        "`f({inputs})` 这种整体传参）；要**单独取某一个操作数**必须写 `{inputs[N]}`"
+        "（如 `{inputs[0]} / {inputs[1]}`、`dict(pred={inputs[0]}, aux={inputs[1]})`），"
+        "**不要**写 `{inputs}[0]`——那会展开成「a, b, c[0]」而语法错误。\n"
         "7. 数据流用 edges 表达（from/to 为节点 id）。同层节点按 forward 执行顺序连边；残差/跳跃连接"
         "直接连到汇合 op（如 add）。Sequential 内部成员之间不连边（顺序由声明序决定），Sequential 整体"
         "与外部节点的边连在 container 节点上。\n"
+        "   **每个 module 节点的直接子节点必须只有一个汇点（唯一输出）**；若 forward 有多个输出分支"
+        "（多个汇总点），必须用一个 op 节点（如 cat/add）把它们汇合为该模块的唯一输出，再连到该模块之外。\n"
         "8. 节点 id 全局唯一，须为合法 Python 标识符（[A-Za-z_][A-Za-z0-9_]*，不能含点/连字符）；"
         "建议直接用源码中的属性名（如 conv1、bn1、layer1），重名时加前缀区分。\n"
         "9. module_path 填该实例在 named_modules() 中的完整路径（如 layer1.0.conv1、downsample.0），"
@@ -263,19 +399,66 @@ def _decompose_prompt(hierarchy: list[dict], entry_class: str | None = None) -> 
         "10. input_shape/output_shape 能静态推出就填数组（元素为整数），推不出填 null。拿不准的节点置 uncertain=true。\n"
         "11. 输出必须是单层 JSON 对象（不要用 {\"ir\":...} 包裹），顶层键：source_file、entry_class、"
         "task_type、input_spec、root_id、nodes、edges。\n"
-        '示例（片段）：{"root_id":"net","nodes":[{"id":"net","kind":"module","class_name":"Net",'
-        '"parent_id":null,"module_path":""},{"id":"conv1","kind":"leaf","class_name":"nn.Conv2d",'
-        '"parent_id":"net","module_path":"conv1","params":{"in_channels":3,"out_channels":16,"kernel_size":3}},'
-        '{"id":"skip_add","kind":"op","class_name":"add","parent_id":"net"}],'
-        '"edges":[{"from":"conv1","to":"skip_add"}]}'
+        "【完整示例（照此结构与粒度产出；数值须换成你读到的真实值）】\n"
+        f"{json.dumps(_IR_EXAMPLE, ensure_ascii=False)}"
     )
     return "".join(parts)
+
+
+def _attempt_stage(attempt: int, total: int, last_reason: str) -> str:
+    """重试循环的阶段文案（任务进度 banner 显示）。"""
+    if attempt <= 1:
+        return f"拆解中（第 1/{total} 次尝试）：读取源码并生成 IR…"
+    tail = (last_reason or "").strip().replace("\n", " ")
+    return f"第 {attempt}/{total} 次尝试：按上次失败原因修正中…（上次：{tail[:100]}）"
+
+
+def _attempt_prompt(base: str, last_reason: str, prev_session: Optional[str], attempt: int):
+    """返回 (prompt, resume)。
+
+    第 2 次起：**能续接就只发修正指令**（`resume=prev_session`），复用上一次已读进上下文的源码，
+    不再整轮重读 → 直接砍掉重试的重复开销；不能续接（首轮无 session / 续接已失效）时退回完整 prompt。
+    """
+    if attempt <= 1:
+        return base, None
+    reason = (last_reason or "").strip()
+    if prev_session:
+        msg = ("【上一次尝试未通过，请据此修正后，重新输出完整、合法的 IR JSON】\n"
+               f"修正要点：{reason}\n"
+               "**必须用 Write 工具把完整的 IR JSON 一次性写入下方系统指令给出的结果文件路径**"
+               "（不要只在回复里说明；忽略上一次尝试用过的旧路径）；可先再读文件确认。")
+        return msg, prev_session
+    return base + f"\n\n【上一次尝试未通过，请据此修正】{reason}", None
+
+
+def _progress_reporter(task_id: str):
+    """返回 (set_stage, on_event)：把拆解的阶段与工具调用写进任务进度（进度打点）。
+
+    `task_manager.update_progress` 是**整体覆盖**，故 on_event 每次都带上当前 stage，
+    避免滚动 activity 时把 stage 冲掉。
+    """
+    state = {"stage": "拆解中…"}
+
+    def set_stage(text: str) -> None:
+        state["stage"] = text
+        task_manager.update_progress(task_id, {"stage": text})
+
+    def on_event(kind: str, data: dict) -> None:
+        if kind != "tool":
+            return
+        name = (data or {}).get("name") or ""
+        if name:
+            task_manager.update_progress(task_id, {"stage": state["stage"],
+                                                   "activity": f"调用工具 {name}"})
+
+    return set_stage, on_event
 
 
 async def _run_decompose(params: dict, task_id: str) -> None:
     project_id = params["project_id"]
     project = _require_original(project_id)
     ws = _ws(project)
+    prev_ir = _read_ir(project)          # 重拆解前先留一份：用户的补参要带过去（见 _carry_over_user_specs）
     source = ws / "source"
     report_path = ws / "reports" / "structure_report.json"
     if not report_path.exists():
@@ -297,6 +480,8 @@ async def _run_decompose(params: dict, task_id: str) -> None:
     deadline = time.monotonic() + DECOMPOSE_AGENT_BUDGET_S
     ir: Optional[dict] = None
     last_reason = "agent 未产出有效 IR 结构（structured_output 缺失）"
+    prev_session: Optional[str] = None   # 上一次尝试的 agent 会话 id（重试时续接复用已读上下文）
+    set_stage, on_event = _progress_reporter(task_id)
 
     def _record_fail(reason: str, bad_ir: Optional[dict] = None) -> None:
         """失败也要留 run_record（架构九.4：失败可检索供 agent 改进）。"""
@@ -317,24 +502,45 @@ async def _run_decompose(params: dict, task_id: str) -> None:
                 f"agent 连续 {attempt - 1} 次未产出可用 IR，重试预算（{DECOMPOSE_AGENT_BUDGET_S}s）已用尽"
             )
             break
-        # 重试时把上一次的失败原因回喂，否则同样的 prompt 只会得到同样的结果
-        ask = prompt if attempt == 1 else prompt + f"\n\n【上一次尝试未通过，请据此修正】{last_reason}"
-        try:
-            result = await agent_service.run_sync(
+        set_stage(_attempt_stage(attempt, DECOMPOSE_AGENT_RETRIES, last_reason))
+        # 重试时把上一次的失败原因回喂（能续接则只发修正指令，复用上一轮已读的源码上下文）
+        ask, resume = _attempt_prompt(prompt, last_reason, prev_session, attempt)
+
+        async def _one_run(ask: str, resume_: Optional[str]) -> dict:
+            return await agent_service.run_sync(
                 ask,
                 cwd=str(source),
                 output_schema=ir_schema.IR_SCHEMA,
                 max_turns=60,
-                timeout_s=int(min(DECOMPOSE_AGENT_TIMEOUT_S, budget)),
+                timeout_s=int(min(DECOMPOSE_AGENT_TIMEOUT_S, max(30, budget))),
+                resume=resume_,
+                on_event=on_event,
             )
+
+        try:
+            try:
+                result = await _one_run(ask, resume)
+            except Exception as exc:  # noqa: BLE001
+                if resume and agent_service.is_stale_session_error(exc):
+                    # 续接目标已失效 → 退回完整 prompt 重跑一次（不带续接）
+                    result = await _one_run(prompt, None)
+                else:
+                    raise
+            if resume and _as_ir(result.get("structured_output")) is None:
+                # 续接后**没写出结果文件**（模型只回了文字 / 写去了旧路径）→ 用完整 prompt 立刻重跑，
+                # 不占用一次重试名额、也不静默失败（2026-10-05 实测踩过：续接那轮 2s 空手而归）
+                result = await _one_run(prompt, None)
         except Exception as e:  # noqa: BLE001 —— agent 失败记 run_record 供检索（先例 4.3）
             _record_fail(f"第 {attempt}/{DECOMPOSE_AGENT_RETRIES} 次尝试失败: {e}")
             raise
+        prev_session = result.get("session_id") or prev_session
         candidate = _as_ir(result.get("structured_output"))
         if candidate is None:
             last_reason = (
                 f"agent 未产出有效 IR 结构（structured_output 缺失，第 {attempt}/{DECOMPOSE_AGENT_RETRIES} 次）"
             )
+            # 仍拿不到结果文件 → 下一轮退回完整 prompt，避免反复踩同一坑
+            prev_session = None
             continue
         errors = validate_ir(candidate)
         if errors:
@@ -357,6 +563,7 @@ async def _run_decompose(params: dict, task_id: str) -> None:
         raise RuntimeError(last_reason)
     ir["schema_version"] = SCHEMA_VERSION
     ir["project_id"] = project_id
+    _carry_over_user_specs(prev_ir, ir)
     ir_path = ws / "reports" / "ir.json"
     ir_path.write_text(json.dumps(ir, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -378,6 +585,7 @@ async def _run_decompose(params: dict, task_id: str) -> None:
         "started_at": started, "finished_at": _now(),
     })
     task_manager.update_progress(task_id, {
+        "stage": f"拆解完成：{ir.get('entry_class')}（{len(ir['nodes'])} 节点 / {len(ir['edges'])} 边）",
         "entry_class": ir.get("entry_class"),
         "nodes": len(ir["nodes"]),
         "edges": len(ir["edges"]),
@@ -630,7 +838,9 @@ async def _run_trace(params: dict, task_id: str) -> None:
             "metrics": {"skipped": True, "reason": "IR 形状已完整"},
             "started_at": _now(), "finished_at": _now(),
         })
-        task_manager.update_progress(task_id, {"skipped": True, "reason": "IR 形状已完整，无需追踪"})
+        task_manager.update_progress(task_id, {
+            "stage": "补形状：IR 形状已完整，无需追踪（跳过）",
+            "skipped": True, "reason": "IR 形状已完整，无需追踪"})
         return
     # 仅为了补记模型参数才需要追踪时，不因环境/模型不可用而中断（IR 本身已完整）
     only_canonical = not (need_shape or need_params or need_input)
@@ -646,6 +856,7 @@ async def _run_trace(params: dict, task_id: str) -> None:
     out_json = run_dir / "shapes.json"
     ir_path = ws / "reports" / "ir.json"
     started = _now()
+    task_manager.update_progress(task_id, {"stage": "补形状：在项目环境运行模型抓取各层形状…"})
     command = f"{python} {TRACE_SCRIPT} <source> {ir_path.name} {out_json.name}"
     try:
         rc, log = await proc_util.run_command(
@@ -687,8 +898,10 @@ async def _run_trace(params: dict, task_id: str) -> None:
         "artifact_path": str(out_json),
         "started_at": started, "finished_at": _now(),
     })
+    _captured = len(shapes.get("shapes", shapes)) if isinstance(shapes, dict) else 0
     task_manager.update_progress(task_id, {
-        "captured_paths": len(shapes.get("shapes", shapes)) if isinstance(shapes, dict) else 0,
+        "stage": f"补形状完成：捕获 {_captured} 个模块，回填 {filled + inferred + edges_filled} 处",
+        "captured_paths": _captured,
         "filled": filled, "inferred": inferred, "edges_filled": edges_filled,
     })
 
@@ -724,6 +937,7 @@ async def _run_verify(params: dict, task_id: str) -> None:
     out_json = run_dir / "verification_result.json"
     ir_path = ws / "reports" / "ir.json"
     started = _now()
+    task_manager.update_progress(task_id, {"stage": "验证：再生成代码并与原模型逐 seed 数值比对…"})
     command = (
         f"{python} {VERIFY_SCRIPT} <source> {ir_path.name} regenerated.py {out_json.name} "
         f"<seeds> <rtol> <atol>"
@@ -781,6 +995,8 @@ async def _run_verify(params: dict, task_id: str) -> None:
         "started_at": started, "finished_at": _now(),
     })
     task_manager.update_progress(task_id, {
+        "stage": f"验证完成：{'通过' if overall == 'passed' else '未通过'}"
+                 + (f"（{verification.get('failure_reason')}）" if overall != "passed" else ""),
         "overall": overall,
         "structure_passed": verification["structure"]["passed"],
         "numeric_passed": verification["numeric"]["passed"],
@@ -1010,6 +1226,7 @@ async def _run_ingest(params: dict, task_id: str) -> None:
         "started_at": started, "finished_at": _now(),
     })
     task_manager.update_progress(task_id, {
+        "stage": f"入库完成：{module_id}:{module_version}",
         "module_id": module_id,
         "module_version": module_version,
         "structured_project_id": structured_id,

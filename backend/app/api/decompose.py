@@ -104,6 +104,10 @@ class NodeParamsBody(BaseModel):
 class InputSpecBody(BaseModel):
     shape: list[int]
     dtype: str | None = None
+    # 多输入模型的额外入参（如 scGPT 的 forward(src, values, src_key_padding_mask)）；[] = 清除
+    extra: list[dict] | None = None
+    # forward 关键字参数（如 scGPT 的 CLS/MVC/ECS 开关）；{} = 清除
+    forward_kwargs: dict | None = None
 
 
 @ir_router.put("/ir/input_spec")
@@ -111,7 +115,24 @@ def update_input_spec(project_id: str, body: InputSpecBody) -> dict:
     """修正入口输入规格（agent 给不出具体维度时的补参通道）；写回后旧验证变 stale。"""
     _require_original(project_id)
     try:
-        return decompose_service.update_input_spec(project_id, body.shape, body.dtype)
+        return decompose_service.update_input_spec(
+            project_id, body.shape, body.dtype, body.extra, body.forward_kwargs)
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+class EntryArgsBody(BaseModel):
+    entry_args: dict
+
+
+@ir_router.put("/ir/entry_args")
+def update_entry_args(project_id: str, body: EntryArgsBody) -> dict:
+    """修正入口类构造参数（模型需要运行期配置/外部数据时的补参通道）；写回后旧验证变 stale。"""
+    _require_original(project_id)
+    try:
+        return decompose_service.update_entry_args(project_id, body.entry_args)
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
