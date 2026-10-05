@@ -41,7 +41,33 @@ export async function startAssistantChat(
     return data.task_id;
 }
 
-/** SSE 事件流地址（EventSource 用；事件 kind ∈ stage/delta/tool/done/error）。 */
+/** SSE 事件流地址（EventSource 用；事件 kind ∈ stage/delta/tool/confirm/done/error）。 */
 export function assistantStreamUrl(taskId: string): string {
     return `${API_BASE}/api/assistant/chat/${taskId}/stream`;
+}
+
+/** 确认请求（③续）：助手要执行平台动作时，前端弹窗让用户裁定。 */
+export type ConfirmRequest = {
+    confirm_id: string;
+    action: string;
+    params: Record<string, unknown>;
+};
+
+/** 回传用户对确认请求的裁定（true=确认执行 / false=取消）。 */
+export async function decideConfirm(confirmId: string, approved: boolean): Promise<void> {
+    const res = await fetch(`${API_BASE}/api/assistant/confirm/${confirmId}/decide`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ approved }),
+    });
+    if (!res.ok) {
+        let detail: unknown = null;
+        try {
+            const body = await res.json();
+            detail = (body as { detail?: unknown }).detail ?? body;
+        } catch {
+            detail = await res.text().catch(() => null);
+        }
+        throw new Error(typeof detail === "string" ? detail : `HTTP ${res.status}`);
+    }
 }

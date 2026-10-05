@@ -8,7 +8,20 @@ from __future__ import annotations
 import json
 import time
 
+import pytest
+
+from app.mcp import knowledge_mcp
 from app.services import agent_service, assistant_service
+
+
+class _FakeQueue:
+    """替代 asyncio.Queue：只收集 put_nowait 推入的事件（确认事件断言用）。"""
+
+    def __init__(self) -> None:
+        self.items: list = []
+
+    def put_nowait(self, item) -> None:
+        self.items.append(item)
 
 
 def _wait(client, task_id: str, timeout_s: float = 8.0) -> dict:
@@ -165,3 +178,133 @@ def test_knowledge_mcp_read_tools_whitelisted():
     for t in ("knowledge_search", "list_projects", "get_project", "list_runs"):
         assert f"mcp__knowledge__{t}" in rules
     assert not any(r.startswith("mcp__knowledge__") for r in agent_service.allowed_tools(attach_knowledge=False))
+
+
+# ---- ③续：平台动作工具 + UI 确认握手 ----
+
+def test_mcp_tools_by_mode():
+    """可写模式加动作工具；只读不加。"""
+    read = set(assistant_service._mcp_tools_for_mode("read"))
+    write = set(assistant_service._mcp_tools_for_mode("write"))
+    assert "platform_create_project" not in read
+    assert {"platform_create_project", "platform_create_env", "platform_run_analyze"} <= write
+    assert {"knowledge_search", "list_projects"} <= read       # 只读工具两模式都有
+
+
+def test_allowed_tools_can_include_action_tools():
+    both = agent_service.KNOWLEDGE_MCP_READ_TOOLS + agent_service.KNOWLEDGE_MCP_ACTION_TOOLS
+    rules = agent_service.allowed_tools(True, ["Read"], both)
+    assert "mcp__knowledge__platform_create_project" in rules
+    # 默认（只读）不含动作工具
+    assert "mcp__knowledge__platform_create_project" not in agent_service.allowed_tools(True, ["Read"])
+
+
+def test_knowledge_mcp_injects_session_env_only_when_keyed():
+    cfg = agent_service._knowledge_mcp(session_key="sess-1", mode="write")
+    env = cfg["knowledge"]["env"]
+    assert env["ASSISTANT_SESSION_KEY"] == "sess-1" and env["ASSISTANT_MODE"] == "write"
+    assert "DL_AI_BACKEND_URL" in env
+    # 不传会话键时保持原样（run_stream/run_sync 等既有调用方不受影响）
+    assert agent_service._knowledge_mcp()["knowledge"]["env"] == {"PYTHONPATH": str(agent_service.BACKEND_DIR)}
+
+
+def test_request_confirmation_requires_live_session():
+    with pytest.raises(LookupError):
+        assistant_service.request_confirmation("no-such-session", "create_env", {})
+
+
+def test_confirm_registry_approve_and_deny(monkeypatch):
+    q = _FakeQueue()
+    monkeypatch.setitem(assistant_service._SESSION_QUEUE, "s1", q)
+    cid = assistant_service.request_confirmation("s1", "create_project", {"name": "demo"})
+    # 事件已推给该会话（前端据此弹窗）
+    assert q.items and q.items[0]["kind"] == "confirm" and q.items[0]["confirm_id"] == cid
+    assert assistant_service.confirmation_status(cid)["status"] == "pending"
+    assert assistant_service.decide_confirmation(cid, True)["status"] == "approved"
+    assert assistant_service.confirmation_status(cid)["status"] == "approved"
+
+    cid2 = assistant_service.request_confirmation("s1", "run_analyze", {"project_id": "p"})
+    assert assistant_service.decide_confirmation(cid2, False)["status"] == "denied"
+
+
+def test_confirm_expires_after_ttl(monkeypatch):
+    monkeypatch.setattr(assistant_service, "CONFIRM_TTL_S", 0.0)
+    q = _FakeQueue()
+    monkeypatch.setitem(assistant_service._SESSION_QUEUE, "s2", q)
+    cid = assistant_service.request_confirmation("s2", "run_analyze", {"project_id": "p"})
+    assert assistant_service.confirmation_status(cid)["status"] == "expired"
+
+
+def test_confirm_endpoints_handshake(app_client, monkeypatch):
+    """HTTP 三端点：登记 → 轮询 pending → 前端确认 → 轮询 approved。"""
+    q = _FakeQueue()
+    monkeypatch.setitem(assistant_service._SESSION_QUEUE, "sess-http", q)
+
+    r = app_client.post("/api/assistant/confirm",
+                        json={"session_key": "sess-http", "action": "create_project",
+                              "params": {"name": "demo"}})
+    assert r.status_code == 200
+    cid = r.json()["confirm_id"]
+    assert q.items[0]["kind"] == "confirm" and q.items[0]["action"] == "create_project"
+
+    assert app_client.get(f"/api/assistant/confirm/{cid}").json()["status"] == "pending"
+    d = app_client.post(f"/api/assistant/confirm/{cid}/decide", json={"approved": True})
+    assert d.status_code == 200 and d.json()["status"] == "approved"
+    assert app_client.get(f"/api/assistant/confirm/{cid}").json()["status"] == "approved"
+
+
+def test_confirm_endpoints_errors(app_client):
+    # 无活动会话 → 409（动作不得执行）
+    r = app_client.post("/api/assistant/confirm",
+                        json={"session_key": "ghost", "action": "run_analyze", "params": {}})
+    assert r.status_code == 409
+    # 未知确认号 → 404
+    assert app_client.get("/api/assistant/confirm/nope").status_code == 404
+    assert app_client.post("/api/assistant/confirm/nope/decide",
+                           json={"approved": True}).status_code == 404
+    # 空动作名 → 400
+    assert app_client.post("/api/assistant/confirm",
+                           json={"session_key": "x", "action": "  "}).status_code == 400
+
+
+def test_mcp_action_tools_gated_by_mode(monkeypatch):
+    monkeypatch.setattr(knowledge_mcp, "_SESSION_KEY", "sess")
+    monkeypatch.setattr(knowledge_mcp, "_MCP_MODE", "read")
+    names = {t["name"] for t in knowledge_mcp._tools_for_session()}
+    assert "platform_create_project" not in names
+    # 只读模式即便被直接调用也拒绝
+    with pytest.raises(ValueError):
+        knowledge_mcp._dispatch_tool("platform_create_project", {"name": "x"})
+
+    monkeypatch.setattr(knowledge_mcp, "_MCP_MODE", "write")
+    names = {t["name"] for t in knowledge_mcp._tools_for_session()}
+    assert {"platform_create_project", "platform_create_env", "platform_run_analyze"} <= names
+
+    # 无会话键（未挂助手上下文）也不暴露动作工具
+    monkeypatch.setattr(knowledge_mcp, "_SESSION_KEY", "")
+    names = {t["name"] for t in knowledge_mcp._tools_for_session()}
+    assert "platform_create_project" not in names
+
+
+def test_mcp_run_action_executes_only_after_confirmation(monkeypatch):
+    calls: dict = {}
+
+    def fake_http(method, path, payload=None):
+        calls.update(method=method, path=path, payload=payload)
+        return {"project_id": "p1", "status": "loading"}
+
+    monkeypatch.setattr(knowledge_mcp, "_http_json", fake_http)
+    monkeypatch.setattr(knowledge_mcp, "_request_confirmation", lambda a, p: True)
+    out = knowledge_mcp._run_action("create_project", {"name": "demo", "source_url": "http://x"})
+    assert out["executed"] is True
+    assert calls["path"] == "/api/projects" and calls["payload"]["project_type"] == "original"
+
+
+def test_mcp_run_action_denied_does_not_call_backend(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("未确认不应调后端执行")
+
+    monkeypatch.setattr(knowledge_mcp, "_http_json", boom)
+    monkeypatch.setattr(knowledge_mcp, "_request_confirmation", lambda a, p: False)
+    out = knowledge_mcp._run_action("run_analyze", {"project_id": "p"})
+    assert out["executed"] is False and "未确认" in out["reason"]

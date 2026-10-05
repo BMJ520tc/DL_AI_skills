@@ -41,10 +41,20 @@ KNOWLEDGE_MCP_SERVER = "knowledge"
 KNOWLEDGE_MCP_TOOL = "knowledge_search"
 # knowledge MCP 暴露的**只读**工具（见 app/mcp/knowledge_mcp.py）：
 # 知识库检索 + 平台只读查询（列项目 / 取项目 / 列运行记录）。
-KNOWLEDGE_MCP_TOOLS = ("knowledge_search", "list_projects", "get_project", "list_runs")
+KNOWLEDGE_MCP_READ_TOOLS = ("knowledge_search", "list_projects", "get_project", "list_runs")
+# 平台**动作**工具（③续）：建原始项目 / 建环境 / 结构分析——**写操作**，需经 UI 确认，
+# 仅在助手「可写」模式暴露；默认（只读）工具集不含它们。
+KNOWLEDGE_MCP_ACTION_TOOLS = ("platform_create_project", "platform_create_env", "platform_run_analyze")
+# 默认（只读）工具集；`KNOWLEDGE_MCP_TOOL_RULES` 保持为只读集，供既有调用方/用例依赖
+KNOWLEDGE_MCP_TOOLS = KNOWLEDGE_MCP_READ_TOOLS
 # CLI 权限规则中 MCP 工具用全名 mcp__<server>__<tool>
 KNOWLEDGE_MCP_TOOL_RULE = f"mcp__{KNOWLEDGE_MCP_SERVER}__{KNOWLEDGE_MCP_TOOL}"
 KNOWLEDGE_MCP_TOOL_RULES = [f"mcp__{KNOWLEDGE_MCP_SERVER}__{t}" for t in KNOWLEDGE_MCP_TOOLS]
+
+
+def mcp_tool_rule(name: str) -> str:
+    """MCP 工具全名（CLI 权限规则口径）。"""
+    return f"mcp__{KNOWLEDGE_MCP_SERVER}__{name}"
 
 DEFAULT_TIMEOUT_S = 900
 # run_sync 的临时目录前缀与保留数：这些目录没有 task 记录可查，长期不清会让 data/agent_tasks 膨胀
@@ -52,16 +62,21 @@ SYNC_DIR_PREFIX = "sync_"
 SYNC_KEEP_DIRS = int(os.getenv("AGENT_SYNC_KEEP_DIRS", "200"))
 
 
-def allowed_tools(attach_knowledge: bool = True, base: Optional[list[str]] = None) -> list[str]:
+def allowed_tools(attach_knowledge: bool = True, base: Optional[list[str]] = None,
+                  mcp_tools: Optional[tuple[str, ...]] = None) -> list[str]:
     """本会话工具白名单：显式白名单 + 挂载知识库时的知识库 MCP 工具。
 
     设计依据《模块详细设计》2.5「工具白名单：…查询知识库（经每会话临时挂载的 MCP）；
     deny 优先，白名单外不提供」。dontAsk 模式下未预授权的工具会被直接拒绝，
     所以「挂载了 MCP」不等于「允许调用」，必须把工具全名加入白名单。
+
+    `mcp_tools` 指定要进白名单的 MCP 工具名（默认＝只读集）；助手「可写」模式传
+    只读 + 动作集（③续）。
     """
     tools = list(base) if base is not None else list(DEFAULT_ALLOWED_TOOLS)
     if attach_knowledge:
-        for rule in KNOWLEDGE_MCP_TOOL_RULES:
+        for name in (mcp_tools if mcp_tools is not None else KNOWLEDGE_MCP_TOOLS):
+            rule = mcp_tool_rule(name)
             if rule not in tools:
                 tools.append(rule)
     return tools
@@ -140,6 +155,31 @@ def path_gate_tool(read_roots: list, write_roots: list, allow_bash: bool = False
     return _check
 
 
+# 续接目标失效（后端重启 / 会话过期）的原文特征——续接失败时据此回退到不带 resume 重跑
+_STALE_SESSION_MARKERS = ("no conversation found", "session not found", "no session found",
+                          "conversation not found")
+
+
+def is_stale_session_error(text) -> bool:
+    low = str(text or "").lower()
+    return any(m in low for m in _STALE_SESSION_MARKERS)
+
+
+def _emit_tool_uses(msg, on_event) -> None:
+    """把一次 AssistantMessage 里的工具调用回调给 on_event（供拆解等长任务报进度）。
+
+    形如 on_event("tool", {"name": "Read"})；回调异常不影响会话。
+    """
+    if on_event is None or type(msg).__name__ != "AssistantMessage":
+        return
+    for blk in (getattr(msg, "content", None) or []):
+        if type(blk).__name__ == "ToolUseBlock":
+            try:
+                on_event("tool", {"name": getattr(blk, "name", "")})
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def _prune_sync_dirs() -> None:
     """清理 run_sync 自建的临时目录（sync_*），按 mtime 保留最近 SYNC_KEEP_DIRS 个。
 
@@ -167,14 +207,28 @@ def _task_dir(task_id: str) -> Path:
     return d
 
 
-def _knowledge_mcp() -> dict:
-    """每会话临时挂载的知识库 stdio MCP server。"""
+# 助手 MCP 子进程回连后端的地址（确认握手经 HTTP 回环；本机默认端口 8000）
+BACKEND_SELF_URL = os.getenv("DL_AI_BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
+
+
+def _knowledge_mcp(session_key: Optional[str] = None, mode: Optional[str] = None) -> dict:
+    """每会话临时挂载的知识库 stdio MCP server。
+
+    传 `session_key`（助手会话键）时，把会话上下文注入 MCP 子进程环境：动作工具要靠
+    `ASSISTANT_SESSION_KEY` 经 HTTP 回环向后端请求用户确认，`ASSISTANT_MODE` 决定是否
+    暴露动作工具（只读模式不给）。
+    """
+    env = {"PYTHONPATH": str(BACKEND_DIR)}
+    if session_key:
+        env["ASSISTANT_SESSION_KEY"] = session_key
+        env["ASSISTANT_MODE"] = mode or "read"
+        env["DL_AI_BACKEND_URL"] = BACKEND_SELF_URL
     return {
         "knowledge": {
             "type": "stdio",
             "command": "python",
             "args": ["-m", "app.mcp.knowledge_mcp"],
-            "env": {"PYTHONPATH": str(BACKEND_DIR)},
+            "env": env,
         }
     }
 
@@ -314,7 +368,8 @@ async def _run(params: dict, task_id: str) -> None:
     )
 
 
-async def _collect(prompt: str, options: ClaudeAgentOptions, timeout_s: int, retries: int = 2) -> dict:
+async def _collect(prompt: str, options: ClaudeAgentOptions, timeout_s: int, retries: int = 2,
+                   on_event=None) -> dict:
     """执行一次 agent 会话，带指数退避重试（2.5 异常兜底：429 退避、超时重试）。"""
     # 一键封装凭证页（K2）：凭证文件在配置时覆盖进程环境（SDK 的 CLI 子进程继承读取）；
     # 文件里的模型名同时覆盖 options.model（显式保存是用户最新意图）。
@@ -334,6 +389,7 @@ async def _collect(prompt: str, options: ClaudeAgentOptions, timeout_s: int, ret
             async def _iterate() -> None:
                 nonlocal saw_result
                 async for msg in query(prompt=prompt, options=options):
+                    _emit_tool_uses(msg, on_event)
                     if isinstance(msg, ResultMessage):
                         saw_result = True
                         outcome["structured_output"] = msg.structured_output
@@ -520,11 +576,16 @@ async def run_client_stream(prompt: str, *, conv_key: Optional[str], mode_key: s
 def stream_options(*, tools: Optional[list[str]] = None, attach_knowledge: bool = True,
                    resume: Optional[str] = None, max_turns: int = 20,
                    cwd: Optional[str] = None, add_dirs: Optional[list] = None,
-                   permission_mode: str = "dontAsk", can_use_tool=None) -> ClaudeAgentOptions:
+                   permission_mode: str = "dontAsk", can_use_tool=None,
+                   mcp_tools: Optional[tuple[str, ...]] = None,
+                   session_key: Optional[str] = None,
+                   mcp_mode: Optional[str] = None) -> ClaudeAgentOptions:
     """构造**流式/常驻会话**的 options（工具集 + 知识库 MCP + 部分消息 + 续接 + 工作目录）。
 
     供 `run_client_stream` 的 options_factory 使用；与 `run_stream` 的构造保持一致。
     **cwd 用于把会话隔离到独立 scratch 目录**（助手：自动记忆与相对写入都落那里，不碰仓库）。
+    `mcp_tools` 指定 MCP 白名单子集（助手可写模式含动作工具）；`session_key` 为助手会话键，
+    传入后 MCP 子进程获得确认握手所需的会话上下文。
     """
     from app import settings_store
 
@@ -533,7 +594,7 @@ def stream_options(*, tools: Optional[list[str]] = None, attach_knowledge: bool 
         cli_path=CLAUDE_CLI_PATH,
         cwd=cwd,
         add_dirs=add_dirs or [],
-        allowed_tools=allowed_tools(attach_knowledge, tools or DEFAULT_ALLOWED_TOOLS),
+        allowed_tools=allowed_tools(attach_knowledge, tools or DEFAULT_ALLOWED_TOOLS, mcp_tools),
         disallowed_tools=DEFAULT_DISALLOWED_TOOLS,
         permission_mode=permission_mode,
         max_turns=max_turns,
@@ -543,7 +604,7 @@ def stream_options(*, tools: Optional[list[str]] = None, attach_knowledge: bool 
         include_partial_messages=True,
     )
     if attach_knowledge:
-        options.mcp_servers = _knowledge_mcp()
+        options.mcp_servers = _knowledge_mcp(session_key=session_key, mode=mcp_mode)
     if resume:
         options.resume = resume
     if cred.get("model"):
@@ -567,12 +628,14 @@ async def run_sync(
     timeout_s: int = 300,
     attach_knowledge: bool = False,
     resume: Optional[str] = None,
+    on_event=None,
 ) -> dict:
     """直接执行一次 agent 会话（不走任务队列），供其他服务的 handler 内部调用。
 
     返回 {"structured_output": ..., "result": ..., "session_id": ...}；结构化输出在 DeepSeek 下走文件兜底。
     attach_knowledge=True 时挂载知识库 MCP 并把其工具加入白名单（默认不挂载，保持既有调用方行为）。
     resume=会话 id 时**续接该会话**（上下文连续；前端多轮对话用）。
+    on_event(kind, data) 可选：逐条回调会话事件（目前仅 `tool`＝工具调用名），供长任务报进度。
     """
     d = _sync_dir()
     result_path = d / "result.json"
@@ -608,7 +671,16 @@ async def run_sync(
     if DEFAULT_MODEL:
         options.model = DEFAULT_MODEL
 
-    outcome = await _collect(prompt, options, timeout_s)
+    outcome = await _collect(prompt, options, timeout_s, on_event=on_event)
+    # 留痕：agent 的文本回复/会话 id/错误（此前 run_sync 只留 result.json，排障时看不到模型说了什么）
+    try:
+        (d / "log.json").write_text(
+            json.dumps({"result": outcome.get("result"), "session_id": outcome.get("session_id"),
+                        "num_turns": outcome.get("num_turns"), "stop_reason": outcome.get("stop_reason"),
+                        "errors": outcome.get("errors")}, ensure_ascii=False),
+            encoding="utf-8")
+    except OSError:
+        pass
     structured = outcome.get("structured_output")
     if structured is None and result_path.exists():
         try:

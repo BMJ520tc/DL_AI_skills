@@ -7,10 +7,19 @@ import { useState } from "react";
 import type { CSSProperties } from "react";
 import {
     assistantStreamUrl,
+    decideConfirm,
     startAssistantChat,
     type AssistantContext,
     type AssistantMode,
+    type ConfirmRequest,
 } from "../api/assistantClient";
+
+// 平台动作的中文名（确认弹窗标题）
+const ACTION_LABELS: Record<string, string> = {
+    create_project: "创建原始项目",
+    create_env: "创建运行环境",
+    run_analyze: "发起结构分析",
+};
 
 type Props = {
     open: boolean;
@@ -66,8 +75,23 @@ export default function AssistantPanel({ open, context, onClose, onOpenSettings 
     const [error, setError] = useState<string | null>(null);
     const [sessionId, setSessionId] = useState<string | null>(null);
     const [mode, setMode] = useState<AssistantMode>("read");
+    const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
+    const [deciding, setDeciding] = useState(false);
 
     if (!open) return null;
+
+    const answerConfirm = async (approved: boolean) => {
+        if (!confirm || deciding) return;
+        setDeciding(true);
+        try {
+            await decideConfirm(confirm.confirm_id, approved);
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setConfirm(null);
+            setDeciding(false);
+        }
+    };
 
     const send = async () => {
         const text = input.trim();
@@ -92,7 +116,8 @@ export default function AssistantPanel({ open, context, onClose, onOpenSettings 
         let acc = "";
         es.onmessage = e => {
             let ev: { kind?: string; text?: string; name?: string; reply?: string;
-                      session_id?: string | null; message?: string };
+                      session_id?: string | null; message?: string;
+                      confirm_id?: string; action?: string; params?: Record<string, unknown> };
             try {
                 ev = JSON.parse(e.data) as typeof ev;
             } catch {
@@ -105,17 +130,26 @@ export default function AssistantPanel({ open, context, onClose, onOpenSettings 
                 setStage(`调用工具 ${ev.name}…`);
             } else if (ev.kind === "stage") {
                 setStage(ev.text || "");
+            } else if (ev.kind === "confirm") {
+                // 助手要执行平台动作：弹窗请用户确认（未确认即不执行）
+                if (ev.confirm_id) {
+                    setConfirm({ confirm_id: ev.confirm_id, action: ev.action || "",
+                                 params: ev.params || {} });
+                    setStage("等待你确认一个平台动作…");
+                }
             } else if (ev.kind === "done") {
                 if (ev.session_id) setSessionId(ev.session_id);
                 setMessages(m => [...m, { role: "assistant", text: ev.reply || acc || "（未返回内容）" }]);
                 setStreamText("");
                 setStage("");
+                setConfirm(null);
                 setBusy(false);
                 es.close();
             } else if (ev.kind === "error") {
                 setError(ev.message || "出错了");
                 setStreamText("");
                 setStage("");
+                setConfirm(null);
                 setBusy(false);
                 es.close();
             }
@@ -135,7 +169,7 @@ export default function AssistantPanel({ open, context, onClose, onOpenSettings 
                 <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
                     <span style={{ color: "#64748b", fontSize: 11 }}>模式</span>
                     <button onClick={() => setMode("read")} disabled={busy} style={tab(mode === "read")} title="只读：能读代码/查库/查平台，不改任何东西">只读</button>
-                    <button onClick={() => setMode("write")} disabled={busy} style={tab(mode === "write")} title="可写：满工具（能改文件/跑命令）——会先说明再动手">可写</button>
+                    <button onClick={() => setMode("write")} disabled={busy} style={tab(mode === "write")} title="可写：满工具（能改会话工作目录文件）+ 平台动作（建项目/建环境/结构分析，逐次弹窗确认）">可写</button>
                     <button onClick={onClose} style={{ background: "#334155", border: "none", borderRadius: 5, color: "#e2e8f0", padding: "2px 9px", fontSize: 12, cursor: "pointer" }}>关闭</button>
                 </span>
             </div>
@@ -143,6 +177,7 @@ export default function AssistantPanel({ open, context, onClose, onOpenSettings 
                 {messages.length === 0 ? (
                     <div style={{ color: "#64748b" }}>
                         可以问当前项目/论文/运行记录相关的问题，助手会先查再答、给建议（能查知识库）。默认「只读」——只看和被问，不改任何东西。
+                        切到「可写」还能让助手提议平台动作（建项目 / 建环境 / 结构分析），每次执行都会弹窗请你确认。
                     </div>
                 ) : null}
                 {messages.map((m, i) => (
@@ -168,6 +203,33 @@ export default function AssistantPanel({ open, context, onClose, onOpenSettings 
                     </div>
                 ) : null}
             </div>
+            {confirm ? (
+                <div style={{ margin: "0 10px 8px", padding: "10px 12px", border: "1px solid #b45309", background: "#2a1f0a", borderRadius: 8 }}>
+                    <div style={{ color: "#fcd34d", fontWeight: 600, marginBottom: 6 }}>
+                        ⚠ 助手请求执行平台动作：{ACTION_LABELS[confirm.action] || confirm.action}
+                    </div>
+                    <div style={{ color: "#94a3b8", fontSize: 11, marginBottom: 3 }}>参数</div>
+                    <pre style={{ margin: "0 0 8px", whiteSpace: "pre-wrap", wordBreak: "break-word", background: "#0f1722", padding: "6px 8px", borderRadius: 6, fontSize: 11, color: "#e2e8f0" }}>
+                        {JSON.stringify(confirm.params, null, 2)}
+                    </pre>
+                    <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                        <button
+                            onClick={() => void answerConfirm(false)}
+                            disabled={deciding}
+                            style={{ background: "#334155", border: "none", borderRadius: 6, color: "#e2e8f0", padding: "5px 12px", fontSize: 12, cursor: "pointer" }}
+                        >
+                            取消
+                        </button>
+                        <button
+                            onClick={() => void answerConfirm(true)}
+                            disabled={deciding}
+                            style={{ background: "#b45309", border: "none", borderRadius: 6, color: "#fff", padding: "5px 12px", fontSize: 12, cursor: "pointer", opacity: deciding ? 0.6 : 1 }}
+                        >
+                            {deciding ? "…" : "确认执行"}
+                        </button>
+                    </div>
+                </div>
+            ) : null}
             <div style={{ display: "flex", gap: 6, padding: "8px 10px", borderTop: "1px solid #262b36" }}>
                 <textarea
                     style={INPUT}
