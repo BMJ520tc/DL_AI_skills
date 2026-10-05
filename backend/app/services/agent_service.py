@@ -13,7 +13,14 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from claude_agent_sdk import ClaudeAgentOptions, PermissionResultAllow, PermissionResultDeny, ResultMessage, query
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ResultMessage,
+    query,
+)
 
 from app.config import AGENT_TASKS_DIR, BACKEND_DIR, CLAUDE_CLI_PATH, DEFAULT_MODEL
 from app.ids import safe_id
@@ -32,8 +39,12 @@ DEFAULT_DISALLOWED_TOOLS: list[str] = []
 
 KNOWLEDGE_MCP_SERVER = "knowledge"
 KNOWLEDGE_MCP_TOOL = "knowledge_search"
+# knowledge MCP 暴露的**只读**工具（见 app/mcp/knowledge_mcp.py）：
+# 知识库检索 + 平台只读查询（列项目 / 取项目 / 列运行记录）。
+KNOWLEDGE_MCP_TOOLS = ("knowledge_search", "list_projects", "get_project", "list_runs")
 # CLI 权限规则中 MCP 工具用全名 mcp__<server>__<tool>
 KNOWLEDGE_MCP_TOOL_RULE = f"mcp__{KNOWLEDGE_MCP_SERVER}__{KNOWLEDGE_MCP_TOOL}"
+KNOWLEDGE_MCP_TOOL_RULES = [f"mcp__{KNOWLEDGE_MCP_SERVER}__{t}" for t in KNOWLEDGE_MCP_TOOLS]
 
 DEFAULT_TIMEOUT_S = 900
 # run_sync 的临时目录前缀与保留数：这些目录没有 task 记录可查，长期不清会让 data/agent_tasks 膨胀
@@ -49,8 +60,10 @@ def allowed_tools(attach_knowledge: bool = True, base: Optional[list[str]] = Non
     所以「挂载了 MCP」不等于「允许调用」，必须把工具全名加入白名单。
     """
     tools = list(base) if base is not None else list(DEFAULT_ALLOWED_TOOLS)
-    if attach_knowledge and KNOWLEDGE_MCP_TOOL_RULE not in tools:
-        tools.append(KNOWLEDGE_MCP_TOOL_RULE)
+    if attach_knowledge:
+        for rule in KNOWLEDGE_MCP_TOOL_RULES:
+            if rule not in tools:
+                tools.append(rule)
     return tools
 
 _DANGEROUS_PATTERNS = [
@@ -75,6 +88,56 @@ async def _can_use_tool(tool_name: str, tool_input: dict, context) -> Permission
             if re.search(pattern, command, re.IGNORECASE):
                 return PermissionResultDeny(message=f"拒绝危险命令: {command[:120]}")
     return PermissionResultAllow()
+
+
+def path_gate_tool(read_roots: list, write_roots: list, allow_bash: bool = False):
+    """构造**路径白名单**版 `can_use_tool`（助手用；配 `permission_mode="default"`）。
+
+    读只允许 read_roots 之下；写只允许 write_roots 之下；Bash 默认不给；
+    其余（含 MCP 只读工具）放行。做到「仓库/数据只读、~/.claude 与用户目录碰不到」。
+    """
+
+    def _norm(p) -> Path:
+        try:
+            return Path(str(p)).resolve()
+        except Exception:  # noqa: BLE001
+            return Path(str(p))
+
+    r_roots = [_norm(r) for r in read_roots]
+    w_roots = [_norm(r) for r in write_roots]
+
+    def _under(path: Path, roots: list) -> bool:
+        for root in roots:
+            try:
+                path.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    async def _check(tool_name: str, tool_input: dict, context):
+        ti = tool_input or {}
+        if tool_name in ("Read", "Glob", "Grep"):
+            raw = ti.get("file_path") or ti.get("path")
+            if not raw:                       # Glob/Grep 缺 path 时默认落在工作目录
+                return PermissionResultAllow()
+            if _under(_norm(raw), r_roots):
+                return PermissionResultAllow()
+            return PermissionResultDeny(
+                message=f"助手只能读「仓库 / 项目数据 / 本会话工作目录」，已拒绝：{raw}")
+        if tool_name in ("Write", "Edit", "NotebookEdit"):
+            raw = ti.get("file_path")
+            if raw and _under(_norm(raw), w_roots):
+                return PermissionResultAllow()
+            return PermissionResultDeny(
+                message="助手只能写自己的会话工作目录；仓库与数据目录只读，请去对应界面操作")
+        if tool_name == "Bash":
+            if allow_bash:
+                return PermissionResultAllow()
+            return PermissionResultDeny(message="助手不提供命令行执行（请用只读工具，或去界面操作）")
+        return PermissionResultAllow()
+
+    return _check
 
 
 def _prune_sync_dirs() -> None:
@@ -279,6 +342,7 @@ async def _collect(prompt: str, options: ClaudeAgentOptions, timeout_s: int, ret
                         outcome["stop_reason"] = getattr(msg, "stop_reason", None)
                         outcome["errors"] = msg.errors
                         outcome["permission_denials"] = msg.permission_denials
+                        outcome["session_id"] = getattr(msg, "session_id", None)
                         return
 
             await asyncio.wait_for(_iterate(), timeout=timeout_s)
@@ -298,6 +362,197 @@ async def _collect(prompt: str, options: ClaudeAgentOptions, timeout_s: int, ret
     return outcome
 
 
+async def run_stream(
+    prompt: str,
+    *,
+    cwd: Optional[str] = None,
+    add_dirs: Optional[list] = None,
+    max_turns: int = 20,
+    timeout_s: int = 600,
+    attach_knowledge: bool = False,
+    resume: Optional[str] = None,
+    tools: Optional[list[str]] = None,
+    on_event=None,
+) -> dict:
+    """**流式**执行一次 agent 会话（不走任务队列）：on_event(kind, data) 逐条回调。
+
+    kind：`delta`（正文增量 `text`）/ `tool`（工具调用 `name`）/ `error`。
+    返回 {"result", "session_id", "errors"}。供前端对话的 SSE 流使用。
+    """
+    from app import settings_store
+
+    def emit(kind: str, data: dict) -> None:
+        if on_event is not None:
+            try:
+                on_event(kind, data)
+            except Exception:  # noqa: BLE001 —— 回调失败不影响会话
+                pass
+
+    cred = settings_store.apply_credentials_env()
+    options = ClaudeAgentOptions(
+        cli_path=CLAUDE_CLI_PATH,
+        cwd=cwd,
+        add_dirs=add_dirs or [],
+        allowed_tools=allowed_tools(attach_knowledge, tools or DEFAULT_ALLOWED_TOOLS),
+        disallowed_tools=DEFAULT_DISALLOWED_TOOLS,
+        permission_mode="dontAsk",
+        max_turns=max_turns,
+        setting_sources=[],
+        can_use_tool=_can_use_tool,
+        env={"DISABLE_AUTOUPDATER": "1"},
+        include_partial_messages=True,   # 正文增量（StreamEvent）
+    )
+    if attach_knowledge:
+        options.mcp_servers = _knowledge_mcp()
+    if resume:
+        options.resume = resume
+    if cred.get("model"):
+        options.model = cred["model"]
+    elif DEFAULT_MODEL:
+        options.model = DEFAULT_MODEL
+
+    out: dict = {"result": "", "session_id": None, "errors": []}
+
+    async def _iterate() -> None:
+        async for msg in query(prompt=prompt, options=options):
+            tname = type(msg).__name__
+            if tname == "StreamEvent":
+                ev = getattr(msg, "event", None) or {}
+                if ev.get("type") == "content_block_delta":
+                    delta = ev.get("delta") or {}
+                    if delta.get("type") == "text_delta" and delta.get("text"):
+                        emit("delta", {"text": delta["text"]})
+            elif tname == "AssistantMessage":
+                for blk in (getattr(msg, "content", None) or []):
+                    if type(blk).__name__ == "ToolUseBlock":
+                        emit("tool", {"name": getattr(blk, "name", "")})
+            elif tname == "ResultMessage":
+                out["result"] = getattr(msg, "result", "") or ""
+                out["session_id"] = getattr(msg, "session_id", None)
+                out["errors"] = getattr(msg, "errors", None) or []
+                return
+
+    try:
+        await asyncio.wait_for(_iterate(), timeout=timeout_s)
+    except Exception as exc:  # noqa: BLE001
+        emit("error", {"message": f"{type(exc).__name__}: {exc}"})
+        raise
+    return out
+
+
+# ---- 常驻会话：跨轮复用一个 ClaudeSDKClient（免每轮冷启动） ----
+_CLIENTS: dict[str, ClaudeSDKClient] = {}
+_CLIENT_LAST: dict[str, float] = {}
+CLIENT_IDLE_S = float(os.getenv("ASSISTANT_CLIENT_IDLE_S", "900"))
+
+
+async def _sweep_clients(now: float) -> None:
+    for key in list(_CLIENTS):
+        if now - _CLIENT_LAST.get(key, 0.0) > CLIENT_IDLE_S:
+            client = _CLIENTS.pop(key, None)
+            _CLIENT_LAST.pop(key, None)
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+async def run_client_stream(prompt: str, *, conv_key: Optional[str], mode_key: str,
+                            options_factory, on_event=None) -> dict:
+    """**常驻会话**流式：跨轮复用同一 `ClaudeSDKClient`（免冷启动）。
+
+    conv_key 为空 = 新会话（自建 key，`done` 回传 `conv_key` 供前端持有）；
+    客户端异常即丢弃（下一轮重建，靠 options 里的 `resume` 续接上下文），空闲超时自动断开。
+    返回 {"result", "session_id", "conv_key"}。
+    """
+    now = asyncio.get_event_loop().time()
+    await _sweep_clients(now)
+
+    cid = conv_key or uuid.uuid4().hex
+    key = f"{cid}::{mode_key}"
+    client = _CLIENTS.get(key)
+    if client is None:
+        client = ClaudeSDKClient(options_factory())
+        await client.connect()
+        _CLIENTS[key] = client
+    _CLIENT_LAST[key] = now
+
+    out: dict = {"result": "", "session_id": None, "conv_key": cid}
+
+    def emit(kind: str, data: dict) -> None:
+        if on_event is not None:
+            try:
+                on_event(kind, data)
+            except Exception:  # noqa: BLE001
+                pass
+
+    try:
+        await client.query(prompt)
+        async for msg in client.receive_response():
+            tname = type(msg).__name__
+            if tname == "StreamEvent":
+                ev = getattr(msg, "event", None) or {}
+                if ev.get("type") == "content_block_delta":
+                    delta = ev.get("delta") or {}
+                    if delta.get("type") == "text_delta" and delta.get("text"):
+                        emit("delta", {"text": delta["text"]})
+            elif tname == "AssistantMessage":
+                for blk in (getattr(msg, "content", None) or []):
+                    if type(blk).__name__ == "ToolUseBlock":
+                        emit("tool", {"name": getattr(blk, "name", "")})
+            elif tname == "ResultMessage":
+                out["result"] = getattr(msg, "result", "") or ""
+                out["session_id"] = getattr(msg, "session_id", None)
+                break
+    except Exception as exc:  # noqa: BLE001 —— 断连即丢客户端，下一轮重建
+        _CLIENTS.pop(key, None)
+        _CLIENT_LAST.pop(key, None)
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        emit("error", {"message": f"{type(exc).__name__}: {exc}"})
+        raise
+    return out
+
+
+def stream_options(*, tools: Optional[list[str]] = None, attach_knowledge: bool = True,
+                   resume: Optional[str] = None, max_turns: int = 20,
+                   cwd: Optional[str] = None, add_dirs: Optional[list] = None,
+                   permission_mode: str = "dontAsk", can_use_tool=None) -> ClaudeAgentOptions:
+    """构造**流式/常驻会话**的 options（工具集 + 知识库 MCP + 部分消息 + 续接 + 工作目录）。
+
+    供 `run_client_stream` 的 options_factory 使用；与 `run_stream` 的构造保持一致。
+    **cwd 用于把会话隔离到独立 scratch 目录**（助手：自动记忆与相对写入都落那里，不碰仓库）。
+    """
+    from app import settings_store
+
+    cred = settings_store.apply_credentials_env()
+    options = ClaudeAgentOptions(
+        cli_path=CLAUDE_CLI_PATH,
+        cwd=cwd,
+        add_dirs=add_dirs or [],
+        allowed_tools=allowed_tools(attach_knowledge, tools or DEFAULT_ALLOWED_TOOLS),
+        disallowed_tools=DEFAULT_DISALLOWED_TOOLS,
+        permission_mode=permission_mode,
+        max_turns=max_turns,
+        setting_sources=[],
+        can_use_tool=can_use_tool or _can_use_tool,
+        env={"DISABLE_AUTOUPDATER": "1"},
+        include_partial_messages=True,
+    )
+    if attach_knowledge:
+        options.mcp_servers = _knowledge_mcp()
+    if resume:
+        options.resume = resume
+    if cred.get("model"):
+        options.model = cred["model"]
+    elif DEFAULT_MODEL:
+        options.model = DEFAULT_MODEL
+    return options
+
+
 def register() -> None:
     task_manager.register_handler(AGENT_TASK_TYPE, _run)
 
@@ -311,11 +566,13 @@ async def run_sync(
     max_turns: int = 20,
     timeout_s: int = 300,
     attach_knowledge: bool = False,
+    resume: Optional[str] = None,
 ) -> dict:
     """直接执行一次 agent 会话（不走任务队列），供其他服务的 handler 内部调用。
 
-    返回 {"structured_output": ..., "result": ...}；结构化输出在 DeepSeek 下走文件兜底。
+    返回 {"structured_output": ..., "result": ..., "session_id": ...}；结构化输出在 DeepSeek 下走文件兜底。
     attach_knowledge=True 时挂载知识库 MCP 并把其工具加入白名单（默认不挂载，保持既有调用方行为）。
+    resume=会话 id 时**续接该会话**（上下文连续；前端多轮对话用）。
     """
     d = _sync_dir()
     result_path = d / "result.json"
@@ -346,6 +603,8 @@ async def run_sync(
     )
     if attach_knowledge:
         options.mcp_servers = _knowledge_mcp()
+    if resume:
+        options.resume = resume
     if DEFAULT_MODEL:
         options.model = DEFAULT_MODEL
 
@@ -359,4 +618,5 @@ async def run_sync(
     if structured is None and outcome.get("result") is None:
         # 既无结构化输出、也无文本回复 → 不能静默返回空结果给调用方
         raise RuntimeError("agent 未返回任何结果（structured_output 与 result 均为空）")
-    return {"structured_output": structured, "result": outcome.get("result")}
+    return {"structured_output": structured, "result": outcome.get("result"),
+            "session_id": outcome.get("session_id")}

@@ -335,10 +335,18 @@ def main() -> int:
         # 表单口径「留空则保留现有密钥」：已配置后只改默认模型、密钥留空再保存
         check("改默认模型输入框（留空密钥）", set_input_by_placeholder(cdp, "如 deepseek-chat", "model-v2"))
         click_button(cdp, "保存", exact=True)
-        wait_for(cdp, "document.body.innerText.includes('当前已配置')", True, "留空密钥保存后仍已配置")
-        updated = http_json("/api/settings/credentials")
+        # 「当前已配置」在保存前就成立（第一次保存后），只等文案会读到旧值 —— 轮询端点直到 model 真正更新
+        updated = {}
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            updated = http_json("/api/settings/credentials")
+            if updated.get("model") == "model-v2":
+                break
+            time.sleep(0.3)
+        check("留空密钥保存后仍已配置", updated.get("configured") is True)
         check("留空密钥保存：旧密钥保留且字段已更新",
-              updated.get("key_mask") == "***1234" and updated.get("model") == "model-v2")
+              updated.get("key_mask") == "***1234" and updated.get("model") == "model-v2",
+              str(updated))
 
         click_button(cdp, "清除凭证", exact=True)
         ok_cleared = wait_for(cdp, "document.body.innerText.includes('尚未配置模型接口凭证')", True, "清除后回到未配置")

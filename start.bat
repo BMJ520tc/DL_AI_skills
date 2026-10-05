@@ -16,8 +16,11 @@ set "PORT=8000"
 rem --- 0. pip 默认国内镜像（可被用户环境变量覆盖；后端各建环境步骤也会继承） ---
 if not defined PIP_INDEX_URL set "PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple"
 
-rem --- 1. Python 自检：优先项目自带虚拟环境（本仓库的标准解释器），否则 PATH 里的 python ---
+rem --- 1. Python 自检：优先项目内虚拟环境；否则本机后端解释器 D:\python.exe；再否则 PATH 里的 python ---
 set "PY=%~dp0backend\.venv\Scripts\python.exe"
+if exist "%PY%" goto :python_ready
+rem --- 1a. 本机后端解释器（D:\python.exe）：项目内无虚拟环境时用它 ---
+if exist "D:\python.exe" set "PY=D:\python.exe"
 if exist "%PY%" goto :python_ready
 where python >nul 2>nul
 if errorlevel 1 (

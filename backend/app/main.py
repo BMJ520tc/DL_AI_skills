@@ -14,10 +14,11 @@ from app.services import (
     task_manager, agent_service, env_manager, analysis_service,
     preprocess_service, baseline_service, dataset_service, compare_service, download_service,
     paper_service, decompose_service, network_service, distill_service, multi_model_service,
+    assistant_service,
 )
 from app.api import (
     tasks, projects, knowledge, agents, environments, search, analysis, preprocess, datasets, papers,
-    decompose, modules, networks, versions, multi_model, settings, system,
+    decompose, modules, networks, versions, multi_model, settings, system, assistant,
 )
 from app.static_serve import mount_static
 
@@ -40,6 +41,7 @@ async def lifespan(app: FastAPI):
     network_service.register()
     distill_service.register()
     multi_model_service.register()
+    assistant_service.register()
     await task_manager.start()
     yield
     await task_manager.stop()
@@ -89,6 +91,7 @@ app.include_router(versions.router)
 app.include_router(multi_model.router)
 app.include_router(settings.router)
 app.include_router(system.router)
+app.include_router(assistant.router)
 
 
 @app.post("/api/torchlens")

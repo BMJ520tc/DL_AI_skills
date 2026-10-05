@@ -5,6 +5,7 @@
 import { useEffect, useState } from "react";
 import ErrorBoundary from "./components/ErrorBoundary.tsx";
 import SettingsModal from "./components/SettingsModal.tsx";
+import AssistantPanel from "./components/AssistantPanel.tsx";
 import { fetchCredentialsStatus } from "./api/systemClient.ts";
 import FlowEditor from "./FlowEditor.tsx";
 import ProjectListView from "./views/ProjectListView.tsx";
@@ -23,6 +24,7 @@ const FIRST_RUN_SKIP_KEY = "dlai_credentials_skip";
 function App() {
     const [view, setView] = useState<AppView>({ kind: "projects" });
     const [settingsOpen, setSettingsOpen] = useState(false);
+    const [assistantOpen, setAssistantOpen] = useState(false);
     const [firstRun, setFirstRun] = useState(false);
 
     useEffect(() => {
@@ -77,9 +79,33 @@ function App() {
         }
     };
 
+    const assistantContext = {
+        page: view.kind,
+        project_id: view.kind === "viewer" || view.kind === "canvas" ? view.projectId : undefined,
+    };
+
     return (
         <>
             <ErrorBoundary key={viewKey}>{renderView()}</ErrorBoundary>
+            <button
+                onClick={() => setAssistantOpen(v => !v)}
+                title="AI 助手（只读：解释现状 / 给建议，不执行动作）"
+                style={{
+                    position: "fixed",
+                    right: 14,
+                    bottom: 56,
+                    zIndex: 55,
+                    background: "#1e293b",
+                    border: "1px solid #334155",
+                    borderRadius: 20,
+                    color: "#cbd5e1",
+                    padding: "7px 12px",
+                    fontSize: 13,
+                    cursor: "pointer",
+                }}
+            >
+                🤖 助手
+            </button>
             <button
                 onClick={() => setSettingsOpen(true)}
                 title="设置（模型接口凭证 / 运行环境自检）"
@@ -100,6 +126,12 @@ function App() {
                 ⚙ 设置
             </button>
             <SettingsModal open={settingsOpen || firstRun} firstRun={firstRun} onClose={closeSettings} />
+            <AssistantPanel
+                open={assistantOpen}
+                context={assistantContext}
+                onClose={() => setAssistantOpen(false)}
+                onOpenSettings={() => setSettingsOpen(true)}
+            />
         </>
     );
 }

@@ -32,7 +32,8 @@ def test_allowed_tools_excludes_mcp_rule_when_not_attached():
 
 def test_allowed_tools_respects_explicit_base_list():
     tools = agent_service.allowed_tools(True, ["Read"])
-    assert tools == ["Read", agent_service.KNOWLEDGE_MCP_TOOL_RULE]
+    # 挂载知识库 MCP 时，其**全部只读工具**都进白名单（knowledge_search + 平台只读查询）
+    assert tools == ["Read", *agent_service.KNOWLEDGE_MCP_TOOL_RULES]
     # 显式传入的列表不被就地修改
     base = ["Read"]
     agent_service.allowed_tools(True, base)

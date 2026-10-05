@@ -30,10 +30,17 @@ export interface CondaInfo {
     path: string | null;
 }
 
+export interface ClaudeCliInfo {
+    found: boolean;
+    path: string | null;
+    version: string | null;
+}
+
 export interface EnvCheckResult {
     git: GitInfo;
     python: PythonInfo;
     conda: CondaInfo;
+    claude_cli: ClaudeCliInfo;
     data_dir: { path: string; writable: boolean };
     static_served: boolean;
     credentials_configured: boolean;

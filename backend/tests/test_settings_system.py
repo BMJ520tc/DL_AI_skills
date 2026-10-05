@@ -117,11 +117,14 @@ def test_env_check_shape(app_client, monkeypatch, tmp_path):
 
     body = app_client.get("/api/system/env-check").json()
     assert set(body) == {
-        "git", "python", "conda", "data_dir", "static_served", "credentials_configured", "pip_index",
+        "git", "python", "conda", "claude_cli", "data_dir", "static_served",
+        "credentials_configured", "pip_index",
     }
     assert set(body["git"]) == {"found", "path", "version"}
     assert set(body["python"]) == {"found", "python", "py_launcher"}
     assert set(body["conda"]) == {"found", "path"}
+    # Claude Code CLI 自检（大模型步骤需要，学生自装）
+    assert set(body["claude_cli"]) == {"found", "path", "version"}
     # 数据目录 = 当前配置值（开发态项目根 data/），可写性为真
     from app.config import DATA_DIR
 

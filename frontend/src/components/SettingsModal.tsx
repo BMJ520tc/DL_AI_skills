@@ -274,6 +274,21 @@ export default function SettingsModal({ open, firstRun, onClose }: Props) {
                                 </span>
                             </div>
                             <div style={FIELD_ROW}>
+                                <StatusIcon ok={envCheck.claude_cli.found} />
+                                <span>Claude Code CLI</span>
+                                {envCheck.claude_cli.found ? (
+                                    <span style={{ color: "#64748b" }}>
+                                        {envCheck.claude_cli.version ?? envCheck.claude_cli.path}
+                                    </span>
+                                ) : (
+                                    <span style={{ color: "#fca5a5" }}>
+                                        未检测到。大模型步骤（复现 / 拆解 / 蒸馏 / 助手）需要它，请自行安装：
+                                        <InstallLink href="https://www.npmjs.com/package/@anthropic-ai/claude-code"
+                                                     text="npm i -g @anthropic-ai/claude-code" />
+                                    </span>
+                                )}
+                            </div>
+                            <div style={FIELD_ROW}>
                                 <StatusIcon ok={envCheck.data_dir.writable} />
                                 <span>数据目录</span>
                                 <span style={{ color: "#64748b", wordBreak: "break-all" }}>

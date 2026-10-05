@@ -44,6 +44,7 @@ TASK_TIMEOUTS: dict[str, float] = {
     "paper_distill": 3600,  # 论文蒸馏（逐篇 agent 起草，多篇可能耗时）
     "knowledge_distill": 600,  # 任务后蒸馏（单次 agent 起草）
     "network_autotune": 3600,  # 自动调参（逐候选训练，每个训练上限见 TRAIN_TIMEOUT_S）
+    "assistant_chat": 900,  # 前端 AI 助手对话（单次只读 agent 会话）
 }
 
 

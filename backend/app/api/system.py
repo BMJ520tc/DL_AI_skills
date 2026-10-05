@@ -37,6 +37,25 @@ def _python_info() -> dict:
     }
 
 
+def _claude_cli_info() -> dict:
+    """Claude Code CLI 检测（大模型步骤经 claude_agent_sdk spawn 它）——**学生自装**，缺则引导。
+
+    SDK 不带 CLI 二进制（`_bundled/` 为空），平台从 `CLAUDE_CLI_PATH` 或 npm 安装位探测；
+    缺了它，复现/拆解/蒸馏/助手等大模型步骤会如实失败（规矩 7）。
+    """
+    from app.config import _detect_claude_cli
+
+    path = _detect_claude_cli()
+    version = None
+    if path:
+        try:
+            proc = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=15)
+            version = (proc.stdout or proc.stderr).strip() or None
+        except Exception:  # noqa: BLE001 —— 自检只报告
+            pass
+    return {"found": bool(path), "path": path, "version": version}
+
+
 def _data_dir_info() -> dict:
     writable = False
     try:
@@ -57,6 +76,7 @@ def env_check() -> dict:
         "git": _git_info(),
         "python": _python_info(),
         "conda": {"found": bool(conda_path), "path": conda_path},
+        "claude_cli": _claude_cli_info(),
         "data_dir": _data_dir_info(),
         "static_served": SERVE_STATIC,
         "credentials_configured": settings_store.status()["configured"],
