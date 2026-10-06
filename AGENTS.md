@@ -209,6 +209,40 @@ ir 与标准节点混拼不支持、容器通道未实现、单位归一误判�
 **启动后端务必带上模型凭证环境**（`ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`，或在设置页填写凭证），
 否则所有 agent 任务都会以「未登录」立即失败。
 
+**任务看板 + 任务实时进度（2026-10-06，`cfeb1a0`）**：长任务原先「看不到」（`task.progress` 只在结束时写）
+→ `proc_util.run_command` 加 **`on_line` 逐行回调**（返回值语义不变）、复现/训练边跑边写 progress、
+`task_manager.list_tasks(order="board")`（执行中→排队中→时间倒序 + `project_name`）、
+新页面 `views/TaskBoardView.tsx`（按类型分栏 + 进度单行省略 + 详情展开 + 取消/重试 + 3s 轮询）。
+**注意**：`task_manager.update_progress` 是**整体覆盖**，多处写要用 `_merge_progress` 合并。
+
+**论文复现（2026-10-06，`cfeb1a0`）**：入口搬到**首页**（`views/ReproduceView.tsx`，查看器只留先使用/先拆解）；
+**复现板**（数据集/指标/报告值/实测值/偏差/判定）；新表 **`paper_project_binding`** 记「论文↔项目」绑定留痕
+（同一篇论文可用不同项目复现）；面板**离开再回来会接管活跃任务**；复现 agent 能看到 `ws/data`；
+条目 `hyperparams`/`baselines` 的 **JSON 文本列在复现边界解码成对象**（否则脚本按对象取值崩）。
+**坑**：`reproduction_result.run_id` 是**运行** id 不是**任务** id，按它比绑定里的 `last_task_id` 永远比不中
+（要经 `run_record.task_id` 反查）。
+
+**普适性（2026-10-06，`cfeb1a0`）**：拿 **boltz** 实测「换任意仓库还成不成立」，为「真实追踪」补了两类
+**仓库外知识**，都做成**约定脚本 + agent 自动生成 + 可手改**：
+- **输入契约** `<ws>/reports/make_inputs.py`（`build_inputs(model) -> tuple`）——真实仓库的 forward 常不吃
+  「一个张量」（boltz 要 `feats` 特征字典）。**prompt 要求真调仓库的 featurizer/数据管线**（**手抄字段必漏**）。
+- **构造契约** `<ws>/reports/make_model.py`（`build_model(entry_class, checkpoint)`）——**ckpt 的
+  `hyper_parameters` 不足以还原能跑的模型**（boltz 的 `pairformer_args` 没有 `v2`，而当前 forward 无条件传
+  `k_in`）。agent 照抄仓库的 `load_from_checkpoint(...)` 调用即解决。
+- **构造参数**：`_model_loader.instantiate` 会读 ckpt 的 hparams（按签名过滤 + 剔嵌套多余键）。
+- 失败按**构造/输入**分类 → **有界迭代最多 3 轮**；agent 跑满回合但文件已写好时**不丢成果**。
+- **缝合怪**：仓库把包也发在 PyPI → 依赖一引就装成 site-packages 的安装版，而入口类按文件从仓库加载 →
+  两版混跑。修：加载侧 `_prefer_repo_package` 优先仓库源码 + 建环境后 `pip install -e . --no-deps`。
+- **建环境顺带取权重**（扫仓库引用的 URL，去重 / HF→hf-mirror / 断点续传 → `<ws>/data/`）。
+- **镜像 torch 必须钉版本**：pip 只按版本号取高，且 PEP440 本地标签 `cu126` 的 `"cu"` 是 `"cpu"` 的前缀 →
+  **`+cpu` 反而更大**；`--find-links` 还要指到**真正列出 wheel 的那一层**（根目录只有包子目录）。
+- **大图折叠**：IR >400 节点时容器默认折叠（`irAdapter.collapseForDisplay`）。
+**实测结论（重要边界）**：boltz 的 **③补形状已成功**（捕获 **5856 个模块**），但 **`torch.export` 对
+data-dependent 分支导不出**（`boltz/model/modules/encodersv2.py:64` 的
+`if ... torch.any(feats["cyclic_period"] > 0)` → `GuardOnDataDependentSymNode`）→ 追踪生成 IR 回退 agent。
+**下一步**：hook 驱动的追踪（不依赖 export）；且**拆解粒度**待定（顶层模块 vs 每个 Linear——后者对 boltz 是
+几千节点）。
+
 ## 六、提交约定
 
 一次改动一个提交，提交说明写清三件事：**改了什么、为什么改、怎么验证的**。提交之后把这一笔补进
