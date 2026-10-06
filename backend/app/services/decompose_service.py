@@ -17,6 +17,7 @@ import json
 import keyword
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -48,6 +49,7 @@ TASK_INGEST = "module_ingest"
 TRACE_SCRIPT = PROJECT_ROOT / "scripts" / "trace_shapes.py"
 VERIFY_SCRIPT = PROJECT_ROOT / "scripts" / "verify_decompose.py"
 FIDELITY_SCRIPT = PROJECT_ROOT / "scripts" / "ir_fidelity_probe.py"
+TRACE_IR_SCRIPT = PROJECT_ROOT / "scripts" / "trace_ir.py"
 
 # 数值比对阈值（实施约定；仿 REPRO_DEVIATION_* 环境变量覆盖先例）
 DECOMPOSE_NUM_RTOL = float(os.getenv("DECOMPOSE_NUM_RTOL", "1e-5"))
@@ -68,6 +70,13 @@ DECOMPOSE_MAX_NODES = int(os.getenv("DECOMPOSE_MAX_NODES", "60"))
 # 实测能显著改善稳定性（第 1 次就产出结构合法的 IR），但**每次拆解的会话数 × 模块数**，
 # token 消耗高得多；未经验证优于单次路径前，默认仍走单次生成。
 DECOMPOSE_STEPWISE = os.getenv("DECOMPOSE_STEPWISE", "0") != "0"
+# **追踪优先**（默认**关**，置 1 启用）：第 1 次尝试先用**真实追踪**（`scripts/trace_ir.py`，torch.export
+# 机械生成）产出的 IR；它仍要过同一条校验链，不过或追踪不可用即回退 agent，行为与今天完全一致。
+# 为什么：LLM 猜不出忠实 IR（漏模块、把子模块晾成孤立死块），追踪按构造忠实。
+# **前置**：要有真实的 `input_spec.shape`——导出会把数据依赖的维度常量折叠（`arange(size(0))` →
+# `arange(1)`），拿默认形状去追踪会把批量维写死。故缺形状时**跳过追踪**并写明原因
+# （即：首次拆解仍走 agent，补形状后**重新拆解**才走追踪）。
+DECOMPOSE_TRACE_IR = os.getenv("DECOMPOSE_TRACE_IR", "0") != "0"
 # 重试时是否续接上一次 agent 会话。默认**不续接**（每轮全新会话）：实测续接的长会话到后期
 # 常直接「不产出 IR」（12 次里 8 次），换新会话给干净上下文；置 1 可切回续接（省一轮读源码）。
 DECOMPOSE_RETRY_RESUME = os.getenv("DECOMPOSE_RETRY_RESUME", "0") != "0"
@@ -1103,6 +1112,95 @@ def _reason_signature(reason: str) -> str:
     return re.sub(r"\s+", " ", s).strip()[:300]
 
 
+# --------------------------- 追踪优先（DECOMPOSE_TRACE_IR） ---------------------------
+
+# trace_ir.py 只从**入参 IR** 读这几个键；模块树/算子/边/叶子参数全由它自己追踪推导。
+_TRACE_REF_KEYS = ("entry_class", "source_file", "task_type", "input_spec", "entry_args")
+
+
+def _valid_input_shape(shape) -> bool:
+    return bool(shape) and all(isinstance(d, int) and d > 0 for d in shape)
+
+
+def _trace_ref_ir(entry_class: Optional[str], prev_ir: Optional[dict],
+                  hierarchy: list) -> tuple[Optional[dict], str]:
+    """组装 `scripts/trace_ir.py` 的**入参 IR**（它只读 `entry_class`/`source_file`/`input_spec`/`entry_args`）。
+
+    优先沿用上一版 IR——重拆解时用户补的 `shape`/`entry_args`/`extra`/`forward_kwargs` 都在里面，
+    这也正是「补形状后重新拆解」那条路径；否则用请求指定的 `entry_class` + 从结构报告的
+    `module_hierarchy`（元素形如 `{file, class, parent}`）按类名找回定义文件。
+    **必须有真实的 `input_spec.shape`**：导出会把数据依赖的维度**常量折叠**（`arange(size(0))` →
+    `arange(1)`），拿默认形状去追踪会把批量维写死。缺形状时返回原因，由调用方**跳过追踪**。
+    """
+    ref: dict = {}
+    if prev_ir:
+        for key in _TRACE_REF_KEYS:
+            if prev_ir.get(key):
+                ref[key] = prev_ir[key]
+    ec = entry_class or ref.get("entry_class")
+    if not ec:
+        return None, "没有 entry_class（请求未指定、也没有上一版 IR），无法定位入口模型"
+    ref["entry_class"] = ec
+    if not ref.get("source_file"):
+        hit = next((h.get("file") for h in (hierarchy or [])
+                    if h.get("class") == ec and h.get("file")), None)
+        if not hit:
+            return None, f"结构报告里找不到入口类 {ec} 的定义文件（source_file），无法追踪"
+        ref["source_file"] = hit
+    ref.setdefault("task_type", "other")
+    spec = dict(ref.get("input_spec") or {})
+    if not _valid_input_shape(spec.get("shape")):
+        return None, ("追踪需要真实的 input_spec.shape（正整数具体形状）：导出会把数据依赖的维度"
+                      "常量折叠（如 arange(size(0)) → arange(1)），用默认形状会把批量维写死。"
+                      "请先补形状（跑「补形状」，或 PUT /api/projects/{id}/ir/input_spec）再拆解")
+    ref["input_spec"] = spec
+    return ref, ""
+
+
+async def _trace_ir_candidate(source: Path, ws: Path, task_id: str, entry_class: Optional[str],
+                              prev_ir: Optional[dict], hierarchy: list) -> tuple[Optional[dict], str]:
+    """**追踪优先**：在项目环境跑 `scripts/trace_ir.py` 生成 IR 候选 → `(ir|None, 备注)`。
+
+    **绝不抛异常**：开关关闭、环境未就绪、缺前置（真实输入形状）、脚本失败/超时、产物不过结构
+    校验——一律返回 `(None, 原因)`，由调用方回退 agent 路径（即行为与不开开关时完全一致）。
+    """
+    if not DECOMPOSE_TRACE_IR:
+        return None, "追踪优先已关闭（DECOMPOSE_TRACE_IR=0）"
+    python = analysis_service._project_python(ws)
+    if python is None:
+        return None, "项目环境未就绪（未找到独立环境解释器），跳过追踪优先"
+    ref, why = _trace_ref_ir(entry_class, prev_ir, hierarchy)
+    if ref is None:
+        return None, why
+    run_dir = ws / "runs" / "decompose" / task_id / "trace_ir"
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        ref_path = run_dir / "ref_ir.json"
+        out_path = run_dir / "ir.json"
+        ref_path.write_text(json.dumps(ref, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError as e:
+        return None, f"追踪优先准备失败，跳过：{e}"
+    try:
+        rc, log = await proc_util.run_command(
+            [python, str(TRACE_IR_SCRIPT), str(source), str(ref_path), str(out_path)],
+            cwd=str(run_dir), timeout=DECOMPOSE_TRACE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return None, f"追踪生成 IR 超时（>{DECOMPOSE_TRACE_TIMEOUT_S}s）"
+    except Exception as e:  # noqa: BLE001 —— 追踪只是**优先**路径，任何意外都不该阻断拆解
+        return None, f"追踪生成 IR 异常：{e}"
+    if rc != 0:
+        return None, f"追踪生成 IR 失败（rc={rc}）：{(log or '')[-300:]}"
+    try:
+        out = json.loads(out_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        return None, f"追踪产物不可解析：{e}"
+    errors = validate_ir(out)
+    if errors:
+        return None, "追踪产物结构校验未通过：" + "；".join(errors[:3])
+    return out, (f"追踪生成 IR（真实 torch.export）：{len(out.get('nodes') or [])} 节点 / "
+                 f"{len(out.get('edges') or [])} 边")
+
+
 async def _run_decompose(params: dict, task_id: str) -> None:
     project_id = params["project_id"]
     project = _require_original(project_id)
@@ -1135,6 +1233,15 @@ async def _run_decompose(params: dict, task_id: str) -> None:
     prev_reason_sig = ""                 # 上一次失败原因的归一化签名（无进展守卫用）
     stalled = 0
 
+    # **追踪优先**（开关默认关，`DECOMPOSE_TRACE_IR=1` 启用）：第 1 次尝试先用**真实追踪**产出的 IR。
+    # 它照样要过下面**同一条**校验链（结构 / inputs 形态 / 再生成自检 / 用户补参 / 保真度自检）；
+    # 任何一步不过、或追踪不可用（环境/形状/脚本），就记下原因回退 agent。
+    if DECOMPOSE_TRACE_IR:
+        set_stage("追踪优先：在项目环境用真实 torch.export 生成 IR…")
+    preset_ir, trace_note = await _trace_ir_candidate(
+        source, ws, task_id, entry_class, prev_ir, hierarchy)
+    produced_via = "agent"               # 最终 IR 由谁产出：trace / agent（随 run_record 与进度留痕）
+
     def _record_fail(reason: str, bad_ir: Optional[dict] = None) -> None:
         """失败也要留 run_record（架构九.4：失败可检索供 agent 改进）。"""
         entry: dict = {
@@ -1164,8 +1271,14 @@ async def _run_decompose(params: dict, task_id: str) -> None:
             )
             break
         set_stage(_attempt_stage(attempt, DECOMPOSE_AGENT_RETRIES, last_reason))
+        # 第 1 轮优先用**追踪产出**的候选（若有）：它不占用 agent，直接进下面的统一校验链
+        # （`from_trace` **每轮都重置**——否则重试轮的 agent 候选会被误当成追踪产物、白蹭节点上限豁免）。
+        from_trace = False
+        if attempt == 1 and preset_ir is not None:
+            candidate, preset_ir, from_trace = preset_ir, None, True
+            set_stage(f"第 1/{DECOMPOSE_AGENT_RETRIES} 次尝试：追踪 IR 已生成，校验中…")
         # 重试时把上一次的失败原因回喂（能续接则只发修正指令，复用上一轮已读的源码上下文）
-        if DECOMPOSE_STEPWISE:
+        elif DECOMPOSE_STEPWISE:
             # **分步生成**：骨架 → 逐模块展开 → 合并（每步输出短，稳定性好得多）
             hint_all = prompt[len(_decompose_prompt(hierarchy, entry_class)):]  # 知识带入等附注
             try:
@@ -1237,7 +1350,9 @@ async def _run_decompose(params: dict, task_id: str) -> None:
             continue
         # 节点数上限（便宜且确定，先于保真度自检）：IR 越长越不稳——漏字段/漏边/整份不产出都
         # 与输出长度相关。把重复结构折叠掉，既短又稳（参数量不受影响：code_hint 实例化同一构造）。
-        if len(candidate.get("nodes") or []) > DECOMPOSE_MAX_NODES:
+        # **追踪产物豁免**：上限的立论是「LLM 一次输出越长越不稳」，对机械追踪不适用
+        # （实测 scGPT 追踪 IR 61 节点 > 60）。
+        if not from_trace and len(candidate.get("nodes") or []) > DECOMPOSE_MAX_NODES:
             last_reason = (
                 f"节点数 {len(candidate['nodes'])} 超过上限 {DECOMPOSE_MAX_NODES}：单次输出越长越容易"
                 "漏字段/漏边甚至整份不产出——请把**同一构造重复多次的结构**（如 encoder 的 N 层）"
@@ -1269,6 +1384,7 @@ async def _run_decompose(params: dict, task_id: str) -> None:
             _record_fail(last_reason, candidate)
             continue
         ir = candidate
+        produced_via = "trace" if from_trace else "agent"
         break
     if ir is None:
         _record_fail(last_reason)
@@ -1280,14 +1396,18 @@ async def _run_decompose(params: dict, task_id: str) -> None:
 
     knowledge_service.record_run({
         "project_id": project_id, "task_id": task_id, "run_type": "decompose",
-        "command": "agent parse (structure → IR)",
-        "params": {"entry_class": ir.get("entry_class"), "source_file": ir.get("source_file")},
+        "command": ("trace → IR (torch.export)" if produced_via == "trace"
+                    else "agent parse (structure → IR)"),
+        "params": {"entry_class": ir.get("entry_class"), "source_file": ir.get("source_file"),
+                   "via": produced_via},
         "status": "success",
         "metrics": {
             "nodes": len(ir["nodes"]),
             "edges": len(ir["edges"]),
             "uncertain": sum(1 for n in ir["nodes"] if n.get("uncertain")),
             "fidelity": fidelity_note,
+            "via": produced_via,               # trace / agent：这一版 IR 由谁产出（可检索）
+            "trace_note": trace_note,          # 追踪优先的结论（成功摘要 / 跳过原因）
             "knowledge_brought": {
                 "param_advice": len(knowledge.get("param_advice") or []),
                 "dependency_conflict": len(knowledge.get("dependency_conflict") or []),
@@ -1296,11 +1416,15 @@ async def _run_decompose(params: dict, task_id: str) -> None:
         "artifact_path": str(ir_path),
         "started_at": started, "finished_at": _now(),
     })
+    _via = "真实追踪" if produced_via == "trace" else "agent 拆解"
     task_manager.update_progress(task_id, {
-        "stage": f"拆解完成：{ir.get('entry_class')}（{len(ir['nodes'])} 节点 / {len(ir['edges'])} 边）",
+        "stage": (f"拆解完成：{ir.get('entry_class')}（{len(ir['nodes'])} 节点 / "
+                  f"{len(ir['edges'])} 边，{_via}）"),
         "entry_class": ir.get("entry_class"),
         "nodes": len(ir["nodes"]),
         "edges": len(ir["edges"]),
+        "via": produced_via,
+        "trace_note": trace_note,
         "ir_path": str(ir_path),
         # 形状缺失 → 前端提示可跑「补形状」（3.2）
         "shapes_missing": any(
@@ -1431,28 +1555,59 @@ def _merge_shapes(ir: dict, trace_output: dict) -> int:
 def _infer_missing_shapes(ir: dict) -> int:
     """兜底回填：op 节点不是 nn.Module，forward hook 永远抓不到形状。
 
-    按其入边上游的输出形状回填（多输入 op 取声明序第一条：add/残差正确，cat 沿通道拼接为近似）。
-    trace 之后调用，只为仍为 null 的项兜底，不覆盖已知值。
+    **只回填 `input_shape`**（= 上游输出，确凿），**不编造 `output_shape`** —— 上游形状对
+    `select`/`squeeze`/`unsqueeze`/`mean`/`to`/`cross_entropy` 这些**改形状**的算子并不是它的输出，
+    编出来会让画布的连线形状校验**误报「输入形状不匹配」**（实测 scGPT 追踪 IR 16 条红线里 14 条由
+    此而来，用户据此以为「模型根本跑不了」）。形状未知时画布按「缺形状不算失败」放行——**给错值不如给未知**。
+    另：**元数据算子**（`sym_size`/`sym_numel`，产出的是 int 不是张量）不当形状来源；
+    **装配输出算子**（`build_output` 把多分支汇成 dict）没有单一张量形状，不填。
     """
     filled = 0
     node_map = nodes_by_id(ir)
+    # **op 的形状由本函数独占负责** → 先**权威清空**两个字段再重填。
+    # 为什么必须"先清"：`input_shape`/`output_shape` 除本函数外没有别的写入方（hook 抓不到 op），
+    # 所以留在 IR 里的值都是**旧版本编造**的（早期版本把上游输出**同时**写成输入与输出）——
+    # 只"不填"清不掉它们，画布会继续拿旧值判连线形状（实测残留一条假红线：
+    # `cls_decoder_out_layer → build_output`）。先清后填 → 用户**重跑一次「补形状」即可自愈**，不必重拆解。
     for n in ir["nodes"]:
-        if n.get("input_shape") and n.get("output_shape"):
+        if n.get("kind") == "op":
+            n["input_shape"] = None
+            n["output_shape"] = None
+    for n in ir["nodes"]:
+        if str(n.get("class_name")) == "build_output" or n.get("input_shape"):
             continue
         ins = [e for e in ir["edges"] if e["to"] == n["id"]]
         if not ins:
             continue
         src = node_map.get(ins[0]["from"]) or {}
+        if str(src.get("class_name") or "").startswith("sym_"):
+            continue                      # 元数据算子产出的是 int，不是张量形状
         shape = src.get("output_shape") or src.get("input_shape")
         if not shape:
             continue
-        if n.get("input_shape") is None:
-            n["input_shape"] = shape
-            filled += 1
-        if n.get("output_shape") is None:
-            n["output_shape"] = shape
-            filled += 1
+        n["input_shape"] = shape
+        filled += 1
     return filled
+
+
+def _drop_ambiguous_module_input_shape(ir: dict) -> int:
+    """**多入边 module 的 `input_shape` 代表不了各实参** → 清掉（宁缺勿错）。
+
+    画布的连线校验拿「源节点输出」比「目标节点 `input_shape`」。而 module 节点的 `input_shape` 只是
+    hook 捕获的**第一个实参**形状——`MVCDecoder(cell_emb, gene_embs)` 这种多输入模块，第二条入边
+    （`encoder → mvc_decoder`，喂的是 `gene_embs`）与 `input_shape`（cell_emb）当然对不上，
+    于是被误标成红线。清成未知后画布按「缺形状不算失败」放行。
+    """
+    node_map = nodes_by_id(ir)
+    indeg: dict[str, int] = {}
+    for e in ir.get("edges") or []:
+        indeg[e.get("to")] = indeg.get(e.get("to"), 0) + 1
+    dropped = 0
+    for n in ir["nodes"]:
+        if n.get("kind") == "module" and indeg.get(n["id"], 0) > 1 and n.get("input_shape"):
+            n["input_shape"] = None
+            dropped += 1
+    return dropped
 
 
 def _uncovered_modules(ir: dict, trace_output: dict) -> list[str]:
@@ -1540,6 +1695,232 @@ def _record_canonical_unavailable(project_id: str, task_id: str, reason: str) ->
     _warn_canonical_unavailable(task_id, reason)
 
 
+# --------------------------- 造输入约定（make_inputs.py） ---------------------------
+
+# 「模型起来了、但**喂进去的输入**不对」的典型特征（如 boltz 把张量当 feats 字典用）。
+_INPUT_CONTRACT_MARKERS = (
+    "too many indices", "IndexError", "KeyError", "mat1 and mat2 shapes", "size mismatch",
+)
+# 「构造/版本不一致」的特征：模块之间签名对不上（ckpt 与代码版本错位，实测 boltz 的
+# `AttentionPairBias.forward() got an unexpected keyword argument 'k_in'`——v2 参数没传对）。
+# 注意：这类错误**也发生在前向里**，所以必须优先于输入契约判定，否则会去补错的脚本。
+_CONSTRUCTION_MARKERS = ("无法实例化", "unexpected keyword argument")
+
+
+def _make_inputs_file(ws: Path) -> Path:
+    """项目里的「造输入」约定脚本（`scripts/_model_loader.build_inputs` 优先用它）。"""
+    return ws / "reports" / "make_inputs.py"
+
+
+def _looks_like_input_contract_error(log: str) -> bool:
+    text = log or ""
+    return any(marker in text for marker in _INPUT_CONTRACT_MARKERS)
+
+
+_FEATURE_KEY_RE = re.compile(r"""\[["']([A-Za-z_][A-Za-z0-9_]*)["']\]""")
+_TRACEBACK_FILE_RE = re.compile(r'File "([^"]+\.py)", line \d+')
+
+
+def _input_contract_hints(source: Path, log: str) -> dict:
+    """从失败日志推「该看哪些文件」——省掉 agent 满仓库翻的回合。
+
+    做法：失败栈里会出现 `feats["res_type"]` 这类**键名访问**，说明模型在找这些输入；
+    再去仓库里 grep **谁在写这些键**（写的地方就是造输入的地方）。另外把栈里点名的
+    仓库内文件也带上。**纯静态定位、不调模型**，几秒钟的事。
+    """
+    keys = sorted({k for k in _FEATURE_KEY_RE.findall(log or "")
+                   if not k.isdigit() and len(k) > 2})[:12]
+    frames: list[str] = []
+    root = str(source).replace("\\", "/")
+    for f in _TRACEBACK_FILE_RE.findall(log or ""):
+        norm = f.replace("\\", "/")
+        if norm.startswith(root):
+            rel = norm[len(root):].lstrip("/")
+            if rel and rel not in frames:
+                frames.append(rel)
+    hit: dict[str, list[str]] = {k: [] for k in keys}
+    scanned = 0
+    for py in source.rglob("*.py"):
+        rel = str(py.relative_to(source)).replace("\\", "/")
+        if "/build/" in f"/{rel}" or rel.startswith("build/"):
+            continue  # 打包副本，跳过（会重复计数、也把人带偏）
+        scanned += 1
+        if scanned > 400:
+            break
+        try:
+            text = py.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for k in keys:
+            if len(hit[k]) < 3 and (f'"{k}"' in text or f"'{k}'" in text):
+                hit[k].append(rel)
+    producers = sorted({f for files in hit.values() for f in files})[:12]
+    # 测试文件里常有「怎么造一份输入」的现成用法（比读生产代码更省事）
+    tests = sorted({f for files in hit.values() for f in files if "test" in f.lower()})[:6]
+    return {"keys": keys, "frames": frames[:8], "producers": producers, "tests": tests}
+
+
+def _forward_snippet(source: Path, ir: dict, limit: int = 60) -> str:
+    """把入口模型 `forward` 的源码片段摘出来——直接告诉 agent「它在读什么」。"""
+    try:
+        fpath = source / str(ir.get("source_file") or "")
+        text = fpath.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return ""
+    start = None
+    for i, line in enumerate(text):
+        if line.lstrip().startswith("def forward("):
+            start = i
+            break
+    if start is None:
+        return ""
+    return "\n".join(text[start:start + limit])
+
+
+async def _write_make_inputs_with_agent(source: Path, ws: Path, task_id: str, log: str,
+                                        ir: dict | None = None) -> bool:
+    """让 agent 读仓库代码写一份 `make_inputs.py`（定义 `build_inputs(model)`）。
+
+    为什么是这一块交给 agent：结构可以**机械追踪**（torch.export/hook，忠实且不猜），
+    但「该喂什么输入」是**仓库外知识**——boltz 的 forward 要 `feats` 特征字典，
+    代码里只有 `feats["res_type"]` 这种间接线索，得读 featurizer/tests 才推得出。
+    写出来的是**可读、可手改**的脚本，不是黑盒。
+    """
+    target = _make_inputs_file(ws)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    hints = _input_contract_hints(source, log)
+    hint_text = ""
+    if hints["keys"]:
+        hint_text += f"\n模型在找这些**输入键**：{', '.join('`%s`' % k for k in hints['keys'])}\n"
+    if hints["producers"]:
+        hint_text += ("仓库里出现这些键的文件（**先看这些**，造输入的地方就在其中）：\n"
+                      + "".join(f"  - {p}\n" for p in hints["producers"]))
+    if hints["tests"]:
+        hint_text += ("**测试文件**（常有现成的「怎么造输入」用法，比读生产代码省事）：\n"
+                      + "".join(f"  - {p}\n" for p in hints["tests"]))
+    if hints["frames"]:
+        hint_text += ("失败发生在这几个文件里（栈里点名的）：\n"
+                      + "".join(f"  - {p}\n" for p in hints["frames"]))
+    if hint_text:
+        hint_text += "**不要满仓库乱翻**：以上面这些文件为起点即可。\n"
+    forward_src = _forward_snippet(source, ir or {})
+    forward_text = (f"\n入口模型 `forward` 的源码（它开头就在读这些输入）：\n```python\n{forward_src}\n```\n"
+                    if forward_src else "")
+    prompt = (
+        "项目环境里跑「形状追踪」失败：**模型实例化成功了，但喂进去的输入不对**。\n"
+        f"失败日志（尾部）：\n{(log or '')[-2500:]}\n"
+        f"{forward_text}{hint_text}\n"
+        "**最关键的要求**：输入要**真的调用仓库自己的数据管线 / featurizer** 来造"
+        "（给它的 `process()` 等入口喂一个最小的真实样本）——"
+        "**不要照着代码手抄字段名**：实测手抄必然漏键（boltz 就漏了 `contact_pair_index`），"
+        "而走仓库自己的管线不会漏、也不会有形状/ dtype 猜错的问题。\n"
+        "只有在仓库确实没有可复用的造数据代码时，才手工拼字典。\n\n"
+        "然后**写一个文件**：\n"
+        f"{target}\n\n"
+        "文件里定义：\n"
+        "    def build_inputs(model):\n"
+        "        \"\"\"返回喂给 model(*args) 的位置实参元组（实参可以是字典/多路输入）\"\"\"\n"
+        "        ...\n\n"
+        "要求：\n"
+        "1) **用仓库自己的方式**造输入——能复用它的 featurizer 或测试夹具最好，不要凭空编字段名；\n"
+        "2) 规模可以小（追踪不需要真实数据），但必须让 `model.forward` 真跑得通；\n"
+        "3) **只写这一个文件**，不要改动仓库代码；\n"
+        "4) **该文件可能已经存在**（上一轮写的）——存在就在它基础上**补齐**最新报错缺的东西，"
+        "不要从头重写、也不要丢掉已有的键；\n"
+        "5) 写完后回复“已写入”。\n"
+    )
+    try:
+        # 预算放宽到 80 回合：boltz 这种大仓库读代码很吃回合（实测 40 回合不够）
+        await agent_service.run_sync(prompt, cwd=str(source),
+                                     add_dirs=[str(ws / "reports")], max_turns=80, timeout_s=1200)
+    except Exception as e:  # noqa: BLE001
+        # **不要因此丢掉成果**：实测 agent 会把文件写好、然后在同一回合跑满预算而来不及回复
+        # （`Reached maximum number of turns`）。文件在、语法过就照用，失败原因只作留痕。
+        task_manager.update_progress(task_id, {"make_inputs_agent_error": str(e)[:300]})
+    if not target.is_file():
+        return False
+    try:
+        compile(target.read_text(encoding="utf-8"), str(target), "exec")
+    except SyntaxError as e:
+        task_manager.update_progress(task_id, {"make_inputs_error": f"生成的脚本语法错误：{e}"})
+        return False
+    return True
+
+
+def _make_model_file(ws: Path) -> Path:
+    """项目里的「构造模型」约定脚本（`scripts/_model_loader.build_model` 优先用它）。"""
+    return ws / "reports" / "make_model.py"
+
+
+def _looks_like_construction_error(log: str) -> bool:
+    """失败是不是**构造/版本错位**导致（而非输入契约）。这类必须先判——它也发生在前向里。"""
+    text = log or ""
+    return any(marker in text for marker in _CONSTRUCTION_MARKERS)
+
+
+def _construction_hints(source: Path) -> list[str]:
+    """找仓库里「加载/构造模型」的地方（`load_from_checkpoint` 等）——给 agent 指路。"""
+    hits: list[str] = []
+    scanned = 0
+    for py in source.rglob("*.py"):
+        rel = str(py.relative_to(source)).replace("\\", "/")
+        if rel.startswith("build/") or "/build/" in f"/{rel}":
+            continue
+        scanned += 1
+        if scanned > 400:
+            break
+        try:
+            text = py.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if "load_from_checkpoint" in text or "from_pretrained" in text:
+            hits.append(rel)
+    return hits[:8]
+
+
+async def _write_make_model_with_agent(source: Path, ws: Path, task_id: str, log: str) -> None:
+    """让 agent 读仓库的**加载代码**写一份 `make_model.py`（定义 `build_model(entry_class, checkpoint)`）。
+
+    为什么要这一块：很多仓库用 `Model.load_from_checkpoint(ckpt, **覆盖)` 建模型——ckpt 里存的
+    hparams **不足以**还原一个能跑的模型，当前代码期望的参数有一部分只出现在 load 的覆盖里
+    （实测 boltz：ckpt 的 `pairformer_args` 没有 `v2`，而当前 forward 无条件用 v2 才有的参数）。
+    照抄那段加载代码，比平台猜 hparams 靠谱得多。
+    """
+    target = _make_model_file(ws)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    hints = _construction_hints(source)
+    hint_text = ""
+    if hints:
+        hint_text = ("仓库里出现 `load_from_checkpoint`/`from_pretrained` 的文件（**先看这些**）：\n"
+                     + "".join(f"  - {p}\n" for p in hints))
+    prompt = (
+        "项目环境里跑「形状追踪」失败：**模型构造不出来**（不是输入的问题）。\n"
+        f"失败日志（尾部）：\n{(log or '')[-2000:]}\n"
+        f"{hint_text}\n"
+        "这类仓库是用 `Model.load_from_checkpoint(ckpt, **覆盖参数)` 加载模型的——"
+        "**ckpt 里存的 hparams 不足以还原一个能跑的模型**（当前代码期望的一部分参数只出现在 "
+        "load 时的覆盖里）。\n\n"
+        "请阅读仓库里**加载模型的那段代码**，把它的构造方式照抄到下面这个文件：\n"
+        f"{target}\n\n"
+        "文件里定义：\n"
+        "    def build_model(entry_class, checkpoint=None):\n"
+        "        \"\"\"照仓库自己的加载方式构造并返回模型实例；拿不到权重时返回 None\"\"\"\n"
+        "        ...\n\n"
+        "要求：\n"
+        "1) **照抄仓库的加载调用**（含它传入的覆盖参数，如 `pairformer_args=...`），"
+        "权重路径用参数 `checkpoint`；\n"
+        "2) `checkpoint` 为 None 或加载失败时**返回 None**，让平台回退其它构造方式（别抛异常）；\n"
+        "3) **只写这一个文件**，不要改动仓库代码；\n"
+        "4) 写完后回复“已写入”。\n"
+    )
+    try:
+        await agent_service.run_sync(prompt, cwd=str(source),
+                                     add_dirs=[str(ws / "reports")], max_turns=80, timeout_s=1200)
+    except Exception as e:  # noqa: BLE001
+        # 同 make_inputs：agent 可能已写好文件却来不及回复（跑满回合），不因此丢掉成果
+        task_manager.update_progress(task_id, {"make_model_agent_error": str(e)[:300]})
+
+
 async def _run_trace(params: dict, task_id: str) -> None:
     project_id = params["project_id"]
     project = _require_original(project_id)
@@ -1606,6 +1987,33 @@ async def _run_trace(params: dict, task_id: str) -> None:
             _warn_canonical_unavailable(task_id, "形状追踪超时")
             return
         raise RuntimeError("形状追踪超时")
+    # 追踪失败 → 按失败类型补齐对应的「契约脚本」（构造 / 输入），再重试。
+    # 有界迭代：真实仓库常常一次补不齐（先修构造、再缺输入键、再缺另一个键…），
+    # 但每轮都要调 agent（分钟级），故限 3 轮，够收敛又不至于无限烧。
+    if rc != 0 and not only_canonical:
+        for _round in range(3):
+            construction = _looks_like_construction_error(log)
+            inputs = (not construction) and _looks_like_input_contract_error(log)
+            if construction and not _make_model_file(ws).exists():
+                task_manager.update_progress(task_id, {
+                    "stage": "模型构造卡在版本不一致（ckpt 的 hparams 不够）→ 让 agent 读仓库的加载代码写构造脚本…"})
+                await _write_make_model_with_agent(source, ws, task_id, log)
+            elif inputs:
+                task_manager.update_progress(task_id, {
+                    "stage": f"输入契约还没满足（第 {_round + 1} 轮）→ 让 agent 按最新报错补造输入脚本…"})
+                await _write_make_inputs_with_agent(source, ws, task_id, log, ir)
+            else:
+                break
+            if not (_make_model_file(ws).exists() or _make_inputs_file(ws).exists()):
+                break
+            task_manager.update_progress(task_id, {"stage": "已按项目的契约脚本重试形状追踪…"})
+            rc, log = await proc_util.run_command(
+                [python, str(TRACE_SCRIPT), str(source), str(ir_path), str(out_json)],
+                cwd=str(run_dir), timeout=DECOMPOSE_TRACE_TIMEOUT_S,
+            )
+            if rc == 0:
+                break
+
     if rc != 0:
         knowledge_service.record_run({
             "project_id": project_id, "task_id": task_id, "run_type": "decompose_trace",
@@ -1620,6 +2028,7 @@ async def _run_trace(params: dict, task_id: str) -> None:
     shapes = json.loads(out_json.read_text(encoding="utf-8"))
     filled = _merge_shapes(ir, shapes)
     inferred = _infer_missing_shapes(ir)  # op 节点兜底（hook 抓不到）
+    _drop_ambiguous_module_input_shape(ir)  # 多入边 module 的单一 input_shape 代表不了各实参
     edges_filled = _fill_edge_shapes(ir)  # 边形状（此前无写入方，见该函数 docstring）
     uncovered = _uncovered_modules(ir, shapes)   # 实际执行到、IR 却没拆的子树（agent 漏拆）
     _write_ir(project, ir)

@@ -318,7 +318,18 @@ async def _do_train(params: dict, task_id: str, ctx: dict) -> None:
     ctx["command"] = " ".join(cmd)
     ctx["log_path"] = str(log_path)
     ctx["environment"] = {"python": python, "environment_project_id": env_project_id}
-    rc, output = await proc_util.run_command(cmd, cwd=str(run_dir), timeout=TRAIN_TIMEOUT_S)
+
+    def _on_line(line: str) -> None:
+        # 把 train.py 的逐 epoch 行透到任务进度（原先只在 train.log 里，界面看不到）
+        text = line.strip()
+        if text.startswith("[epoch") or text.startswith("device="):
+            task_manager.update_progress(
+                task_id, {"stage": f"训练中 · {text[:200]}", "command": " ".join(cmd)}
+            )
+
+    rc, output = await proc_util.run_command(
+        cmd, cwd=str(run_dir), timeout=TRAIN_TIMEOUT_S, on_line=_on_line
+    )
     log_path.write_text(output, encoding="utf-8", errors="replace")
     if rc != 0:
         raise RuntimeError(f"训练脚本失败（退出码 {rc}）：{output[-800:]}")

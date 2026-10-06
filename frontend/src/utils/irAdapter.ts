@@ -304,3 +304,46 @@ export function graphIRToFlow(graph: GraphIR): { nodes: Node[]; edges: Edge[] } 
         edges: flow.edges,
     };
 }
+
+/** 超过这个节点数就**默认折叠容器**（只渲染容器本身、不渲染其子孙）。 */
+export const COLLAPSE_HINT_THRESHOLD = 400;
+
+/**
+ * 大图默认折叠：把「位于未展开容器里」的节点剔出去。
+ *
+ * 为什么：真实大模型追踪出来会有几千个模块（boltz 实测 5856），一次性全渲染必卡死。
+ * `expandedIds === null` 时按规模取默认——小图维持原样（全展开，行为不变），大图只留顶层。
+ * 边同步过滤，避免悬挂边（`irToGraphIR` 会按 `ir.edges` 算句柄数）。
+ */
+export function collapseForDisplay(ir: IrGraph, expandedIds: Set<string> | null): IrGraph {
+    const parentOf = new Map(ir.nodes.map(n => [n.id, n.parent_id ?? null]));
+    const withKids = new Set(
+        ir.nodes.filter(n => n.parent_id).map(n => n.parent_id as string),
+    );
+    if (withKids.size === 0) return ir;   // 没有嵌套结构，无从折叠
+    const expanded = expandedIds
+        ?? (ir.nodes.length > COLLAPSE_HINT_THRESHOLD ? new Set<string>() : withKids);
+
+    const hidden = new Set<string>();
+    for (const n of ir.nodes) {
+        let p = parentOf.get(n.id) ?? null;
+        while (p) {
+            if (!expanded.has(p)) {
+                hidden.add(n.id);
+                break;
+            }
+            p = parentOf.get(p) ?? null;
+        }
+    }
+    if (hidden.size === 0) return ir;
+    return {
+        ...ir,
+        nodes: ir.nodes.filter(n => !hidden.has(n.id)),
+        edges: ir.edges.filter(e => !hidden.has(e.from) && !hidden.has(e.to)),
+    };
+}
+
+/** 所有「有子节点」的容器 id（判断能不能折叠 / 一键展开用）。 */
+export function containerIds(ir: IrGraph): string[] {
+    return [...new Set(ir.nodes.filter(n => n.parent_id).map(n => n.parent_id as string))];
+}

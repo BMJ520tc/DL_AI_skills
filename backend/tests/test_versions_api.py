@@ -220,7 +220,7 @@ def test_train_run_commits_metrics_summary(tmp_versions, monkeypatch):
 
     from app.services import network_service, proc_util
 
-    async def fake_run(cmd, *, cwd, timeout):
+    async def fake_run(cmd, *, cwd, timeout, on_line=None):
         Path(cmd[6]).write_text(
             json.dumps({"metrics": {"loss": 0.1, "accuracy": 0.95}}), encoding="utf-8"
         )

@@ -35,6 +35,8 @@ import NetworkRunPanel from "./features/network/NetworkRunPanel";
 import VersionPanel from "./features/network/VersionPanel";
 import { exportNetwork } from "./api/client";
 import { graphIRToFlow } from "./utils/irAdapter";
+import { relayoutWithElk } from "./utils/elkCompoundLayout";
+import type { LayoutDirection } from "./utils/layout";
 import { syncIdFromNodes } from "./features/editor/utils/idUtils";
 
 const TRACE_SEED_PRESETS = [42, 1337, 1234, 2020, 2021];
@@ -193,12 +195,12 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
     const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "warned" | "error">("idle");
     // 版本提交失败原因（图已保存）：必须显示成非成功，不能再一律报「已保存 ✓」（4d-1 版本失败不静默）。
     const [saveWarning, setSaveWarning] = useState<string | null>(null);
-    const handleSaveGraph = async () => {
+    const handleSaveGraph = async (graphOverride?: GraphIR) => {
         if (!onSave || saveState === "saving") return;
         setSaveState("saving");
         setSaveWarning(null);
         try {
-            const feedback = await onSave(buildGraphIR(nodes, edges));
+            const feedback = await onSave(graphOverride ?? buildGraphIR(nodes, edges));
             const versionError = feedback && typeof feedback === "object" ? feedback.versionError : null;
             if (versionError) {
                 setSaveState("warned");
@@ -210,6 +212,24 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
         } catch (err) {
             console.error("保存画布失败", err);
             setSaveState("error");
+        }
+    };
+
+    // **左→右重排**（ELK compound，见 utils/elkCompoundLayout）：一键把画布按数据流从左到右层叠，
+    // 顺便重算容器尺寸。**只在用户点按钮时改**——不自动覆盖拖过的位置；重排后立刻落盘（同「保存画布」口径）。
+    const [layoutDir, setLayoutDir] = useState<LayoutDirection>("LR");
+    const [relayoutState, setRelayoutState] = useState<"idle" | "busy" | "error">("idle");
+    const handleRelayout = async (direction: LayoutDirection) => {
+        if (relayoutState === "busy") return;
+        setRelayoutState("busy");
+        try {
+            const laid = await relayoutWithElk(nodes, edges, direction);
+            setNodes(laid.nodes);
+            await handleSaveGraph(buildGraphIR(laid.nodes, edges));
+            setRelayoutState("idle");
+        } catch (err) {
+            console.error("重排失败", err);
+            setRelayoutState("error");
         }
     };
 
@@ -437,6 +457,39 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                             <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                                 {projectId && (
                                     <>
+                                        <select
+                                            value={layoutDir}
+                                            onChange={e => setLayoutDir(e.target.value as LayoutDirection)}
+                                            title="重排方向"
+                                            style={{
+                                                border: "1px solid #1f2a2f", borderRadius: 8, padding: "6px 8px",
+                                                fontSize: 12, background: "#1e293b", color: "#e2e8f0",
+                                            }}
+                                        >
+                                            <option value="LR">左 → 右</option>
+                                            <option value="TB">上 → 下</option>
+                                        </select>
+                                        <button
+                                            onClick={() => void handleRelayout(layoutDir)}
+                                            disabled={relayoutState === "busy"}
+                                            title="按数据流层叠重排（ELK），并落盘保存"
+                                            style={{
+                                                border: "1px solid #1f2a2f",
+                                                borderRadius: 8,
+                                                padding: "6px 14px",
+                                                fontWeight: 600,
+                                                fontSize: 12,
+                                                cursor: relayoutState === "busy" ? "wait" : "pointer",
+                                                background: relayoutState === "error" ? "#7f1d1d" : "#1e293b",
+                                                color: "#e2e8f0",
+                                            }}
+                                        >
+                                            {relayoutState === "busy"
+                                                ? "重排中…"
+                                                : relayoutState === "error"
+                                                  ? "重排失败，重试"
+                                                  : "重新布局"}
+                                        </button>
                                         <button
                                             onClick={() => void handleExportCode()}
                                             disabled={exportState === "busy"}
@@ -500,7 +553,7 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                                     </>
                                 )}
                                 <button
-                                    onClick={handleSaveGraph}
+                                    onClick={() => void handleSaveGraph()}
                                     disabled={saveState === "saving"}
                                     title={saveState === "warned" && saveWarning ? saveWarning : undefined}
                                     style={{

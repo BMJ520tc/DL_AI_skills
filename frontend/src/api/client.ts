@@ -67,6 +67,8 @@ export interface Task {
     error: string | null;
     created_at: string;
     updated_at: string;
+    /** 任务列表接口额外带回（看板直接显示项目名，不必逐条查项目） */
+    project_name?: string | null;
 }
 
 // IR（backend/app/services/ir_schema.py 对应）
@@ -233,6 +235,18 @@ export const putGraph = (projectId: string, graph: GraphIR) =>
 // ---------------------------------------------------------------------------
 
 export const getTask = (taskId: string) => request<Task>(`/api/tasks/${taskId}`);
+
+/** 任务列表（看板用）。order="board"：执行中 → 排队中 → 其余按创建时间倒序。 */
+export const listTasks = (order: "board" | "recent" = "board", limit = 200) =>
+    request<Task[]>(`/api/tasks?order=${order}&limit=${limit}`);
+
+/** 取消任务（仅 queued 可取消；running → 409）。 */
+export const cancelTask = (taskId: string) =>
+    request<{ status: string }>(`/api/tasks/${taskId}/cancel`, { method: "POST" });
+
+/** 重试失败任务（仅 failed；成功/取消 → 409）。 */
+export const retryTask = (taskId: string) =>
+    request<{ status: string }>(`/api/tasks/${taskId}/retry`, { method: "POST" });
 
 /** 轮询任务直至终态（success/failed/cancelled）。 */
 export async function pollTask(taskId: string, intervalMs = 2000): Promise<Task> {
@@ -570,6 +584,8 @@ export interface PaperDetail {
     items: Array<Record<string, unknown>>;
     reproduction_results: Array<Record<string, unknown>>;
     conclusion: Record<string, unknown> | null;
+    /** 论文↔项目 绑定留痕（复现板：这篇论文用过哪些项目复现） */
+    bindings?: Array<Record<string, unknown>>;
 }
 
 export const getPaperDetail = (paperId: string) => request<PaperDetail>(`/api/papers/${paperId}`);

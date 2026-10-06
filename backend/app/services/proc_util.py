@@ -12,7 +12,7 @@ import os
 import signal
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 
 async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
@@ -42,11 +42,14 @@ async def run_command(
     cwd: Optional[str] = None,
     timeout: Optional[float] = None,
     env: Optional[dict] = None,
+    on_line: Optional[Callable[[str], None]] = None,
 ) -> tuple[int, str]:
     """运行命令并返回 (returncode, 合并输出)。
 
     - 超时：杀进程树并抛 `TimeoutError`（不区分大小写，调用方按超时处理）。
     - 被取消（任务 cancel）：杀进程树后把 CancelledError 继续抛给上层。
+    - `on_line`：**逐行回调**（可选），用于把长任务（训练/复现）的 stdout 实时上报进度。
+      返回值仍是完整输出，语义不变；回调自身抛异常不影响被跑的命令。
     - Windows 下命令恒为 list、不经 shell（既有约定）。
     """
     kwargs: dict = {}
@@ -70,12 +73,32 @@ async def run_command(
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         **kwargs,
     )
+
+    async def _drain() -> str:
+        if on_line is None:
+            out, _ = await proc.communicate()
+            return (out or b"").decode("utf-8", errors="replace")
+        chunks: list[str] = []
+        assert proc.stdout is not None
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                break
+            line = raw.decode("utf-8", errors="replace")
+            chunks.append(line)
+            try:
+                on_line(line.rstrip("\r\n"))
+            except Exception:  # noqa: BLE001 —— 进度上报失败不能影响被跑的命令
+                pass
+        await proc.wait()
+        return "".join(chunks)
+
     try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        text = await asyncio.wait_for(_drain(), timeout=timeout)
     except asyncio.TimeoutError:
         await _kill_tree(proc)
         raise
     except asyncio.CancelledError:
         await _kill_tree(proc)
         raise
-    return proc.returncode or 0, (out or b"").decode("utf-8", errors="replace")
+    return proc.returncode or 0, text

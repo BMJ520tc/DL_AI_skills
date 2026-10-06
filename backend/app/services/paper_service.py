@@ -47,7 +47,9 @@ EXTRACT_SECTION_SHARE = float(os.getenv("EXTRACT_SECTION_SHARE", "0.55"))
 EXTRACT_TABLE_SHARE = float(os.getenv("EXTRACT_TABLE_SHARE", "0.35"))
 
 # 4.1 保真核对阈值（O3：先按设计取值，实施期用真实论文校准）
-FIDELITY_PAGE_MIN_CHARS = int(os.getenv("FIDELITY_PAGE_MIN_CHARS", "200"))
+# 保真核对：从 PDF 每页取「指纹」片段（≥ 该长度的行，滤掉页边行号/页眉），
+# 在归一化后的 markdown 里找命中 → 判该页内容有没有进 markdown。
+_FIDELITY_MIN_PROBE_CHARS = int(os.getenv("FIDELITY_MIN_PROBE_CHARS", "40"))
 FIDELITY_MIN_COVERAGE = float(os.getenv("FIDELITY_MIN_COVERAGE", "0.30"))
 
 # D6 可信度分档阈值（O3：先按设计取值，实施期用真实复现数据校准）——按相对误差
@@ -124,13 +126,20 @@ def _get_paper(paper_id: str) -> dict:
 
 
 _NUM_RE = re.compile(r"^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?$")
+# 约数前缀：「约 0.85」「~0.85」「≈0.85」「about 0.85」——数值本身仍是确定的，
+# 只是作者表明近似。剥掉前缀后**其余部分仍必须是纯数值**，不破坏下面的严格口径。
+_APPROX_PREFIX_RE = re.compile(
+    r"^\s*(?:约\s*为|约|大约|approximately|approx\.?|about|around|circa|~=|~|≈|∼)\s*",
+    re.IGNORECASE,
+)
 _UNIT_SUFFIXES = ("个百分点", "%p", "pp", "%", "‰", "‱")
 
 
 def _to_float(value) -> Optional[float]:
     """把报告值/实测值转成浮点。
 
-    只接受真正的数值或「数值+单位符号」（`91.5%`、`1,234`、`9.15e-3`）；
+    只接受真正的数值或「数值+单位符号」（`91.5%`、`1,234`、`9.15e-3`），以及带**约数前缀**的
+    数值（`~0.85`、`≈0.85`、`约 0.85`——剥掉前缀后仍是纯数值）；
     含不等式、区间或文字的写法（`>50% improvement`、`85-90`、`未报告`）一律返回 None，
     由 `_classify` 判为「无法复现」——不从自由文本里抠数字，避免把「提升 50%」当成指标值。
     """
@@ -143,6 +152,7 @@ def _to_float(value) -> Optional[float]:
     text = value.strip().replace("％", "%").replace("，", ",").replace(",", "")
     if not text:
         return None
+    text = _APPROX_PREFIX_RE.sub("", text)
     for suffix in _UNIT_SUFFIXES:
         if text.endswith(suffix):
             text = text[: -len(suffix)].strip()
@@ -267,30 +277,30 @@ def _pdf_page_texts(pdf_path: Optional[str]) -> tuple[Optional[list[str]], Optio
         return None, f"PDF 无法解析: {e}"
 
 
-def _markdown_page_chars(lines: list[str], index: dict) -> tuple[Optional[list[int]], Optional[str]]:
-    """用 section_index 的行→页锚点，把 markdown 各行文本量摊回页码（粗略比对）。
+def _normalize_for_match(text: str) -> str:
+    """归一化文本，用于判断「这段 PDF 文字是否出现在 markdown 里」。
 
-    锚点行属于锚点所在页；两锚点之间的行归前一锚点页；首锚点之前的行归首锚点页
-    （标题/作者页）。索引没有分页信息（如 `--index-only` 重建后 page 全为空）时
-    返回 (None, 原因)，由调用方如实记为「无法按页比对」。
+    只留字母数字（去空白/标点/大小写/markdown 标记/行尾断词连字符），使两侧的
+    排版差异不影响命中判断。
     """
-    anchors: list[tuple[int, int]] = []
-    for key in ("sections", "tables", "equations", "captions"):
-        for entry in index.get(key) or []:
-            line, page = entry.get("line"), entry.get("page")
-            if isinstance(line, int) and isinstance(page, int) and page >= 1:
-                anchors.append((line, page))
-    anchors = sorted(set(anchors))
-    if not anchors:
-        return None, "section_index 无分页信息（page 为空：索引由 --index-only 重建且未继承页码）"
-    per_page = [0] * max(page for _, page in anchors)
-    for i, (line, page) in enumerate(anchors):
-        end = anchors[i + 1][0] if i + 1 < len(anchors) else len(lines) + 1
-        for ln in range(max(line, 1), min(end, len(lines) + 1)):
-            per_page[page - 1] += len(lines[ln - 1].strip())
-    for ln in range(1, max(anchors[0][0], 1)):
-        per_page[anchors[0][1] - 1] += len(lines[ln - 1].strip())
-    return per_page, None
+    t = (text or "").lower().replace("­", "")
+    t = re.sub(r"-\s*\n\s*", "", t)  # 行尾断词（"trans-\nformer" → "transformer"）
+    return re.sub(r"[^0-9a-z一-鿿]+", "", t)
+
+
+def _page_probes(page_text: str, limit: int = 3) -> list[str]:
+    """从一页 PDF 文本里取若干「指纹」片段，用于判断该页内容是否进了 markdown。
+
+    只取足够长的行（滤掉页边行号、页眉页脚等短行），按长度取最长的几条。
+    """
+    lines = [ln.strip() for ln in (page_text or "").splitlines()]
+    lines = [
+        ln for ln in lines
+        if len(ln) >= _FIDELITY_MIN_PROBE_CHARS and not ln.replace(" ", "").isdigit()
+    ]
+    lines.sort(key=len, reverse=True)
+    probes = (_normalize_for_match(ln) for ln in lines[:limit])
+    return [p for p in probes if len(p) >= _FIDELITY_MIN_PROBE_CHARS]
 
 
 def _fidelity_index_gaps(page_texts: list[str], index: dict, tables_path: Optional[Path]) -> list[str]:
@@ -315,11 +325,8 @@ def _fidelity_index_gaps(page_texts: list[str], index: dict, tables_path: Option
             gaps.append(
                 f"pdfplumber 抓到 {len(grid_tables)} 张表格网格，但 markdown 表格索引为 0（表格未落到 markdown）"
             )
-    elif grid_tables and len(index.get("tables") or []) < len(grid_tables) // 2:
-        gaps.append(
-            f"pdfplumber 抓到 {len(grid_tables)} 张表格网格，markdown 只索引到 {len(index['tables'])} 张，"
-            "可能有表格丢失"
-        )
+    # 不再用「网格数 vs 索引数」的半量比对：pdfplumber 会把图片框/分栏线当成表格网格
+    # （实测 scGPT 报 60 张 vs 实际结果表 5 张），分母不可靠 → 只报「markdown 一张表都没有」这种确凿情况。
     figure_pages = [i for i, t in enumerate(page_texts, start=1) if _FIDELITY_FIGURE_RE.search(t or "")]
     has_fig_caption = any((c.get("kind") == "figure") for c in (index.get("captions") or []))
     if figure_pages and not has_fig_caption:
@@ -396,27 +403,37 @@ def _check_fidelity(
                 f"markdown 索引记 {index['n_pages']} 页，PDF 实际 {len(page_texts)} 页（以 PDF 为准）"
             )
 
-        md_per_page, why = _markdown_page_chars(md_text.split("\n"), index)
-        if md_per_page is None:
-            report["coverage"] = {"method": "per-page-text-ratio", "available": False, "reason": why}
-            report["warnings"].append(f"无法按页比对文本覆盖率：{why}")
-        else:
-            rows = []
-            for i, pdf_chars in enumerate(page_chars):
-                md_chars = md_per_page[i] if i < len(md_per_page) else 0
-                rows.append({
-                    "page": i + 1,
-                    "pdf_chars": pdf_chars,
-                    "md_chars": md_chars,
-                    "ratio": round(md_chars / pdf_chars, 4) if pdf_chars else None,
-                })
-            considered = [r for r in rows if r["pdf_chars"] >= FIDELITY_PAGE_MIN_CHARS]
-            low = [r for r in considered if r["ratio"] is not None and r["ratio"] < FIDELITY_MIN_COVERAGE]
-            mean = round(sum(r["ratio"] for r in considered) / len(considered), 4) if considered else None
+        # 逐页判「该页的正文片段有没有进 markdown」。
+        # 不用「按锚点把字符摊回页码」——纯正文页没有标题/表格锚点，会被算成覆盖率 0%，
+        # 明明内容在 markdown 里却报「内容未进入」（实测 scGPT 误报 14 页）。
+        md_norm = _normalize_for_match(md_text)
+        rows = []
+        for i, text in enumerate(page_texts, start=1):
+            probes = _page_probes(text or "")
+            if not probes:
+                continue  # 该页没有足量正文（封面/纯图页/扫描页），不参与判定
+            hits = sum(1 for p in probes if p in md_norm)
+            rows.append({
+                "page": i,
+                "pdf_chars": page_chars[i - 1],
+                "probes": len(probes),
+                "hits": hits,
+                "ratio": round(hits / len(probes), 4),
+            })
+        if not rows:
             report["coverage"] = {
-                "method": "per-page-text-ratio",
+                "method": "per-page-content-presence",
+                "available": False,
+                "reason": "PDF 各页都没有足量正文片段（疑似纯图扫描件）",
+            }
+            report["warnings"].append("无法按页比对内容：PDF 各页都没有足量正文（疑似扫描件）")
+        else:
+            low = [r for r in rows if r["ratio"] < FIDELITY_MIN_COVERAGE]
+            mean = round(sum(r["ratio"] for r in rows) / len(rows), 4)
+            report["coverage"] = {
+                "method": "per-page-content-presence",
                 "available": True,
-                "min_page_chars": FIDELITY_PAGE_MIN_CHARS,
+                "min_probe_chars": _FIDELITY_MIN_PROBE_CHARS,
                 "threshold": FIDELITY_MIN_COVERAGE,
                 "mean_ratio": mean,
                 "pages_below_threshold": [r["page"] for r in low],
@@ -424,12 +441,12 @@ def _check_fidelity(
             }
             for r in low:
                 report["gaps"].append(
-                    f"第 {r['page']} 页 PDF 有 {r['pdf_chars']} 字符文本，markdown 对应部分仅 {r['md_chars']} 字符"
-                    f"（覆盖率 {r['ratio']:.0%}）——该页内容基本未进入 markdown"
+                    f"第 {r['page']} 页 PDF 有 {r['pdf_chars']} 字符文本，但该页正文片段在 markdown 里"
+                    f"只命中 {r['hits']}/{r['probes']} ——疑似该页内容丢失（公式/表格页常见）"
                 )
-            if mean is not None and mean < FIDELITY_MIN_COVERAGE:
+            if mean < FIDELITY_MIN_COVERAGE:
                 report["warnings"].append(
-                    f"按页文本覆盖率均值 {mean:.0%} 低于阈值 {FIDELITY_MIN_COVERAGE:.0%}："
+                    f"按页内容命中率均值 {mean:.0%} 低于阈值 {FIDELITY_MIN_COVERAGE:.0%}："
                     "markdown 与 PDF 差异较大，需人工复核（不静默通过）"
                 )
         report["ok"] = report["error"] is None
@@ -479,10 +496,16 @@ async def _fix_markdown(md_path: Path, index: dict, pdf_path: Optional[str] = No
         "要求：直接 Read 该 markdown，用 Edit 就地修正明显错误，**保持章节标题层级不变**；"
         "只改表格/公式/图注的解析错误，不要重写正文、不要臆造原文没有的内容、不要浏览仓库、"
         "不要修改该 markdown 之外的文件。核对后确认无需改动就保持文件不变，回复“无需修正”；"
-        "有改动则回复“已修正”。"
+        "有改动则回复“已修正”。\n"
+        "**回合预算有限：不要逐页通读整篇 PDF**——最多挑 5~8 页最可能出错的位置"
+        "（多列表格页、公式密集页、图注页，可用 Read 的页码范围一次读多页）核对后立即动手，"
+        "读完没发现问题就回复“无需修正”。"
     )
+    # 回合/超时预算：对照 PDF 核对要多次 Read（57 页论文实测 10 回合不够、20 回合仍被读页吃光）。
+    # 上调到 40 并在 prompt 里限制「不要逐页通读」。失败仍非致命：规则链路已产出 markdown，
+    # 保真核对独立进行，UI 会把 agent_fix 的失败原因如实显示。
     await agent_service.run_sync(
-        prompt, cwd=str(md_path.parent), add_dirs=list(dict.fromkeys(dirs)), max_turns=10, timeout_s=180
+        prompt, cwd=str(md_path.parent), add_dirs=list(dict.fromkeys(dirs)), max_turns=40, timeout_s=360
     )
 
 
@@ -557,7 +580,7 @@ async def _run_parse(params: dict, task_id: str) -> None:
     else:
         log.append(
             f"保真核对通过：PDF {report.get('pdf', {}).get('pages')} 页，"
-            f"按页文本覆盖率均值 {fidelity['coverage_mean']}"
+            f"按页内容命中率均值 {fidelity['coverage_mean']}"
         )
     for warning in fidelity["warnings"]:
         log.append(f"告警：{warning}")
@@ -836,7 +859,17 @@ async def _run_extract(params: dict, task_id: str) -> None:
         "论文报告值(metric_value_reported)、超参数(hyperparams)、对比基线(baselines)。\n"
         "**论文报告值必须取自结果表格中的实际数字**（如 “Table 3 …” 的表格行），"
         "不要因为数字在表格里就标为“未报告”；确实缺失的项才标注为“未报告”，**不要臆造**。\n"
+        "**语言约定**：描述性文字一律**用中文**（split_method 的说明、报告值里的括注说明、"
+        "缺失占位等；缺失一律写中文“未报告”，不要写 “not reported”）。"
+        "但 **dataset_name（数据集名）、metric_name（指标名）、metric_unit（单位）、"
+        "hyperparams 的键名、baselines 的条目、section_ref（章节位置）保留论文原文**——"
+        "这些是专有名词或机器可读字段（指标名要参与归一、数据集名要用于匹配），不要翻译。\n"
         "评价指标名给出论文里的原始写法即可，系统会统一归一到规范指标名。\n"
+        "**一条目只对应一个指标**：结果表同一行给出多个指标（如 Accuracy/Precision/Recall/MacroF1）时，"
+        "**按指标拆成多条**（同数据集、同划分方式，只有指标不同），不要把多个指标塞进同一条，"
+        "metric_name 里也不要出现逗号分隔的多指标。\n"
+        "**metric_value_reported 只写该指标的值**（取结果表里的数字；约数照原样写，如 `~0.85`；"
+        "确实没有数值才写「未报告」），不要写整句结论或多指标拼串——平台要拿它与实测值逐条比对。\n"
         "注意：markdown 表格单元格内的 `<br>` 表示原表该格内换行（常对应另一行数据），"
         "解析时需按列语义区分，不要把两行数字当成一个值。\n"
         '严格按照如下 JSON 结构输出（顶层键必须是 "items"）：\n'
@@ -892,18 +925,39 @@ async def _run_extract(params: dict, task_id: str) -> None:
 # --------------------------- 4.3 自动复现执行 ---------------------------
 
 def reproduce(paper_id: str, project_id: str) -> str:
+    """发起复现。顺带记一次「论文 ↔ 项目」绑定留痕（复现板据此列出用过的项目/环境）。"""
     _get_paper(paper_id)
-    return task_manager.create_task(
+    task_id = task_manager.create_task(
         TASK_REPRODUCE, project_id=project_id, params={"paper_id": paper_id, "project_id": project_id}
     )
+    knowledge_service.record_paper_project_binding(paper_id, project_id, task_id)
+    return task_id
 
 
-async def _run_item(python: str, script: Path, source: Path, item_json: Path, out_json: Path, cwd: Path) -> dict:
-    """跑一条复现；走 proc_util（取消/超时即杀进程树）。"""
+def _merge_progress(task_id: str, **fields) -> None:
+    """合并写任务进度——`update_progress` 是**整体覆盖**，直接写会冲掉同批的键。"""
+    task = task_manager.get_task(task_id) or {}
+    base: dict = {}
+    if task.get("progress"):
+        try:
+            base = json.loads(task["progress"])
+        except (json.JSONDecodeError, TypeError):
+            base = {}
+    if not isinstance(base, dict):
+        base = {}
+    base.update(fields)
+    task_manager.update_progress(task_id, base)
+
+
+async def _run_item(
+    python: str, script: Path, source: Path, item_json: Path, out_json: Path, cwd: Path,
+    on_line=None,
+) -> dict:
+    """跑一条复现；走 proc_util（取消/超时即杀进程树）。`on_line` 用于实时上报进度。"""
     try:
         rc, log = await proc_util.run_command(
             [python, str(script), str(source), str(item_json), str(out_json)],
-            cwd=str(cwd), timeout=REPRODUCE_TIMEOUT_S,
+            cwd=str(cwd), timeout=REPRODUCE_TIMEOUT_S, on_line=on_line,
         )
     except asyncio.TimeoutError:
         return {"ok": False, "error": f"复现运行超时（>{REPRODUCE_TIMEOUT_S}s，已终止进程树）", "log": ""}
@@ -911,22 +965,71 @@ async def _run_item(python: str, script: Path, source: Path, item_json: Path, ou
     return {"ok": rc == 0, "error": error, "log": log}
 
 
-async def _fill_reproduce_script(source: Path, run_dir: Path, items: list[dict]) -> None:
+# 条目里的结构化字段在库里以 JSON 文本列存储，`SELECT *` 读出来是**字符串**。
+# 交给复现脚本时必须是对象/数组（脚本按 `item["hyperparams"]["lr"]` 取值），否则 AttributeError。
+_ITEM_JSON_FIELDS = ("hyperparams", "baselines")
+
+
+def decode_item_json_fields(item: dict) -> dict:
+    """把条目的 JSON 文本列解回对象/数组（解析不出则原样保留，不吞数据）。"""
+    out = dict(item)
+    for key in _ITEM_JSON_FIELDS:
+        value = out.get(key)
+        if isinstance(value, str) and value.strip():
+            try:
+                out[key] = json.loads(value)
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def _data_inventory(data_dir: Path | None) -> str:
+    """项目数据目录清单（提示给复现 agent，让它就地取材而不是联网下大文件）。"""
+    if data_dir is None or not data_dir.is_dir():
+        return ""
+    try:
+        entries = sorted(p.name + ("/" if p.is_dir() else "") for p in data_dir.iterdir())
+    except OSError:
+        entries = []
+    return f"（内含：{', '.join(entries)}）" if entries else "（为空）"
+
+
+async def _fill_reproduce_script(
+    source: Path, run_dir: Path, items: list[dict], data_dir: Path | None = None
+) -> None:
     """agent 依据项目代码填写复现脚本的 reproduce()（4.3 步骤 1：固定模板 + agent 填空）。"""
     items_brief = [
         {k: it.get(k) for k in ("item_id", "dataset_name", "split_method", "metric_name",
                                 "metric_value_reported", "metric_unit", "hyperparams", "baselines")}
-        for it in items
+        for it in [decode_item_json_fields(it) for it in items]
     ]
+    # 论文数据与预训练权重通常不在代码仓库里（仓库只放取数脚本），而在项目工作区数据目录。
+    # 不把该目录交给 agent，它就只能干猜路径或联网拉几 GB 数据 → 复现必然失败。
+    data_hint = ""
+    if data_dir is not None and data_dir.is_dir():
+        data_hint = (
+            f"\n项目工作区数据目录：{data_dir} {_data_inventory(data_dir)}\n"
+            "复现所需的数据集与预训练权重**优先在该目录下就地查找**（子目录名常与条目 dataset_name 对应，"
+            "如 ms/、hPancreas/），**不要联网下载大文件**；找不到再考虑仓库自带脚本取数。\n"
+        )
     prompt = (
         f"复现脚本模板已放在 {run_dir / 'reproduce.py'}（函数 reproduce(source_dir, item) 待实现）。\n"
-        f"论文对应的代码仓库在 {source}，实验条目如下：\n{json.dumps(items_brief, ensure_ascii=False)}\n\n"
+        f"论文对应的代码仓库在 {source}，实验条目如下：\n{json.dumps(items_brief, ensure_ascii=False)}\n"
+        f"{data_hint}\n"
         "请阅读仓库代码，**原地编辑**该脚本，实现 reproduce()：按条目的数据集、划分方式、"
         "超参数执行评测，返回 {metric_name, metric_value_actual, n_samples, log_tail}。"
-        "不要修改模板的 main() 与输出字段名；无法复现时让脚本非 0 退出即可。完成后回复“已实现”。"
+        "不要修改模板的 main() 与输出字段名；无法复现时让脚本非 0 退出即可。完成后回复“已实现”。\n"
+        "**重要**：只写脚本、**不要自己运行它**（不要执行训练/评测命令，也不要跑冒烟测试）——"
+        "平台随后会在项目环境里按条目执行；自行跑完整训练会占满 GPU、拖慢甚至失败。"
+        "需要确认接口用法时读代码即可，不要实际跑数据。"
     )
+    add_dirs = [str(run_dir), str(run_dir.parent)]
+    if data_dir is not None:
+        add_dirs.append(str(data_dir))
+    # 默认超时 300s 对「读大仓库 + 写完整复现脚本」这类活偏紧（实测 scGPT 上被截断），
+    # 放到 900s：仍受 REPRODUCE_TIMEOUT_S 总预算约束（_collect 内含退避重试）。
     await agent_service.run_sync(
-        prompt, cwd=str(source), add_dirs=[str(run_dir), str(run_dir.parent)], max_turns=40
+        prompt, cwd=str(source), add_dirs=add_dirs, max_turns=40, timeout_s=900
     )
 
 
@@ -960,14 +1063,15 @@ async def _run_reproduce(params: dict, task_id: str) -> None:
                    **await asyncio.to_thread(env_manager.detect_versions, source, python)}
 
     # agent 填空失败则不修脚本，逐条运行会非 0 退出 → 记为「无法复现」（4.3 异常与边界）
+    _merge_progress(task_id, stage=f"写复现脚本（agent 读仓库，共 {len(items)} 条待复现）")
     try:
-        await _fill_reproduce_script(source, run_dir, items)
+        await _fill_reproduce_script(source, run_dir, items, data_dir=ws / "data")
     except Exception as e:  # noqa: BLE001
-        task_manager.update_progress(task_id, {"script_fill": f"failed: {e}"})
+        _merge_progress(task_id, script_fill=f"failed: {e}")
 
     sem = asyncio.Semaphore(REPRODUCE_MAX_PARALLEL)
 
-    async def _one(it: dict) -> dict:
+    async def _one(it: dict, idx: int) -> dict:
         """单条目的复现：运行→落 run_record/metrics/日志→写对照结果。失败不抛出（归无法复现）。
 
         复现输出契约（4.3 模板固定字段）`{metric_name, metric_value_actual, n_samples, log_tail}`
@@ -977,10 +1081,21 @@ async def _run_reproduce(params: dict, task_id: str) -> None:
         async with sem:
             item_json = run_dir / f"item_{it['item_id']}.json"
             out_json = run_dir / f"out_{it['item_id']}.json"
-            item_json.write_text(json.dumps(it, ensure_ascii=False), encoding="utf-8")
+            item_json.write_text(
+                json.dumps(decode_item_json_fields(it), ensure_ascii=False), encoding="utf-8"
+            )
 
             started = _now()
-            run = await _run_item(python, script, source, item_json, out_json, run_dir)
+            label = f"{it.get('dataset_name') or '?'} · {it.get('metric_name') or '?'}"
+            _merge_progress(task_id, stage=f"运行条目 {idx}/{len(items)}：{label}", live=None)
+
+            def _on_line(line: str) -> None:
+                # 只把脚本自己的进度行刷进任务进度（epoch/loss 等），别每行写一次库
+                text = line.strip()
+                if text.startswith("[reproduce]") or text.startswith("epoch"):
+                    _merge_progress(task_id, live=text[:300])
+
+            run = await _run_item(python, script, source, item_json, out_json, run_dir, on_line=_on_line)
 
             payload: dict = {}
             if run["ok"] and out_json.exists():
@@ -1040,7 +1155,8 @@ async def _run_reproduce(params: dict, task_id: str) -> None:
                     "n_samples": n_samples, "metric_value_actual": actual,
                     "ok": actual is not None, "notes": metric_notes}
 
-    gathered = await asyncio.gather(*[_one(it) for it in items], return_exceptions=True)
+    gathered = await asyncio.gather(*[_one(it, i) for i, it in enumerate(items, start=1)],
+                                    return_exceptions=True)
     summary = [r for r in gathered if isinstance(r, dict)]
     log = [
         note for r in summary for note in (r.get("notes") or [])
@@ -1050,7 +1166,7 @@ async def _run_reproduce(params: dict, task_id: str) -> None:
         log.append(f"{len(missing)} 条复现输出未带 n_samples（契约字段缺失，如实记录）")
 
     knowledge_service.update_paper(paper_id, status="reproduced")
-    task_manager.update_progress(task_id, {"count": len(items), "results": summary, "log": log})
+    _merge_progress(task_id, stage="完成", live=None, count=len(items), results=summary, log=log)
 
 
 # --------------------------- 4.4 逐条对照与可信度结论 ---------------------------
@@ -1268,6 +1384,8 @@ def get_detail(paper_id: str) -> dict:
         "items": knowledge_service.list_experiment_items(paper_id),
         "reproduction_results": knowledge_service.list_reproduction_results(paper_id),
         "conclusion": knowledge_service.get_credibility_conclusion(paper_id),
+        # 论文↔项目 绑定留痕（复现板：这篇论文用过哪些项目/环境复现）
+        "bindings": knowledge_service.list_paper_project_bindings(paper_id),
     }
 
 

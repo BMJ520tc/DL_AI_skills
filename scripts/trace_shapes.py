@@ -13,8 +13,8 @@ from pathlib import Path
 import torch
 
 from _model_loader import (
-    call_kwargs, first_tensor, _shape_of, instantiate, load_entry_class, make_dummy_input,
-    make_extra_inputs, prepare_torch,
+    build_inputs, call_kwargs, first_tensor, _shape_of, instantiate, load_entry_class,
+    prepare_torch,
 )
 
 # 从实例化出来的层上读取构造参数。两个用途：
@@ -187,7 +187,7 @@ def main() -> None:
     prepare_torch()
     ir = json.loads(Path(ir_path).read_text(encoding="utf-8"))
     cls = load_entry_class(source_dir, ir["source_file"], ir["entry_class"])
-    model = instantiate(cls, ir.get("entry_args")).eval()
+    model = instantiate(cls, ir.get("entry_args"), source_dir).eval()
 
     spec = ir.get("input_spec") or {}
     shape = list(spec.get("shape") or [])
@@ -199,7 +199,9 @@ def main() -> None:
               "（可用 PUT /api/projects/{id}/ir/input_spec 覆盖）", file=sys.stderr)
     dtype = getattr(torch, str(spec.get("dtype") or "float32"), torch.float32)
     torch.manual_seed(0)
-    inputs = (make_dummy_input(shape, dtype), *make_extra_inputs(spec))
+    # 优先用项目的 make_inputs.py——真实仓库的 forward 常不吃「一个张量」
+    # （boltz 要 feats 特征字典）；没有该脚本时退回 shape+dtype 的 dummy 张量。
+    inputs = build_inputs(model, {**spec, "shape": shape}, source_dir)
 
     result = _capture(model, inputs, call_kwargs(spec))
     result["input_shape"] = shape

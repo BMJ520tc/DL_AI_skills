@@ -280,3 +280,163 @@ def test_instantiate_prefers_entry_args():
 
     with pytest.raises(RuntimeError, match="无法实例化"):
         instantiate(_NeedsArgs)               # 不给 entry_args → 猜测全失败，如实报错
+
+
+# --------------------------- checkpoint hparams 兜底（Lightning 系仓库） ---------------------------
+
+
+class _NeedsStructuredArgs:
+    """模拟 boltz 这类：一二十个结构化必填参数，代码里没有直接构造调用。"""
+
+    def __init__(self, atom_s, atom_z, num_bins, msa_args):
+        self.atom_s, self.atom_z = atom_s, atom_z
+        self.num_bins, self.msa_args = num_bins, msa_args
+
+
+def _save_fake_ckpt(path: Path, hparams: dict) -> None:
+    import torch
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"state_dict": {}, "hyper_parameters": hparams}, str(path))
+
+
+def test_instantiate_falls_back_to_checkpoint_hparams(tmp_path, monkeypatch):
+    """猜测全失败时，从 checkpoint 的 hyper_parameters 拿构造参数（Lightning 系唯一可靠来源）。
+
+    背景：boltz 的 `Boltz2.__init__` 要 13 个必填结构化参数，仓库里只有
+    `load_from_checkpoint`（参数存在 ckpt 的 hparams 里）→ agent 猜不出 → 追踪起不来。
+    """
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+    from _model_loader import instantiate
+
+    ws = tmp_path / "ws"
+    (ws / "source").mkdir(parents=True)
+    hparams = {"atom_s": 128, "atom_z": 128, "num_bins": 64, "msa_args": {"a": 1}}
+    _save_fake_ckpt(ws / "data" / "model.ckpt", hparams)
+
+    model = instantiate(_NeedsStructuredArgs, None, str(ws / "source"))
+    assert model.num_bins == 64 and model.msa_args == {"a": 1}
+
+
+def test_instantiate_checkpoint_is_last_resort(tmp_path, monkeypatch):
+    """entry_args 能给就不读权重（读 ckpt 很贵），且明确指定的 checkpoint 优先。"""
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+    from _model_loader import instantiate
+
+    ws = tmp_path / "ws"
+    (ws / "source").mkdir(parents=True)
+    _save_fake_ckpt(ws / "data" / "wrong.ckpt",
+                    {"atom_s": 1, "atom_z": 1, "num_bins": 1, "msa_args": {}})
+    right = tmp_path / "right.ckpt"
+    _save_fake_ckpt(right, {"atom_s": 9, "atom_z": 9, "num_bins": 9, "msa_args": {"b": 2}})
+    monkeypatch.setenv("DECOMPOSE_CHECKPOINT", str(right))
+
+    # entry_args 足够 → 不去读权重
+    got = instantiate(_NeedsStructuredArgs, {"atom_s": 3, "atom_z": 3, "num_bins": 3, "msa_args": {}},
+                      str(ws / "source"))
+    assert got.num_bins == 3
+
+    # 没有 entry_args → 读显式指定的那个
+    got2 = instantiate(_NeedsStructuredArgs, None, str(ws / "source"))
+    assert got2.num_bins == 9
+
+
+def test_instantiate_without_checkpoint_still_reports_signature(tmp_path):
+    """没有 checkpoint 时行为不变：如实抛「无法实例化」并列出尝试过的候选。"""
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+    from _model_loader import instantiate
+
+    ws = tmp_path / "ws"
+    (ws / "source").mkdir(parents=True)
+    with pytest.raises(RuntimeError, match="无法实例化"):
+        instantiate(_NeedsStructuredArgs, None, str(ws / "source"))
+
+
+# --------------------------- 造输入约定 make_inputs.py ---------------------------
+
+
+def test_build_inputs_prefers_project_make_inputs(tmp_path):
+    """有项目约定脚本就用它（boltz 这种要 `feats` 字典的模型靠它）；没有就退回 dummy 张量。
+
+    背景：真实仓库的 forward 常不吃「一个张量」——boltz 要 feats 特征字典（键多、维度各异，
+    由 featurizer 造）。平台按 shape+dtype 喂 dummy 张量必然 `IndexError`（实测踩到），
+    追踪/验证全卡在第一步。
+    """
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+    from _model_loader import build_inputs
+
+    ws = tmp_path / "ws"
+    src = ws / "source"
+    src.mkdir(parents=True)
+    spec = {"shape": [1, 4], "dtype": "float32"}
+
+    # ① 没有约定脚本 → 退回 shape+dtype 的 dummy 张量（旧行为不变）
+    xs = build_inputs(object(), spec, str(src))
+    assert len(xs) == 1 and tuple(xs[0].shape) == (1, 4)
+
+    # ② 有约定脚本 → 用脚本产物（这里返回一个字典实参）
+    (ws / "reports").mkdir()
+    (ws / "reports" / "make_inputs.py").write_text(
+        "def build_inputs(model):\n"
+        "    import torch\n"
+        "    return ({'feats': torch.zeros(2, 3)},)\n",
+        encoding="utf-8",
+    )
+    xs2 = build_inputs(object(), spec, str(src))
+    assert list(xs2[0]["feats"].shape) == [2, 3]
+
+
+def test_build_inputs_falls_back_when_script_broken(tmp_path):
+    """约定脚本写坏（导入报错/没定义 build_inputs）→ 不阻断，退回 dummy 张量。"""
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+    from _model_loader import build_inputs
+
+    ws = tmp_path / "ws"
+    src = ws / "source"
+    (ws / "reports").mkdir(parents=True)
+    src.mkdir()
+    (ws / "reports" / "make_inputs.py").write_text("import not_a_real_module\n", encoding="utf-8")
+
+    xs = build_inputs(object(), {"shape": [1, 4], "dtype": "float32"}, str(src))
+    assert tuple(xs[0].shape) == (1, 4)
+
+
+def test_instantiate_prefers_project_make_model(tmp_path):
+    """有 `make_model.py` 就优先用它——仓库的 `load_from_checkpoint(**覆盖)` 里有 ckpt 没有的参数。
+
+    实测 boltz：ckpt 的 `pairformer_args` 没有 `v2`，而当前代码的 forward 无条件用 v2 才有的
+    `k_in` → 光靠 ckpt 的 hparams 构造出来的模型跑不了。
+    """
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+    from _model_loader import instantiate
+
+    class _OneArg:
+        def __init__(self, n):
+            self.n = n
+
+    ws = tmp_path / "ws"
+    src = ws / "source"
+    src.mkdir(parents=True)
+    (ws / "reports").mkdir()
+    (ws / "reports" / "make_model.py").write_text(
+        "def build_model(entry_class, checkpoint=None):\n"
+        "    return entry_class(42)          # 模拟「照仓库的加载方式」构造\n",
+        encoding="utf-8",
+    )
+    # 即使给了 entry_args，也以项目构造脚本为准（它最权威）
+    assert instantiate(_OneArg, {"n": 1}, str(src)).n == 42
+
+
+def test_instantiate_make_model_returning_none_falls_back(tmp_path):
+    """约定脚本返回 None（如没权重）→ 回退其它构造方式，不误当成成功。"""
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+    from _model_loader import instantiate
+
+    ws = tmp_path / "ws"
+    src = ws / "source"
+    src.mkdir(parents=True)
+    (ws / "reports").mkdir()
+    (ws / "reports" / "make_model.py").write_text(
+        "def build_model(entry_class, checkpoint=None):\n"
+        "    return None\n", encoding="utf-8")
+    assert instantiate(_NeedsArgs, {"ntoken": 7, "vocab": {}}, str(src)).ntoken == 7

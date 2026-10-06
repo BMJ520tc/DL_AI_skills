@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -223,12 +224,188 @@ async def _run_env_create(params: dict, task_id: str) -> None:
     report("环境已创建，开始安装依赖…")
     ok = await _install_with_fix(source, env_dir, project_id, task_id, env_type, report, ws=ws)
     if ok:
+        # 仓库自己若也发在 PyPI，依赖清单一引就会装成安装版 → 运行时是「仓库入口类 + PyPI 子模块」
+        # 的缝合怪（boltz 实测）。这里换成 editable，从根上避免。
+        await _install_repo_editable(source, env_dir, task_id, report)
         project_manager.update_status(project_id, "env_ready")
         report("环境就绪 ✓")
+        # 建环境顺带把仓库引用的模型权重下下来（失败不连坐环境，如实登记）
+        await _fetch_weights(source, ws, task_id, report)
     else:
         project_manager.update_status(project_id, "env_failed")
         _draft_dependency_conflict(project_id, task_id, "依赖安装（修正循环耗尽）", "")
         raise RuntimeError("环境安装失败（依赖修正循环耗尽）" + _long_path_hint(project_id))
+
+
+# --------------------------- 建环境顺带取模型权重 ---------------------------
+
+# 仓库里引用的权重地址（boltz 那种在 main.py 里写成常量列表）
+_WEIGHT_URL_RE = re.compile(
+    r"https?://[^\s\"'<>)\]}]+\.(?:ckpt|pt|pth|safetensors|bin)\b", re.IGNORECASE
+)
+# 模型权重下载范围：entry=只下与入口类同名的那几个（Boltz2 → boltz2_*）；all=仓库引用到的全部
+ENV_WEIGHT_SCOPE = os.getenv("ENV_WEIGHT_SCOPE", "entry").strip().lower()
+ENV_FETCH_WEIGHTS = os.getenv("ENV_FETCH_WEIGHTS", "1") != "0"
+
+
+def _mirror_url(url: str) -> str:
+    """HuggingFace 官方域名换镜像（本机实测 huggingface.co 不可达、hf-mirror.com 可达）。
+
+    注意：镜像对**大文件**会 302 回官方 CDN，所以下载必须带断点续传 + 重试。
+    """
+    return url.replace("https://huggingface.co/", "https://hf-mirror.com/")
+
+
+def plan_weight_downloads(source: Path, entry_class: Optional[str] = None) -> list[dict]:
+    """扫仓库源码里引用的权重地址 → 按**文件名去重**（HF 换镜像）→ 可选按入口类名过滤。
+
+    只扫 `.py`（引用都写在代码里）；同名地址只保留一条，优先镜像地址。
+    """
+    by_name: dict[str, str] = {}
+    for py in source.rglob("*.py"):
+        try:
+            text = py.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for raw in _WEIGHT_URL_RE.findall(text):
+            name = raw.rsplit("/", 1)[-1]
+            if not name:
+                continue
+            url = _mirror_url(raw)
+            # 已有镜像地址就别被官方地址覆盖（反过来可以）
+            if name not in by_name or "hf-mirror" in url:
+                by_name[name] = url
+    plans = [{"filename": n, "url": u} for n, u in sorted(by_name.items())]
+    if entry_class and ENV_WEIGHT_SCOPE != "all":
+        key = entry_class.strip().lower()
+        filtered = [p for p in plans if key and key in p["filename"].lower()]
+        if filtered:  # 过滤后为空则退回全部，避免"因为名字对不上就一个都不下"
+            plans = filtered
+    return plans
+
+
+async def _fetch_weights(source: Path, ws: Path, task_id: str, report) -> None:
+    """把仓库引用的权重下到 `<ws>/data/`（脚本按约定会自动发现）。
+
+    - **断点续传**（`curl -C -`）+ 重试：镜像对大文件会 302 回官方 CDN，实测会中途停滞。
+    - **不连坐**：某个权重下不下来只记日志，环境仍算就绪（权重不是每个仓库都需要）。
+    """
+    if not ENV_FETCH_WEIGHTS:
+        return
+    try:
+        entry_class = _entry_class_of(ws)
+        plans = plan_weight_downloads(source, entry_class)
+    except Exception as e:  # noqa: BLE001 —— 扫描失败不该影响环境
+        report("权重扫描失败（不影响环境就绪）", weights_error=str(e)[:200])
+        return
+    if not plans:
+        return
+
+    dest_dir = ws / "data"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    report(f"取模型权重：{len(plans)} 个（{', '.join(p['filename'] for p in plans)}）",
+           weights_planned=[p["filename"] for p in plans])
+    done: list[str] = []
+    failed: list[str] = []
+    for i, p in enumerate(plans, start=1):
+        dest = dest_dir / p["filename"]
+        label = f"权重 {i}/{len(plans)} {p['filename']}"
+        ok, note = await _download_weight(p["url"], dest, label, report)
+        if ok:
+            done.append(p["filename"])
+        else:
+            failed.append(f"{p['filename']}：{note}")
+    fields = {"weights_done": done}
+    if failed:
+        fields["weights_failed"] = failed
+    report(
+        f"权重取回 {len(done)}/{len(plans)} 个" + (f"（失败 {len(failed)} 个）" if failed else ""),
+        **fields,
+    )
+
+
+def _entry_class_of(ws: Path) -> Optional[str]:
+    """从项目当前的 IR 里取入口类名（用于按名字挑该模型的权重）；取不到就算了。"""
+    try:
+        ir = json.loads((ws / "reports" / "ir.json").read_text(encoding="utf-8"))
+        value = ir.get("entry_class")
+        return str(value) if value else None
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+
+
+async def _download_weight(url: str, dest: Path, label: str, report) -> tuple[bool, str]:
+    """下单个权重（断点续传 + 重试）。返回 (是否成功, 失败说明)。"""
+    cmd = [
+        "curl", "-L", "-C", "-", "--retry", "5", "--retry-delay", "5", "--retry-all-errors",
+        "-sS", "-o", str(dest), url,
+    ]
+    task = asyncio.create_task(proc_util.run_command(cmd))
+    try:
+        while not task.done():
+            await asyncio.sleep(5)
+            size = dest.stat().st_size if dest.exists() else 0
+            report(f"{label}：已下 {size // 1048576} MB…", weights_current={
+                "file": dest.name, "downloaded_mb": size // 1048576,
+            })
+        rc, out = await task
+    except Exception as e:  # noqa: BLE001
+        return False, f"下载异常 {e}"
+    if rc != 0:
+        return False, (out or f"curl 退出码 {rc}")[-300:]
+    if not dest.exists() or dest.stat().st_size == 0:
+        return False, "下载后文件为空"
+    report(f"{label}：完成（{dest.stat().st_size // 1048576} MB）")
+    return True, ""
+
+
+def _repo_package_name(source: Path) -> Optional[str]:
+    """仓库**自己发布**的包名（pyproject.toml / setup.cfg / setup.py）。"""
+    try:
+        text = (source / "pyproject.toml").read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r'^\s*name\s*=\s*["\']([^"\']+)["\']', text, re.M)
+        if m:
+            return m.group(1)
+    except OSError:
+        pass
+    for fn in ("setup.cfg", "setup.py"):
+        try:
+            text = (source / fn).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        m = re.search(r'name\s*=\s*["\']([^"\']+)["\']', text)
+        if m:
+            return m.group(1)
+    return None
+
+
+async def _install_repo_editable(source: Path, env_dir: Path, task_id: str, report) -> None:
+    """把**仓库自身**按 editable 装上（`pip install -e . --no-deps`）。
+
+    为什么需要：很多仓库把自己也发到 PyPI，依赖清单一引就装成了**安装版**——运行时变成
+    「仓库的入口类 + PyPI 的子模块」这种**缝合怪**（boltz 实测：仓库的 `boltz2.py` 配
+    site-packages 的 `boltz 2.2.1`，报 `AttentionPairBias.forward() got an unexpected
+    keyword argument`，**追踪的根本不是仓库这份代码**）。editable 装上后 `import` 直接命中仓库源码。
+    `--no-deps`：依赖已由主安装装过，这里只换来源、不动依赖图。失败**不连坐**（如实登记）——
+    加载侧还有「优先仓库包」的兜底。
+    """
+    if not (source / "pyproject.toml").is_file() and not (source / "setup.py").is_file() \
+            and not (source / "setup.cfg").is_file():
+        return
+    pip = _env_pip(env_dir)
+    cmd = [pip, "install", "-e", str(source), "--no-deps",
+           "--retries", str(PIP_RETRIES), "--timeout", str(PIP_TIMEOUT_S)]
+    try:
+        rc, out = await proc_util.run_command(cmd, timeout=INSTALL_TIMEOUT_S)
+    except Exception as e:  # noqa: BLE001
+        report(f"仓库源码安装（editable）异常：{str(e)[:200]}")
+        return
+    name = _repo_package_name(source) or "（未识别到包名）"
+    if rc == 0:
+        report(f"已把仓库自身按 editable 安装（{name}）：运行时用仓库源码，不会混 PyPI 版")
+    else:
+        report(f"仓库自身 editable 安装失败（{name}）——加载侧会兜底优先仓库源码",
+               repo_editable_error=(out or "")[-300:])
 
 
 def _long_path_hint(project_id: str) -> str:
@@ -369,6 +546,14 @@ async def _install_with_fix(
         # CUDA 降级结论必须可见：进任务进度，且随 environment.cuda_plan 进每次安装的 run_record
         extra_index_url = cuda_plan.get("index")
         _report("检测到 CUDA 要求，改用 CPU 版 wheel", env_cuda=cuda_plan)
+    elif cuda_plan.get("action") == "cuda_wheel":
+        # 有 NVIDIA 驱动 → **先把 torch 从 CUDA 轮子索引装上**，再做主安装。
+        # 单独一步是**确定性**的做法：`--extra-index-url` 只在版本比较上让 `2.14.1+cu126` 赢过
+        # `2.14.1`（本地版本标签更大），一旦清单把 torch 钉成精确版本就未必生效。
+        extra_index_url = cuda_plan.get("index")
+        _report("检测到 NVIDIA 驱动，装 CUDA 版 torch", env_cuda=cuda_plan)
+        await _preinstall_torch(pip, cuda_plan, versions, PIP_INDEX_URL, project_id, task_id,
+                                report=_report)
     index_url = PIP_INDEX_URL  # None → 用 pip 自身配置（用户 pip.ini）
 
     attempt = 0
@@ -566,6 +751,21 @@ _FRAMEWORK_ALIASES = {"pytorch": "torch", "pytorch-cuda": "torch", "pytorch-gpu"
 # CPU 版 torch wheel 的额外索引（PEP 440：同一公共版本下 `2.1.2+cpu` 高于 `2.1.2`，
 # 故把 CPU 索引作为额外索引交给 pip，pip 会优先取 CPU 版 wheel；主索引仍可服务其余依赖）。
 CPU_TORCH_INDEX = os.getenv("ENV_CPU_TORCH_INDEX", "https://download.pytorch.org/whl/cpu")
+
+# **有 NVIDIA 驱动就装 CUDA 版 torch**（2026-10-06）：默认索引（Windows 上的 PyPI/镜像）给的 `torch`
+# 是 **CPU 版**——清单没声明 CUDA 时原来的结论是「按默认 wheel 安装」，于是环境永远拿不到 GPU 轮子
+# （实测 scGPT 环境装出 `torch 2.14.1+cpu`）。候选 tag 从高到低取**驱动支持的最高者**，并做一次
+# 轻量可达性探测（索引 404/不可达就往下降一档）。`ENV_USE_GPU_TORCH=0` 关闭；`ENV_CUDA_TORCH_INDEX`
+# 可指名索引；`ENV_PYTORCH_WHEEL_ROOT` 可换轮子根（走镜像时用）。
+GPU_TORCH_ENABLED = os.getenv("ENV_USE_GPU_TORCH", "1") != "0"
+CUDA_TORCH_INDEX_OVERRIDE = os.getenv("ENV_CUDA_TORCH_INDEX")
+PYTORCH_WHEEL_ROOT = os.getenv("ENV_PYTORCH_WHEEL_ROOT", "https://download.pytorch.org/whl").rstrip("/")
+_CUDA_TAGS = ("cu130", "cu128", "cu126", "cu124", "cu121", "cu118")
+# **国内镜像（任一即可）**：官方 CDN 下 2.5GB 的 CUDA wheel 极易 `ReadTimeoutError`（2026-10-06 实测
+# 直接失败）；镜像站是**扁平目录**（不是 PEP503 索引），所以要按 `--find-links` 传，不能当 `--index-url`。
+# 形如 `ENV_PYTORCH_FIND_LINKS=https://mirror.sjtu.edu.cn/pytorch-wheels/cu126`（逗号分隔多个）。
+CUDA_FIND_LINKS = [u.strip().rstrip("/") + "/" for u in
+                   (os.getenv("ENV_PYTORCH_FIND_LINKS") or "").split(",") if u.strip()]
 
 _CUDA_SUFFIX_RE = re.compile(r"\+(cu\d{2,3})\b")
 _CUDA_INDEX_RE = re.compile(r"/(cu\d{2,3})(?=[/\s\"']|$)")
@@ -924,28 +1124,109 @@ def _required_cuda(source: Path) -> Optional[dict]:
     return None
 
 
-def plan_cuda(source: Path, versions: dict) -> dict:
-    """驱动 CUDA 与依赖要求的判定（2.3「异常与边界」：不匹配 → 记录并降级 CPU 运行）。
+_TORCH_LINE_RE = re.compile(r"^\s*[-'\"]?\s*(?:[\w.-]+::)?(torch|pytorch)\s*(?P<spec>[=<>!~][^\s'\";#]*)?",
+                            re.IGNORECASE)
 
-    返回结论字典（进 run_record 的 environment.cuda_plan 与任务进度，不静默）：
-    action=None 按默认 wheel 安装；action="cpu_wheel" 时 index 为 CPU 版 wheel 额外索引。
+
+def _torch_wheel_spec(source: Path) -> str:
+    """依赖清单里 torch 的**版本钉**（如 `torch==2.1.0` → 原样返回；清单没写 → `"torch"`）。
+
+    预装 CUDA 版 torch 时**尊重清单的钉**（只为换 build，不为换版本）；conda 的 `=` 写法归一成 `==`。
+    """
+    for name in ("requirements.txt", "environment.yml", "environment.yaml", "pyproject.toml", "setup.py"):
+        text = _read_text(source / name)
+        for line in text.splitlines():
+            m = _TORCH_LINE_RE.match(line)
+            if not m:
+                continue
+            spec = (m.group("spec") or "").strip()
+            if spec.startswith("=") and not spec.startswith("=="):
+                spec = "=" + spec            # conda `=2.1` → pip `==2.1`
+            return f"torch{spec}" if spec else "torch"
+    return "torch"
+
+
+_INDEX_REACHABLE_CACHE: dict[str, bool] = {}
+
+
+def _index_reachable(index: str, timeout: float = 8.0) -> bool:
+    """wheel 索引根是否可达（进程内缓存，只探一次）。探测失败一律当不可达——**不抛异常**。"""
+    if index in _INDEX_REACHABLE_CACHE:
+        return _INDEX_REACHABLE_CACHE[index]
+    import urllib.request
+
+    ok = False
+    try:
+        req = urllib.request.Request(index.rstrip("/") + "/", method="HEAD")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            ok = 200 <= int(getattr(r, "status", 200)) < 400
+    except Exception:  # noqa: BLE001 —— 探测失败不该让建环境失败，按不可达处理
+        ok = False
+    _INDEX_REACHABLE_CACHE[index] = ok
+    return ok
+
+
+def _pick_cuda_index(driver: Optional[str]) -> tuple[Optional[str], str]:
+    """驱动支持的**最高可用** CUDA 轮子索引 → `(index|None, 说明)`。
+
+    配了 `ENV_PYTORCH_FIND_LINKS` 时**不探测官方索引**（轮子从镜像来，官方 CDN 慢/超时都无所谓）；
+    配了 `ENV_CUDA_TORCH_INDEX` 时按它走、也不探测。
+    """
+    if CUDA_TORCH_INDEX_OVERRIDE:
+        return CUDA_TORCH_INDEX_OVERRIDE, f"由 ENV_CUDA_TORCH_INDEX 指定：{CUDA_TORCH_INDEX_OVERRIDE}"
+    dver = _version_tuple(driver or "")
+    tried: list[str] = []
+    for tag in _CUDA_TAGS:
+        ver = _cuda_tag_to_version(tag)
+        if not ver or dver < _version_tuple(ver):
+            continue                                    # 驱动不支持这一档
+        index = f"{PYTORCH_WHEEL_ROOT}/{tag}"
+        if CUDA_FIND_LINKS:
+            return index, (f"驱动支持 CUDA {driver}，轮子取镜像 {', '.join(CUDA_FIND_LINKS)}"
+                           f"（官方索引 {index} 仅备用）")
+        tried.append(tag)
+        if _index_reachable(index):
+            return index, f"驱动支持 CUDA {driver}，取最高可用轮子索引 {index}"
+    if not tried:
+        return None, f"驱动只到 CUDA {driver}，没有更低的候选（{', '.join(_CUDA_TAGS)}）"
+    return None, f"候选轮子索引都不可达（{', '.join(tried)}，根 {PYTORCH_WHEEL_ROOT}）"
+
+
+def plan_cuda(source: Path, versions: dict) -> dict:
+    """驱动 CUDA 与依赖要求的判定（2.3「异常与边界」）。
+
+    返回结论字典（进 run_record 的 environment.cuda_plan 与任务进度，**不静默**），三种动作：
+      - `action=None`：按默认 wheel 安装（无 GPU / 明确关闭 / 索引不可达）；
+      - `action="cuda_wheel"`：**有 NVIDIA 驱动** → 以 `index` 为索引装 **CUDA 版** torch
+        （清单没声明 CUDA 也照样装：Windows 上默认索引的 torch 就是 CPU 版）；
+      - `action="cpu_wheel"`：清单声明了 CUDA 但驱动不支持 → 降级 CPU 版 wheel。
     """
     required = _required_cuda(source)
     driver = versions.get("cuda")
-    if required is None:
-        return {"driver": driver, "required": None, "match": None, "action": None,
-                "reason": "依赖清单未声明 CUDA 版本，按默认 wheel 安装（不做降级）"}
-    if driver and _version_tuple(driver) >= _version_tuple(required["version"]):
-        return {"driver": driver, "required": required["version"],
-                "requirement_source": required["source"], "match": True, "action": None,
-                "reason": f"驱动支持 CUDA {driver} ≥ 依赖要求 {required['version']}，按默认 wheel 安装"}
-    return {"driver": driver, "required": required["version"],
-            "requirement_source": required["source"], "match": False, "action": "cpu_wheel",
-            "index": CPU_TORCH_INDEX,
-            "reason": (f"依赖要求 CUDA {required['version']}（{required['source']}），本机"
-                       + ("未检测到 NVIDIA 驱动（nvidia-smi 不可用）" if not driver
-                          else f"驱动仅支持 CUDA {driver}")
-                       + f" → 降级 CPU 运行：以额外索引 {CPU_TORCH_INDEX} 选 CPU 版 torch wheel")}
+    base: dict = {"driver": driver,
+                  "required": required["version"] if required else None,
+                  "requirement_source": required["source"] if required else None}
+    if required is not None and not (driver and _version_tuple(driver) >= _version_tuple(required["version"])):
+        return {**base, "match": False, "action": "cpu_wheel", "index": CPU_TORCH_INDEX,
+                "reason": (f"依赖要求 CUDA {required['version']}（{required['source']}），本机"
+                           + ("未检测到 NVIDIA 驱动（nvidia-smi 不可用）" if not driver
+                              else f"驱动仅支持 CUDA {driver}")
+                           + f" → 降级 CPU 运行：以额外索引 {CPU_TORCH_INDEX} 选 CPU 版 torch wheel")}
+    if not GPU_TORCH_ENABLED:
+        return {**base, "match": bool(required), "action": None,
+                "reason": "ENV_USE_GPU_TORCH=0：按默认 wheel 安装（不装 CUDA 版）"}
+    if not driver:
+        return {**base, "match": None, "action": None,
+                "reason": "未检测到 NVIDIA 驱动（nvidia-smi 不可用），按默认 wheel 安装"}
+    index, why = _pick_cuda_index(driver)
+    if index is None:
+        return {**base, "match": None, "action": None, "reason": f"{why} → 按默认 wheel 安装"}
+    return {**base, "match": True, "action": "cuda_wheel", "index": index,
+            "torch_spec": _torch_wheel_spec(source),
+            "find_links": list(CUDA_FIND_LINKS),
+            "reason": (f"{why}；本机有 NVIDIA 驱动（CUDA {driver}）→ 装 **CUDA 版** torch"
+                       + (f"（清单要求 CUDA {required['version']}）" if required
+                          else "（清单未声明 CUDA；默认索引在 Windows 上只给 CPU 版，故这里显式取 CUDA 轮子）"))}
 
 
 def _detect_cuda() -> Optional[str]:
@@ -998,6 +1279,151 @@ def detect_versions(source: Path, python_exe: Optional[str] = None) -> dict:
 
     info["cuda_plan"] = plan_cuda(source, info)
     return info
+
+
+_TORCH_CU_WHEEL_RE = re.compile(r"torch-(\d+\.\d+\.\d+\+cu\d+)-(cp\d+)-[^-]+-([A-Za-z0-9_.]+)\.whl")
+
+
+def _fetch_text(url: str) -> Optional[str]:
+    """取一段文本（镜像的 PEP503 列表页）；失败返回 None，不抛。"""
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310 —— 地址来自平台配置
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _python_tag(python: str) -> Optional[str]:
+    """解释器的 wheel tag（如 cp312）；问不出来就返回 None。"""
+    try:
+        done = subprocess.run(
+            [python, "-c", "import sys;print('cp%d%d' % sys.version_info[:2])"],
+            capture_output=True, text=True, timeout=60,
+        )
+        tag = (done.stdout or "").strip()
+        return tag if tag.startswith("cp") else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _platform_tag() -> str:
+    """本机 wheel 平台标签（子串匹配用）：Windows → win_amd64，其余按 manylinux。"""
+    return "win_amd64" if os.name == "nt" else "manylinux"
+
+
+def resolve_mirror_torch_pin(python: str, find_links: list) -> Optional[tuple]:
+    """从镜像里挑一个**匹配当前解释器/平台**的最新 CUDA 版 torch。
+
+    返回 `(钉, 可用链接)`，例如 `("torch==2.14.1+cu126", "…/cu126/torch/")`；找不到返回 None。
+
+    为什么必须钉版本：pip 在「find-links 镜像 + 主索引」之间**只按版本号取高**，而 PyPI 上的
+    torch 版本号常高于镜像里的 cuXXX 轮子（Windows 上 PyPI 给的就是 CPU 版）→ 镜像被完全忽略。
+    实测：`2.14.1`（CPU）> `2.9.1+cu126`；就算基础版本相同，PEP 440 的**本地版本按段比较**，
+    `cu126`→`["cu",126]` 而 `"cu"` 是 `"cpu"` 的前缀 → **`+cpu` 反而更大**。钉死才覆盖得了这套规则。
+
+    **还要返回链接**：镜像根目录（PEP503）里只有**包子目录**、没有 wheel，`--find-links` 指根目录
+    pip 会说 `from versions: none`（实测踩到）；必须指向真正列出 wheel 的那一层（如 `torch/`）。
+    """
+    tag = _python_tag(python)
+    if not tag:
+        return None
+    plat = _platform_tag()
+    for link in find_links:
+        base = str(link).rstrip("/")
+        for url in (f"{base}/torch/", base):  # PEP503 包子目录 → 扁平目录
+            html = _fetch_text(url)
+            if not html:
+                continue
+            best: Optional[tuple] = None
+            for m in _TORCH_CU_WHEEL_RE.finditer(html.replace("%2B", "+")):
+                full, wheel_tag, wheel_plat = m.group(1), m.group(2), m.group(3)
+                if wheel_tag != tag or plat not in wheel_plat:
+                    continue
+                key = tuple(int(x) for x in full.split("+")[0].split("."))
+                if best is None or key > best[0]:
+                    best = (key, full)
+            if best:
+                return f"torch=={best[1]}", url
+    return None
+
+
+def preinstall_torch_cmd(pip: str, cuda_plan: dict, main_index: Optional[str],
+                         torch_pin: Optional[str] = None,
+                         torch_link: Optional[str] = None) -> list[str]:
+    """CUDA 版 torch 的预装命令（`_preinstall_torch` 与 `scripts/install_cuda_torch.py` 共用一份）。
+
+    配了镜像（`find_links`）就按 `--find-links` 传——且**必须钉住镜像里的版本号**（`torch_pin`）
+    并把链接指到**真正列出 wheel 的那一层**（`torch_link`），否则：
+    ① 主索引上版本号更高的 CPU 版会赢；② 指根目录时 pip 说 `from versions: none`。
+    不能把镜像当 `--index-url`：官方 CDN 下 2.5GB 的 wheel 会 `ReadTimeoutError`（2026-10-06 实测）。
+    """
+    spec = str(torch_pin or cuda_plan.get("torch_spec") or "torch")
+    index = str(cuda_plan.get("index") or "")
+    find_links = [torch_link] if torch_link else [
+        str(u) for u in (cuda_plan.get("find_links") or [])
+    ]
+    cmd = [pip, "install", "--upgrade", spec]
+    if find_links:
+        for link in find_links:
+            cmd += ["--find-links", link]
+        if main_index:
+            cmd += ["--index-url", main_index]      # 其余依赖（torch 的兄弟包）走主索引
+    else:
+        cmd += ["--index-url", index]
+        if main_index:
+            cmd += ["--extra-index-url", main_index]
+    cmd += ["--retries", str(PIP_RETRIES), "--timeout", str(PIP_TIMEOUT_S)]
+    return cmd
+
+
+async def _preinstall_torch(pip: str, cuda_plan: dict, versions: dict,
+                            main_index: Optional[str], project_id: str, task_id: str,
+                            report=None) -> bool:
+    """先从 **CUDA 轮子索引**把 torch 装上（其余依赖仍走主索引）。
+
+    失败**如实登记**（run_record `step="pip_install_torch_cuda"` + 任务进度）并返回 False；
+    主安装仍会带 CUDA 额外索引再试一次，所以这一步失败不等于建环境失败——但绝不静默。
+    `report` 是调用方的进度写手（`_install_with_fix` 里的闭包），不传就直写任务进度。
+    """
+    def _say(stage: str, **extra) -> None:
+        if report is not None:
+            report(stage, **extra)
+        else:
+            task_manager.update_progress(task_id, {**extra, "stage": stage})
+
+    spec = str(cuda_plan.get("torch_spec") or "torch")
+    index = str(cuda_plan.get("index") or "")
+    find_links = [str(u) for u in (cuda_plan.get("find_links") or [])]
+    # 钉住镜像里的版本号——否则主索引上版本号更高的 **CPU 版** torch 会赢（实测过）
+    torch_pin = torch_link = None
+    if find_links:
+        try:
+            python = str(Path(pip).with_name("python.exe" if os.name == "nt" else "python"))
+            resolved = await asyncio.to_thread(resolve_mirror_torch_pin, python, find_links)
+            if resolved:
+                torch_pin, torch_link = resolved
+        except Exception:  # noqa: BLE001 —— 钉不上就回退旧行为，不阻断建环境
+            torch_pin = torch_link = None
+    cmd = preinstall_torch_cmd(pip, cuda_plan, main_index, torch_pin=torch_pin, torch_link=torch_link)
+    started = _now()
+    try:
+        rc, out = await proc_util.run_command(cmd, timeout=INSTALL_TIMEOUT_S)
+        ok = rc == 0
+        error = None if ok else out[-2000:]
+    except asyncio.TimeoutError:
+        ok, error = False, f"CUDA 版 torch 预装超时（>{INSTALL_TIMEOUT_S}s，已终止进程树）"
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        ok, error = False, str(e)
+    result = {"ok": ok, "error": error, "command": " ".join(cmd), "index_url": index,
+              "extra_index_url": main_index, "started_at": started, "finished_at": _now()}
+    _record_install(project_id, task_id, 0, result, versions, "venv", step="pip_install_torch_cuda")
+    _say("CUDA 版 torch 预装成功（后续主安装沿用该索引）" if ok
+         else f"CUDA 版 torch 预装失败（{spec} @ {index}）——继续主安装再试",
+         env_cuda={**cuda_plan, "preinstall_ok": ok, "torch_pin": torch_pin},
+         **({"env_cuda_error": (error or "")[-300:]} if not ok else {}))
+    return ok
 
 
 async def _try_install(pip: str, req_file: Optional[Path], index_url: Optional[str] = None,

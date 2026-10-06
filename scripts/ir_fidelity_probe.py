@@ -20,7 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _model_loader import (   # noqa: E402
     accepted_kwargs, accepted_positional, call_kwargs, first_tensor, instantiate,
-    load_entry_class, make_dummy_input, make_extra_inputs, prepare_torch,
+    load_entry_class, build_inputs, prepare_torch,
 )
 
 MAX_ISSUES = 8
@@ -81,7 +81,7 @@ def main() -> None:
     # 真实模型：起不来就跳过本轮（缺 entry_args / 依赖未装 → 无从比对，不能误判为「不忠实」）
     try:
         cls = load_entry_class(source_dir, ir["source_file"], ir["entry_class"])
-        orig = instantiate(cls, entry_args).eval()
+        orig = instantiate(cls, entry_args, source_dir).eval()
     except Exception as e:  # noqa: BLE001
         _write(out_path, {"ok": True, "skipped": True,
                           "reason": f"真实模型无法实例化（跳过保真度自检）：{type(e).__name__}: {str(e)[:200]}"})
@@ -131,7 +131,7 @@ def main() -> None:
     # 追踪不可用（export 失败）时跳过、不误判。
     from trace_structure import trace_model
 
-    traced = trace_model(orig, ir.get("input_spec") or {})
+    traced = trace_model(orig, ir.get("input_spec") or {}, source_dir)
     traced_modules = traced.get("modules") or []
     if not traced.get("skipped"):
         missing_mods = [m for m in traced_modules if not _covered_by_ir(ir, m["module_path"])]
@@ -157,7 +157,7 @@ def main() -> None:
         fkw = call_kwargs(spec)
         try:
             torch.manual_seed(0)
-            xs = (make_dummy_input(shape, dtype), *make_extra_inputs(spec))
+            xs = build_inputs(orig, {**spec, "shape": shape}, source_dir)
             with torch.no_grad():
                 yo = first_tensor(orig(*accepted_positional(orig.forward, xs),
                                        **accepted_kwargs(orig.forward, fkw)))

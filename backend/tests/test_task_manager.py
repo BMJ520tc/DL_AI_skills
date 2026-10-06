@@ -141,3 +141,61 @@ def test_cancel_queued_task(isolated_db):
     assert task_manager.get_task(tid)["status"] == "cancelled"
     # 已取消的任务不会被 worker 执行
     assert task_manager.retry_task(tid) is False
+
+
+# --------------------------- 看板口径：排序与 project_name ---------------------------
+
+
+def _insert_task_at(task_id: str, task_type: str, status: str, created_at: str,
+                    project_id: str | None = None) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO task(task_id, task_type, project_id, params, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, '{}', ?, ?, ?)",
+            (task_id, task_type, project_id, status, created_at, created_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_list_tasks_board_order_puts_active_first(isolated_db):
+    """看板口径：执行中 → 排队中 → 其余按创建时间倒序。
+
+    纯时间倒序时，一个跑半小时的长任务会被后来创建的一堆短任务挤到看不见的地方——
+    这正是「看不到现在在跑什么」的来源。
+    """
+    _insert_task_at("old-run", "reproduce", "running", "2026-10-01T00:00:01+00:00")
+    _insert_task_at("mid-queued", "network_train", "queued", "2026-10-01T00:00:05+00:00")
+    _insert_task_at("new-failed", "extract_items", "failed", "2026-10-01T00:00:08+00:00")
+    _insert_task_at("new-success", "pdf_parse", "success", "2026-10-01T00:00:09+00:00")
+
+    assert [t["task_id"] for t in task_manager.list_tasks(order="board")] == [
+        "old-run", "mid-queued", "new-success", "new-failed",
+    ]
+    # 默认仍是纯时间倒序（既有行为不变）
+    assert [t["task_id"] for t in task_manager.list_tasks()] == [
+        "new-success", "new-failed", "mid-queued", "old-run",
+    ]
+
+
+def test_list_tasks_includes_project_name(isolated_db):
+    """列表带回 project_name，看板不必再逐条查项目。"""
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO project(project_id, project_type, name, status, workspace_path, "
+            "created_at, updated_at, schema_version) VALUES "
+            "('p1', 'original', '我的项目', 'ready', 'C:/x', '2026-10-01T00:00:00+00:00', "
+            "'2026-10-01T00:00:00+00:00', '1.0')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _insert_task_at("t1", "reproduce", "running", "2026-10-01T00:00:01+00:00", project_id="p1")
+    _insert_task_at("t2", "pdf_parse", "success", "2026-10-01T00:00:02+00:00")
+
+    rows = {t["task_id"]: t for t in task_manager.list_tasks(order="board")}
+    assert rows["t1"]["project_name"] == "我的项目"
+    assert rows["t2"]["project_name"] is None  # 无项目任务不报错

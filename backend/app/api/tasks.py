@@ -20,8 +20,9 @@ def create_task(body: TaskCreate) -> dict:
 
 
 @router.get("")
-def list_tasks(limit: int = 100, offset: int = 0) -> list[dict]:
-    return task_manager.list_tasks(limit, offset)
+def list_tasks(limit: int = 100, offset: int = 0, order: str = "recent") -> list[dict]:
+    """任务列表。`order=board` 按看板口径排序（执行中 → 排队中 → 时间倒序）。"""
+    return task_manager.list_tasks(limit, offset, order)
 
 
 @router.get("/{task_id}")

@@ -199,50 +199,70 @@ def test_fidelity_report_fails_honestly_without_pdf(tmp_path):
     assert saved["ok"] is False and saved["paper_id"] == "p1"
 
 
-def test_fidelity_report_coverage_and_gaps_with_real_pdf(tmp_path, monkeypatch):
-    """有 PDF：给出页数/章节/表格/图注计数、按页覆盖率与明显缺口，并明确告警。"""
-    monkeypatch.setattr(paper_service, "FIDELITY_PAGE_MIN_CHARS", 10)
+def _probe_line(page: str, i: int) -> str:
+    """≥ 40 字符的正文行（保真核对只把长行当「指纹」）。"""
+    return f"page {page} substantive sentence number {i} with enough characters"
+
+
+def test_fidelity_report_flags_only_pages_whose_content_is_absent(tmp_path, monkeypatch):
+    """有 PDF：逐页判「该页正文有没有进 markdown」——只点名**内容确实缺失**的页。
+
+    旧口径按索引锚点摊字符：纯正文页没有锚点 → 一律算 0%，明明内容在也报「未进入」
+    （实测 scGPT 误报 14 页）。新口径直接拿 PDF 每页的正文片段去 markdown 里找。
+    """
     monkeypatch.setattr(paper_service, "FIDELITY_MIN_COVERAGE", 0.9)
     pdf = tmp_path / "paper.pdf"
-    _make_pdf(pdf, [
-        "Title\nAbstract\n" + "\n".join(f"intro line {i}" for i in range(20)),
-        "1 Method\n" + "\n".join(f"method line {i}" for i in range(20)) + "\nTable 1: results",
-    ])
-    md_lines = ["# Title", "Abstract", *[f"intro line {i}" for i in range(20)], "", "## 1 Method"]
+    p1 = [_probe_line("one", i) for i in range(20)]
+    p2 = [_probe_line("two", i) for i in range(20)]
+    _make_pdf(pdf, ["\n".join(p1), "\n".join(p2) + "\nTable 1: results"])
     md = tmp_path / "paper.md"
-    md.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+    md.write_text("# Title\n\nAbstract\n\n" + "\n".join(p1) + "\n", encoding="utf-8")  # 只含第 1 页
+    # 索引故意「无分页锚点」：新口径不依赖它，仍应能逐页判定
     index = {"n_pages": 2, "quality": "text",
-             "sections": [{"level": 1, "title": "Title", "page": 1, "line": 1},
-                          {"level": 2, "title": "1 Method", "page": 2,
-                           "line": md_lines.index("## 1 Method") + 1}],
+             "sections": [{"level": 1, "title": "Title", "page": None, "line": 1}],
              "tables": [], "equations": [], "captions": []}
 
     report = paper_service._check_fidelity("p1", str(pdf), md, index, tmp_path / "tables.json")
 
     assert report["ok"] is True and report["error"] is None
     assert report["pdf"]["pages"] == 2 and report["pdf"]["chars"] > 0
-    assert report["markdown"]["sections"] == 2
+    assert report["coverage"]["method"] == "per-page-content-presence"
     assert report["coverage"]["available"] is True
-    assert report["coverage"]["mean_ratio"] is not None
-    assert 2 in report["coverage"]["pages_below_threshold"]
-    assert any("Table" in gap for gap in report["gaps"])
-    assert any("覆盖率均值" in w for w in report["warnings"])
+    assert 1 not in report["coverage"]["pages_below_threshold"]  # 第 1 页内容在 markdown 里
+    assert 2 in report["coverage"]["pages_below_threshold"]      # 第 2 页不在
+    assert any("第 2 页" in gap for gap in report["gaps"])
+    assert any("内容命中率均值" in w for w in report["warnings"])
     assert Path(report["report_path"]).exists()
 
 
-def test_fidelity_report_marks_missing_page_anchors_as_unavailable(tmp_path, monkeypatch):
-    """索引无分页信息（--index-only 重建后 page 为空）：如实记为「无法按页比对」。"""
-    monkeypatch.setattr(paper_service, "FIDELITY_PAGE_MIN_CHARS", 10)
+def test_fidelity_report_index_page_anchors_no_longer_needed(tmp_path, monkeypatch):
+    """索引 page 全为空（--index-only 重建）时，逐页内容判定**照常可用**（旧口径会放弃）。"""
+    monkeypatch.setattr(paper_service, "FIDELITY_MIN_COVERAGE", 0.9)
     pdf = tmp_path / "paper.pdf"
-    _make_pdf(pdf, ["1 Introduction\n" + "\n".join(f"line {i}" for i in range(20))])
+    lines = [_probe_line("one", i) for i in range(20)]
+    _make_pdf(pdf, ["\n".join(lines)])
     md = tmp_path / "paper.md"
-    md.write_text("# 1 Introduction\nsome text\n", encoding="utf-8")
+    md.write_text("# 1 Introduction\n\n" + "\n".join(lines) + "\n", encoding="utf-8")
     index = {"n_pages": None, "quality": "text",
              "sections": [{"level": 1, "title": "1 Introduction", "page": None, "line": 1}],
              "tables": [], "equations": [], "captions": []}
 
     report = paper_service._check_fidelity("p1", str(pdf), md, index)
-    assert report["coverage"]["available"] is False and "无分页信息" in report["coverage"]["reason"]
+    assert report["coverage"]["available"] is True
+    assert report["coverage"]["pages_below_threshold"] == []
+
+
+def test_fidelity_report_scanned_pdf_without_text_is_unavailable(tmp_path):
+    """扫描件（无文本层）：没有可判定的正文片段时如实记「无法按页比对」，不伪造成通过。"""
+    pdf = tmp_path / "paper.pdf"
+    _make_pdf(pdf, ["", "  ", "12\n34"])
+    md = tmp_path / "paper.md"
+    md.write_text("# whatever\n", encoding="utf-8")
+    index = {"n_pages": 3, "quality": "scan", "sections": [], "tables": [], "equations": [], "captions": []}
+
+    report = paper_service._check_fidelity("p1", str(pdf), md, index)
+    assert report["coverage"]["available"] is False
+    assert "扫描" in report["coverage"]["reason"]
     assert any("无法按页比对" in w for w in report["warnings"])
 
 
@@ -466,3 +486,327 @@ def test_normalize_metric_name_reuses_canonical_metrics():
     assert paper_service.normalize_metric_name("  ") is None
     # 未收录的指标名原样规范化保留，不被丢弃
     assert paper_service.normalize_metric_name("BLEU-4") == "bleu_4"
+
+
+# --------------------------- 4.3 复现：让 agent 看得到项目数据 ---------------------------
+
+
+def test_fill_reproduce_script_exposes_project_data_dir(tmp_path, monkeypatch):
+    """复现 agent 必须能就地取数：数据目录进 add_dirs、清单进 prompt。
+
+    背景：论文数据与预训练权重通常不在代码仓库里（仓库只有取数脚本），而在项目工作区
+    `data/` 目录。此前 agent 的可见范围只有 source/ 与本次 run_dir，拿不到数据 → 只能
+    干猜路径或联网拉几 GB，复现必然失败。
+    """
+    captured: dict = {}
+
+    async def _fake_run_sync(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured.update(kwargs)
+
+    monkeypatch.setattr(paper_service.agent_service, "run_sync", _fake_run_sync)
+
+    source = tmp_path / "source"
+    source.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    data_dir = tmp_path / "data"
+    (data_dir / "ms").mkdir(parents=True)
+    (data_dir / "scGPT_human").mkdir()
+
+    asyncio.run(paper_service._fill_reproduce_script(
+        source, run_dir,
+        [{"item_id": "i1", "dataset_name": "ms", "metric_name": "accuracy"}],
+        data_dir=data_dir,
+    ))
+
+    assert str(data_dir) in captured["add_dirs"]
+    assert str(data_dir) in captured["prompt"]
+    assert "ms/" in captured["prompt"] and "scGPT_human/" in captured["prompt"]
+    assert "不要联网下载大文件" in captured["prompt"]
+    # agent 只写字、不自行跑（否则与平台的执行抢 GPU，8GB 卡上会拖慢/失败）
+    assert "不要自己运行它" in captured["prompt"]
+    assert captured["timeout_s"] == 900
+    assert captured["cwd"] == str(source)
+
+
+def test_fill_reproduce_script_without_data_dir_omits_inventory(tmp_path, monkeypatch):
+    """无数据目录时不谎报清单：add_dirs 与旧行为一致，提示里不出现数据目录段。"""
+    captured: dict = {}
+
+    async def _fake_run_sync(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured.update(kwargs)
+
+    monkeypatch.setattr(paper_service.agent_service, "run_sync", _fake_run_sync)
+    source = tmp_path / "source"
+    source.mkdir()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    asyncio.run(paper_service._fill_reproduce_script(source, run_dir, [], data_dir=None))
+
+    assert captured["add_dirs"] == [str(run_dir), str(run_dir.parent)]
+    assert "工作区数据目录" not in captured["prompt"]
+
+
+def test_run_reproduce_passes_workspace_data_dir(tmp_path, monkeypatch):
+    """_run_reproduce 把 <ws>/data 交给脚本填空（接线回归，防提示与调用侧脱节）。"""
+    ws = tmp_path / "ws"
+    (ws / "source").mkdir(parents=True)
+    (ws / "data" / "ms").mkdir(parents=True)
+    captured: dict = {}
+
+    monkeypatch.setattr(paper_service.project_manager, "require_type",
+                        lambda pid, types: {"workspace_path": str(ws)})
+    monkeypatch.setattr(paper_service.analysis_service, "_project_python", lambda w: "python")
+    monkeypatch.setattr(paper_service.knowledge_service, "list_experiment_items",
+                        lambda pid: [{"item_id": "i1", "metric_name": "accuracy", "status": "confirmed"}])
+    monkeypatch.setattr(paper_service.knowledge_service, "clear_reproduction_results", lambda pid: None)
+    monkeypatch.setattr(paper_service.env_manager, "detect_env_type", lambda w: "venv")
+    monkeypatch.setattr(paper_service.env_manager, "detect_versions", lambda s, p: {})
+    monkeypatch.setattr(paper_service.knowledge_service, "record_run", lambda rec: "rid")
+    monkeypatch.setattr(paper_service.knowledge_service, "record_reproduction_result", lambda rec: "resid")
+    monkeypatch.setattr(paper_service.knowledge_service, "update_paper", lambda pid, **kw: None)
+    monkeypatch.setattr(paper_service.task_manager, "update_progress", lambda tid, payload: None)
+
+    async def _fake_fill(source, run_dir, items, data_dir=None):
+        captured["data_dir"] = data_dir
+
+    async def _fake_run_item(*args, **kwargs):
+        return {"ok": False, "error": "stub", "log": ""}
+
+    monkeypatch.setattr(paper_service, "_fill_reproduce_script", _fake_fill)
+    monkeypatch.setattr(paper_service, "_run_item", _fake_run_item)
+
+    asyncio.run(paper_service._run_reproduce(
+        {"paper_id": "scgpt", "project_id": "p1"}, "task1"))
+
+    assert captured["data_dir"] == ws / "data"
+
+
+def test_decode_item_json_fields_parses_text_columns():
+    """条目 JSON 文本列（hyperparams/baselines）必须解回对象/数组再交给复现脚本。
+
+    否则脚本按 `item["hyperparams"]["epochs"]` 取值会 'str' object has no attribute 'get'
+    （scGPT 复现实测踩到）。
+    """
+    item = {
+        "item_id": "i1",
+        "hyperparams": '{"epochs": 10, "lr": 0.0001}',
+        "baselines": '["TOSICA", "scBert"]',
+        "metric_name": "Accuracy",
+    }
+    out = paper_service.decode_item_json_fields(item)
+    assert out["hyperparams"] == {"epochs": 10, "lr": 0.0001}
+    assert out["baselines"] == ["TOSICA", "scBert"]
+    assert out["metric_name"] == "Accuracy"  # 其余字段原样
+    assert item["hyperparams"] == '{"epochs": 10, "lr": 0.0001}'  # 不改原对象
+
+
+def test_decode_item_json_fields_keeps_unparseable_and_empty():
+    """解析不出/为空/已是对象时都不抛异常、不丢数据。"""
+    assert paper_service.decode_item_json_fields({"hyperparams": None})["hyperparams"] is None
+    assert paper_service.decode_item_json_fields({"hyperparams": ""})["hyperparams"] == ""
+    assert paper_service.decode_item_json_fields({"hyperparams": "{not json"})["hyperparams"] == "{not json"
+    already = {"baselines": ["a"]}
+    assert paper_service.decode_item_json_fields(already)["baselines"] == ["a"]
+
+
+def test_run_reproduce_writes_structured_item_json(tmp_path, monkeypatch):
+    """写盘给脚本的 item_*.json 里 hyperparams 是对象、baselines 是数组（契约回归）。"""
+    ws = tmp_path / "ws"
+    (ws / "source").mkdir(parents=True)
+    captured: dict = {}
+
+    monkeypatch.setattr(paper_service.project_manager, "require_type",
+                        lambda pid, types: {"workspace_path": str(ws)})
+    monkeypatch.setattr(paper_service.analysis_service, "_project_python", lambda w: "python")
+    monkeypatch.setattr(paper_service.knowledge_service, "list_experiment_items",
+                        lambda pid: [{"item_id": "i9", "metric_name": "accuracy", "status": "confirmed",
+                                      "hyperparams": '{"epochs": 3}', "baselines": '["a"]'}])
+    monkeypatch.setattr(paper_service.knowledge_service, "clear_reproduction_results", lambda pid: None)
+    monkeypatch.setattr(paper_service.env_manager, "detect_env_type", lambda w: "venv")
+    monkeypatch.setattr(paper_service.env_manager, "detect_versions", lambda s, p: {})
+    monkeypatch.setattr(paper_service.knowledge_service, "record_run", lambda rec: "rid")
+    monkeypatch.setattr(paper_service.knowledge_service, "record_reproduction_result", lambda rec: "resid")
+    monkeypatch.setattr(paper_service.knowledge_service, "update_paper", lambda pid, **kw: None)
+    monkeypatch.setattr(paper_service.task_manager, "update_progress", lambda tid, payload: None)
+
+    async def _fake_fill(source, run_dir, items, data_dir=None):
+        return None
+
+    async def _fake_run_item(python, script, source, item_json, out_json, cwd, on_line=None):
+        captured["item"] = json.loads(Path(item_json).read_text(encoding="utf-8"))
+        return {"ok": False, "error": "stub", "log": ""}
+
+    monkeypatch.setattr(paper_service, "_fill_reproduce_script", _fake_fill)
+    monkeypatch.setattr(paper_service, "_run_item", _fake_run_item)
+
+    asyncio.run(paper_service._run_reproduce({"paper_id": "p", "project_id": "p1"}, "t1"))
+
+    assert captured["item"]["hyperparams"] == {"epochs": 3}
+    assert captured["item"]["baselines"] == ["a"]
+
+
+# --------------------------- 4.2 抽取：语言约定 ---------------------------
+
+
+def test_extract_prompt_requires_chinese_for_descriptive_text(tmp_path, monkeypatch):
+    """抽取提示词必须有语言约定：描述性文字中文，专有/机器可读字段保留原文。
+
+    背景：原先提示词无语言约定，条目按论文原文（英文）输出，只有缺失占位是中文
+    「未报告」→ 中英混排。指标名/数据集名不能翻（要参与归一与匹配）。
+    """
+    md = tmp_path / "paper.md"
+    md.write_text("# Method\n\nWe fine-tune on hPancreas with accuracy 0.85.\n", encoding="utf-8")
+    captured: dict = {}
+
+    monkeypatch.setattr(paper_service, "_get_paper",
+                        lambda pid: {"paper_id": pid, "markdown_path": str(md), "section_index": None})
+
+    async def _fake_run_sync(prompt, **kwargs):
+        captured["prompt"] = prompt
+        return {"structured_output": {"items": []}}
+
+    monkeypatch.setattr(paper_service.agent_service, "run_sync", _fake_run_sync)
+    monkeypatch.setattr(paper_service.knowledge_service, "record_experiment_items",
+                        lambda pid, items: [])
+    monkeypatch.setattr(paper_service.knowledge_service, "update_paper", lambda pid, **kw: None)
+    monkeypatch.setattr(paper_service.task_manager, "update_progress", lambda tid, payload: None)
+
+    asyncio.run(paper_service._run_extract({"paper_id": "p"}, "t1"))
+
+    prompt = captured["prompt"]
+    assert "语言约定" in prompt
+    # 描述性文字要中文
+    assert "一律**用中文**" in prompt
+    # 机器可读 / 专有名词字段要保留原文
+    for field in ("dataset_name", "metric_name", "metric_unit", "hyperparams", "baselines", "section_ref"):
+        assert field in prompt
+    assert "保留论文原文" in prompt
+    assert "not reported" in prompt  # 明确禁止英文缺失占位
+
+
+# --------------------------- 报告值解析：约数前缀 ---------------------------
+
+
+def test_to_float_accepts_approximation_prefix():
+    """`~0.85` / `≈0.85` / `约 0.85` 是**确定数值**+约数标记，必须能比对。
+
+    背景：平台原先只认纯数值 → 论文里常见的 `~0.85`（scGPT 的 M.S. 条目就是这么写的）
+    被判「无法复现」，即使复现跑出 0.85 也一样——等于这条链路白跑。
+    """
+    assert paper_service._to_float("~0.85") == pytest.approx(0.85)
+    assert paper_service._to_float("≈0.85") == pytest.approx(0.85)
+    assert paper_service._to_float("约 0.85") == pytest.approx(0.85)
+    assert paper_service._to_float("about 0.85") == pytest.approx(0.85)
+    assert paper_service._to_float("~91.5%") == pytest.approx(91.5)
+    assert paper_service._classify(0.856, "~0.85")[2] == paper_service.VERDICT_CONSISTENT
+
+
+def test_to_float_still_rejects_text_inequality_and_range():
+    """严格口径不变：不等式/区间/整句仍判非数值（不因为放宽约数而误抓自由文本里的数字）。"""
+    for bad in (">50% improvement", "85-90", "未报告", "scGPT (fine-tuned)：Accuracy 0.856",
+                "", None, ">0.8 for most cell types (confusion matrix)"):
+        assert paper_service._to_float(bad) is None, bad
+
+
+# --------------------------- 论文↔项目 绑定留痕（复现板） ---------------------------
+
+
+def _insert_project(project_id: str, name: str) -> None:
+    conn = ks.get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO project(project_id, project_type, name, status, workspace_path, "
+            "created_at, updated_at, schema_version) VALUES "
+            "(?, 'original', ?, 'ready', 'C:/x', '2026-10-01T00:00:00+00:00', "
+            "'2026-10-01T00:00:00+00:00', '1.0')",
+            (project_id, name),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_record_binding_upserts_and_keeps_first_time(isolated_db):
+    """同一(论文,项目)重复绑定：uses 累加、last_used/last_task 更新，created_at 保留首次。"""
+    ks.record_paper({"paper_id": "p1", "title": "T"})
+    _insert_project("proj-a", "项目A")
+
+    ks.record_paper_project_binding("p1", "proj-a", "task-1")
+    first = ks.list_paper_project_bindings("p1")[0]
+    assert first["uses"] == 1 and first["last_task_id"] == "task-1"
+
+    ks.record_paper_project_binding("p1", "proj-a", "task-2")
+    rows = ks.list_paper_project_bindings("p1")
+    assert len(rows) == 1, "同一(论文,项目)只应留一条"
+    assert rows[0]["uses"] == 2 and rows[0]["last_task_id"] == "task-2"
+    assert rows[0]["created_at"] == first["created_at"], "首次绑定时间不该被覆盖"
+    assert rows[0]["project_name"] == "项目A"
+
+
+def test_bindings_keep_multiple_projects_for_one_paper(isolated_db):
+    """同一篇论文可以用不同项目复现——每个项目各留一条，最近使用的在前。"""
+    ks.record_paper({"paper_id": "p1", "title": "T"})
+    _insert_project("proj-a", "项目A")
+    _insert_project("proj-b", "项目B")
+
+    ks.record_paper_project_binding("p1", "proj-a", "t1")
+    ks.record_paper_project_binding("p1", "proj-b", "t2")
+
+    rows = ks.list_paper_project_bindings("p1")
+    assert {r["project_id"] for r in rows} == {"proj-a", "proj-b"}
+    assert rows[0]["project_id"] == "proj-b", "最近使用的在前"
+
+
+def test_reproduce_records_binding(isolated_db):
+    """发起复现即记一次绑定（复现板据此列出用过的项目），无需用户额外操作。"""
+    ks.record_paper({"paper_id": "p-scgpt", "title": "scGPT"})
+    _insert_project("proj-x", "scGPT 项目")
+
+    task_id = paper_service.reproduce("p-scgpt", "proj-x")
+
+    rows = ks.list_paper_project_bindings("p-scgpt")
+    assert len(rows) == 1
+    assert rows[0]["project_id"] == "proj-x" and rows[0]["last_task_id"] == task_id
+
+
+def test_re_extract_keeps_bindings_but_paper_delete_clears_them(isolated_db):
+    """重抽取不该抹掉绑定留痕（绑定是论文级的）；删论文才清。"""
+    ks.record_paper({"paper_id": "p1", "title": "T"})
+    _insert_project("proj-a", "A")
+    ks.record_paper_project_binding("p1", "proj-a", "t1")
+
+    ks.record_experiment_items("p1", [{"metric_name": "accuracy"}])   # 重抽取
+    assert len(ks.list_paper_project_bindings("p1")) == 1
+
+    assert ks.delete_item("paper", "p1") is True
+    assert ks.list_paper_project_bindings("p1") == []
+
+
+def test_binding_lists_items_of_that_reproduce_run(isolated_db):
+    """绑定行的「最近一次复现的条目」按 run_record.task_id 反查。
+
+    坑：`reproduction_result.run_id` 是**运行** id，不是任务 id——直接拿绑定里的
+    last_task_id 去比 run_id 会永远比不中（实测绑定行一直显示「—」）。
+    """
+    ks.record_paper({"paper_id": "p1", "title": "T"})
+    _insert_project("proj-a", "A")
+    (item_id,) = ks.record_experiment_items(
+        "p1", [{"metric_name": "accuracy", "metric_value_reported": "0.9"}])
+    ks.record_paper_project_binding("p1", "proj-a", "task-1")
+    run_id = ks.record_run({"project_id": "proj-a", "task_id": "task-1",
+                            "run_type": "reproduce", "status": "success",
+                            "metrics": {"accuracy": 0.88}})
+    ks.record_reproduction_result({"item_id": item_id, "run_id": run_id,
+                                   "metric_value_actual": 0.88, "verdict": "一致"})
+
+    row = ks.list_paper_project_bindings("p1")[0]
+    assert [i["metric_name"] for i in row["last_run_items"]] == ["accuracy"]
+    assert row["last_run_items"][0]["verdict"] == "一致"
+
+    # 换成别的任务 id 再绑一次：这次没有对应运行 → 条目为空（不串上一次的）
+    ks.record_paper_project_binding("p1", "proj-a", "task-2")
+    assert ks.list_paper_project_bindings("p1")[0]["last_run_items"] == []

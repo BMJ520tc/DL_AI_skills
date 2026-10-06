@@ -540,6 +540,83 @@ def list_reproduction_results(paper_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def record_paper_project_binding(paper_id: str, project_id: str, task_id: Optional[str] = None) -> None:
+    """记一次「论文 ↔ 项目」绑定（复现任务创建时调用；按 paper_id+project_id 唯一）。
+
+    同一篇论文可以用**不同项目**（各自的独立环境）复现，所以这里是留痕而不是覆盖：
+    首次写入 created_at，之后只更新 last_used_at / uses / last_task_id。
+    """
+    now = _now()
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO paper_project_binding(paper_id, project_id, created_at, last_used_at, uses, last_task_id)
+            VALUES (?, ?, ?, ?, 1, ?)
+            ON CONFLICT(paper_id, project_id) DO UPDATE SET
+                last_used_at = excluded.last_used_at,
+                uses = uses + 1,
+                last_task_id = excluded.last_task_id
+            """,
+            (paper_id, project_id, now, now, task_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_paper_project_bindings(paper_id: str) -> list[dict]:
+    """列出该论文绑定过的项目（带项目名/状态 + 最近一次复现的条目），最近使用的在前。
+
+    `last_run_items` 按 **run_record.task_id** 反查（`reproduction_result.run_id` 是**运行** id，
+    不是任务 id，直接拿 task_id 去比会永远比不中——实测踩到）。
+    """
+    conn = get_connection()
+    try:
+        rows = [dict(r) for r in conn.execute(
+            """
+            SELECT b.*, p.name AS project_name, p.status AS project_status
+            FROM paper_project_binding b
+            LEFT JOIN project p ON p.project_id = b.project_id
+            WHERE b.paper_id = ?
+            ORDER BY b.last_used_at DESC
+            """,
+            (paper_id,),
+        ).fetchall()]
+        items_rows = conn.execute(
+            """
+            SELECT rr.task_id, r.item_id, r.metric_value_actual, r.deviation, r.verdict,
+                   i.metric_name, i.metric_value_reported, i.metric_unit, i.dataset_name
+            FROM reproduction_result r
+            JOIN experiment_item i ON i.item_id = r.item_id
+            JOIN run_record rr ON rr.run_id = r.run_id
+            WHERE i.paper_id = ?
+            """,
+            (paper_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    by_task: dict[str, list[dict]] = {}
+    for r in items_rows:
+        by_task.setdefault(str(r["task_id"]), []).append({k: r[k] for k in r.keys() if k != "task_id"})
+    for row in rows:
+        row["last_run_items"] = by_task.get(str(row.get("last_task_id")), [])
+    return rows
+
+
+def delete_paper_project_binding(paper_id: str, project_id: str) -> bool:
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "DELETE FROM paper_project_binding WHERE paper_id = ? AND project_id = ?",
+            (paper_id, project_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def record_credibility_conclusion(paper_id: str, conclusion: dict) -> str:
     """写入可信度结论（模块二 4.4）：同论文重算则先删旧结论，保持一论文一结论。
 
@@ -1196,12 +1273,17 @@ def list_paper_ids() -> list[str]:
     return [r["paper_id"] for r in rows]
 
 
-def _delete_paper_children(conn, paper_id: str) -> None:
+def _delete_paper_children(conn, paper_id: str, *, include_bindings: bool = False) -> None:
     """清掉论文的从属数据：条目 → 条目派生的复现结果（**reproduction_result 没有 paper_id**，
     经 item_id 关联）→ 可信度结论（有 paper_id），并同步清理它们的索引条目。
 
     不这样做会在重抽取/删论文后留下 join 不可见的孤儿行（真实库里已出现过）。
+
+    `include_bindings` 只在**删论文**时置 True：重新抽取条目不该抹掉「这篇论文用过哪些项目
+    复现」的留痕（绑定是论文级的，与某次抽取的条目无关）。
     """
+    if include_bindings:
+        conn.execute("DELETE FROM paper_project_binding WHERE paper_id = ?", (paper_id,))
     item_ids = [r[0] for r in conn.execute(
         "SELECT item_id FROM experiment_item WHERE paper_id = ?", (paper_id,)).fetchall()]
     result_ids = []
@@ -1240,7 +1322,7 @@ def delete_item(data_type: str, ref_id: str) -> bool:
             raise ReferenceError(f"{data_type}:{ref_id} 被其他条目引用，禁止删除")
         conn.execute("DELETE FROM unified_index WHERE data_type = ? AND ref_id = ?", (data_type, ref_id))
         if data_type == "paper":
-            _delete_paper_children(conn, ref_id)
+            _delete_paper_children(conn, ref_id, include_bindings=True)
         cur = conn.execute(f"DELETE FROM {table} WHERE {pk} = ?", (ref_id,))
         conn.commit()
         return cur.rowcount > 0

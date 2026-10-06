@@ -3,11 +3,12 @@
 // → 复现执行 → 可信度结论（确认或修改）。
 // 全部驱动既有后端接口（模块二 4.1~4.4），任务轮询复用 useTaskPolling。
 
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import {
     confirmPaperItem,
     getPaperDetail,
     listKnowledge,
+    listTasks,
     postConclusion,
     postExtractItems,
     postParsePaper,
@@ -22,6 +23,8 @@ import { useTaskPolling } from "../../hooks/useTaskPolling";
 
 export type ReproducePanelProps = {
     projectId: string;
+    /** 初始选中的论文（从初始界面的「论文复现」入口带入；不传则空） */
+    initialPaperId?: string;
 };
 
 interface PanelTask {
@@ -114,9 +117,51 @@ function draftText(raw: unknown): string {
     return JSON.stringify(raw);
 }
 
-export default function ReproducePanel({ projectId }: ReproducePanelProps) {
+/** 判定分档配色（与后端 verdict 文案对齐）。 */
+function verdictColor(verdict: string | undefined): string {
+    switch (verdict) {
+        case "一致": return "#4ade80";
+        case "近似": return "#fbbf24";
+        case "不一致": return "#f87171";
+        default: return "#94a3b8";
+    }
+}
+
+/** ISO 时间 → 本地「月-日 时:分」。 */
+function shortTime(raw: unknown): string {
+    if (typeof raw !== "string" || !raw) return "—";
+    const d = new Date(raw);
+    if (Number.isNaN(d.getTime())) return raw.slice(0, 16).replace("T", " ");
+    return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} `
+        + `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** 禁用态样式：默认的 `<button disabled>` 与正常按钮外观一致，会让用户以为「按钮坏了」。 */
+function dimmed(disabled: boolean): CSSProperties {
+    return disabled ? { opacity: 0.45, cursor: "not-allowed" } : {};
+}
+
+/** 本面板发起的任务类型 → 面板内的操作名（用于重新接管任务）。 */
+const RESUME_KINDS: Record<string, string> = {
+    pdf_parse: "parse",
+    extract_items: "extract",
+    reproduce: "reproduce",
+    conclusion: "conclusion",
+};
+
+/** 任务 params 里的 paper_id（任务 params 是 JSON 文本）。 */
+function paperIdOfTask(task: Task): string | null {
+    try {
+        const p = JSON.parse(task.params || "{}") as Record<string, unknown>;
+        return typeof p.paper_id === "string" ? p.paper_id : null;
+    } catch {
+        return null;
+    }
+}
+
+export default function ReproducePanel({ projectId, initialPaperId }: ReproducePanelProps) {
     const [papers, setPapers] = useState<Array<Record<string, unknown>>>([]);
-    const [paperId, setPaperId] = useState("");
+    const [paperId, setPaperId] = useState(initialPaperId ?? "");
     const [detail, setDetail] = useState<PaperDetail | null>(null);
     const [task, setTask] = useState<PanelTask | null>(null);
     const [taskInfo, setTaskInfo] = useState<string | null>(null);
@@ -133,6 +178,8 @@ export default function ReproducePanel({ projectId }: ReproducePanelProps) {
     const [verdictDraft, setVerdictDraft] = useState("");
     const [summaryDraft, setSummaryDraft] = useState("");
     const [savingConclusion, setSavingConclusion] = useState(false);
+    // 绑定记录里展开了哪个项目（看该次复现的条目）
+    const [openBinding, setOpenBinding] = useState<string | null>(null);
 
     useEffect(() => {
         void (async () => {
@@ -174,7 +221,11 @@ export default function ReproducePanel({ projectId }: ReproducePanelProps) {
     const busyRef = useRef(false);
     const [busy, setBusy] = useState(false);
     const runTask = useCallback((kind: string, starter: () => Promise<{ task_id: string }>, after: () => Promise<void>) => {
-        if (busyRef.current) return;
+        // 静默丢弃点击会被当成「按钮坏了」——明确告诉用户为什么没反应
+        if (busyRef.current) {
+            setFlash("已有任务在执行中，请等它结束再操作（按钮暂时不可用）");
+            return;
+        }
         busyRef.current = true;
         setBusy(true);
         setBanner(null);
@@ -191,6 +242,37 @@ export default function ReproducePanel({ projectId }: ReproducePanelProps) {
             }
         })();
     }, []);
+
+    // 任务状态是本组件的本地 state，离开本页即卸载 → 回来「按钮复原、进度丢失」。
+    // 任务本身在库里没丢，只是没人显示它：挂载/切论文时找回本论文的活跃任务并**接管**。
+    useEffect(() => {
+        if (!paperId || task) return;  // 本地已有任务时不抢
+        let cancelled = false;
+        void (async () => {
+            try {
+                const rows = await listTasks("board", 100);
+                const active = rows.find(
+                    t => (t.status === "running" || t.status === "queued")
+                        && RESUME_KINDS[t.task_type] !== undefined
+                        && paperIdOfTask(t) === paperId,
+                );
+                if (cancelled || !active) return;
+                busyRef.current = true;
+                setBusy(true);
+                setTask({
+                    id: active.task_id,
+                    kind: RESUME_KINDS[active.task_type],
+                    after: () => refreshDetail(paperId),
+                });
+                setFlash("已接管本论文正在执行的任务（离开本页不会中断它）");
+            } catch {
+                /* 恢复失败不影响正常操作 */
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [paperId, task, refreshDetail]);
 
     useTaskPolling({
         taskId: task?.id ?? null,
@@ -220,6 +302,7 @@ export default function ReproducePanel({ projectId }: ReproducePanelProps) {
     const items = detail?.items ?? [];
     const confirmedCount = items.filter(i => i.status === "confirmed").length;
     const reproResults = detail?.reproduction_results ?? [];
+    const bindings = detail?.bindings ?? [];
     const conclusion = detail?.conclusion ?? null;
     const paper = detail?.paper ?? null;
     const sectionIndex = asObject(paper?.section_index);
@@ -386,35 +469,45 @@ export default function ReproducePanel({ projectId }: ReproducePanelProps) {
                     {/* 操作按钮 */}
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
                         <button
-                            style={btnStyle}
+                            style={{ ...btnStyle, ...dimmed(busy) }}
                             disabled={busy}
                             onClick={() => runTask("parse", () => postParsePaper(paperId), refreshAfter)}
                             title="规则解析 PDF → markdown（+ agent 对照修正），并做固定代码保真核对"
                         >
                             ⓪ 解析论文（PDF→markdown）
                         </button>
-                        <button style={btnStyle} disabled={busy} onClick={() => runTask("extract", () => postExtractItems(paperId), refreshAfter)}>
+                        <button
+                            style={{ ...btnStyle, ...dimmed(busy) }}
+                            disabled={busy}
+                            onClick={() => runTask("extract", () => postExtractItems(paperId), refreshAfter)}
+                        >
                             ① 抽取实验条目
                         </button>
                         <button
-                            style={btnStyle}
+                            style={{ ...btnStyle, ...dimmed(busy || confirmedCount === 0) }}
                             disabled={busy || confirmedCount === 0}
                             onClick={() => runTask("reproduce", () => postReproduce(paperId, projectId), refreshAfter)}
-                            title={confirmedCount === 0 ? "需先确认至少一条实验条目" : undefined}
+                            title={busy ? "有任务在执行中" : confirmedCount === 0 ? "需先确认至少一条实验条目" : undefined}
                         >
                             ② 复现（已确认 {confirmedCount}/{items.length} 条）
                         </button>
                         <button
-                            style={btnStyle}
+                            style={{ ...btnStyle, ...dimmed(busy || reproResults.length === 0) }}
                             disabled={busy || reproResults.length === 0}
                             onClick={() => runTask("conclusion", () => postConclusion(paperId), refreshAfter)}
-                            title={reproResults.length === 0 ? "需先有复现结果" : undefined}
+                            title={busy ? "有任务在执行中" : reproResults.length === 0 ? "需先有复现结果" : undefined}
                         >
                             ③ 生成可信度结论
                         </button>
-                        <span style={{ alignSelf: "center", fontSize: 11, color: parsed ? "#4ade80" : "#d97706" }}>
-                            {parsed ? "已解析" : "未解析（直接抽取会报「论文尚未转 markdown」）"}
-                        </span>
+                        {busy ? (
+                            <span style={{ alignSelf: "center", fontSize: 11, color: "#fbbf24" }}>
+                                ⏳ 有任务在执行中，按钮暂不可用
+                            </span>
+                        ) : (
+                            <span style={{ alignSelf: "center", fontSize: 11, color: parsed ? "#4ade80" : "#d97706" }}>
+                                {parsed ? "已解析" : "未解析（直接抽取会报「论文尚未转 markdown」）"}
+                            </span>
+                        )}
                     </div>
 
                     {/* 4.1 解析与保真核对结果 */}
@@ -428,7 +521,7 @@ export default function ReproducePanel({ projectId }: ReproducePanelProps) {
                                     {"\n"}agent 对照修正：{String(parseInfo.agent_fix ?? "—")} · markdown {parseInfo.markdown_changed ? "有改动" : "未改动"} · 索引 {parseInfo.index_rebuilt ? "已重建" : "保留原索引"}
                                     {parseInfo.hint ? `\n提示：${String(parseInfo.hint)}` : ""}
                                     {fidelity
-                                        ? `\n保真核对：${fidelity.ok ? "通过" : "未通过"}${fidelity.coverage_mean !== undefined ? ` · 按页文本覆盖率均值 ${String(fidelity.coverage_mean)}` : ""}${fidelity.error ? ` · ${String(fidelity.error)}` : ""}`
+                                        ? `\n保真核对：${fidelity.ok ? "通过" : "未通过"}${fidelity.coverage_mean !== undefined ? ` · 按页内容命中率均值 ${String(fidelity.coverage_mean)}` : ""}${fidelity.error ? ` · ${String(fidelity.error)}` : ""}`
                                         : "\n保真核对：本次任务进度未返回 fidelity 字段（旧后端或未执行核对）"}
                                 </div>
                             ) : (
@@ -438,7 +531,7 @@ export default function ReproducePanel({ projectId }: ReproducePanelProps) {
                             )}
                             {fidelity && asTextLines(fidelity.pages_below_threshold).length > 0 && (
                                 <div style={{ color: "#fca5a5", fontSize: 11, marginTop: 4 }}>
-                                    覆盖率低于阈值的页：{asTextLines(fidelity.pages_below_threshold).join("、")}
+                                    内容未命中的页：{asTextLines(fidelity.pages_below_threshold).join("、")}
                                 </div>
                             )}
                             {fidelity && asTextLines(fidelity.gaps).length > 0 && (
@@ -503,6 +596,17 @@ export default function ReproducePanel({ projectId }: ReproducePanelProps) {
                         <div style={{ color: "#64748b", fontSize: 11 }}>尚无条目（点「① 抽取实验条目」）。</div>
                     ) : (
                         <table style={tableStyle}>
+                            {/* 定宽列：超参数/对比基线是长 JSON，不定宽会把列撑爆并与邻列重叠 */}
+                            <colgroup>
+                                <col style={{ width: "12%" }} />
+                                <col style={{ width: "16%" }} />
+                                <col style={{ width: "11%" }} />
+                                <col style={{ width: "12%" }} />
+                                <col style={{ width: "19%" }} />
+                                <col style={{ width: "12%" }} />
+                                <col style={{ width: "6%" }} />
+                                <col style={{ width: "12%" }} />
+                            </colgroup>
                             <thead>
                                 <tr>
                                     <th style={thStyle}>数据集</th>
@@ -585,7 +689,12 @@ export default function ReproducePanel({ projectId }: ReproducePanelProps) {
                                                     <div style={{ display: "flex", gap: 6 }}>
                                                         <button style={{ ...btnStyle, background: "#334155" }} onClick={() => startEdit(item)}>编辑</button>
                                                         {item.status !== "confirmed" && (
-                                                            <button style={btnStyle} disabled={busy} onClick={() => void confirmItem(id)}>
+                                                            <button
+                                                                style={{ ...btnStyle, ...dimmed(busy) }}
+                                                                disabled={busy}
+                                                                title={busy ? "有任务在执行中，稍后再确认" : "确认后该条目参与复现（4.2 人工闸门）"}
+                                                                onClick={() => void confirmItem(id)}
+                                                            >
                                                                 确认
                                                             </button>
                                                         )}
@@ -600,15 +709,27 @@ export default function ReproducePanel({ projectId }: ReproducePanelProps) {
                     )}
                     {itemError && <div style={{ color: "#fca5a5", fontSize: 11, marginTop: 4 }}>{itemError}</div>}
 
-                    {/* 复现对照 */}
-                    <div style={{ fontWeight: 700, margin: "12px 0 4px" }}>复现对照</div>
+                    {/* 复现板：本篇论文「报告值 vs 实测值」逐条对照 */}
+                    <div style={{ fontWeight: 700, margin: "12px 0 4px" }}>
+                        复现板 <span style={{ color: "#64748b", fontSize: 11, fontWeight: 400 }}>（本论文的逐条对照）</span>
+                    </div>
                     {reproResults.length === 0 ? (
                         <div style={{ color: "#64748b", fontSize: 11 }}>尚无复现结果（点「② 复现」）。</div>
                     ) : (
                         <table style={tableStyle}>
+                            <colgroup>
+                                <col style={{ width: "22%" }} />
+                                <col style={{ width: "14%" }} />
+                                <col style={{ width: "16%" }} />
+                                <col style={{ width: "16%" }} />
+                                <col style={{ width: "12%" }} />
+                                <col style={{ width: "20%" }} />
+                            </colgroup>
                             <thead>
                                 <tr>
+                                    <th style={thStyle}>数据集</th>
                                     <th style={thStyle}>指标</th>
+                                    <th style={thStyle}>报告值</th>
                                     <th style={thStyle}>实测值</th>
                                     <th style={thStyle}>偏差</th>
                                     <th style={thStyle}>判定</th>
@@ -617,13 +738,126 @@ export default function ReproducePanel({ projectId }: ReproducePanelProps) {
                             <tbody>
                                 {reproResults.map(r => {
                                     const item = items.find(i => String(i.item_id) === String(r.item_id));
+                                    const actual = r.metric_value_actual;
+                                    // deviation 是**相对**误差（0.0022 = 0.22%）
+                                    const dev = typeof r.deviation === "number" ? `${(r.deviation * 100).toFixed(2)}%` : "—";
                                     return (
                                         <tr key={String(r.result_id)}>
-                                            <td style={tdStyle}>{item ? String(item.metric_name ?? "?") : String(r.item_id).slice(0, 8)}</td>
-                                            <td style={tdStyle}>{r.metric_value_actual !== null && r.metric_value_actual !== undefined ? String(r.metric_value_actual) : "—"}</td>
-                                            <td style={tdStyle}>{r.deviation !== null && r.deviation !== undefined ? String(r.deviation) : "—"}</td>
-                                            <td style={tdStyle}>{String(r.verdict ?? "—")}</td>
+                                            <td style={tdStyle}>
+                                                {String(r.dataset_name ?? item?.dataset_name ?? "—")}
+                                            </td>
+                                            <td style={tdStyle}>{String(r.metric_name ?? item?.metric_name ?? "?")}</td>
+                                            <td style={tdStyle}>
+                                                {r.metric_value_reported === null || r.metric_value_reported === undefined
+                                                    ? "—" : String(r.metric_value_reported)}
+                                            </td>
+                                            <td style={tdStyle}>
+                                                {actual === null || actual === undefined ? "—" : String(actual)}
+                                            </td>
+                                            <td style={tdStyle}>{dev}</td>
+                                            <td style={tdStyle}>
+                                                <span style={{ color: verdictColor(r.verdict as string | undefined) }}>
+                                                    {String(r.verdict ?? "—")}
+                                                </span>
+                                            </td>
                                         </tr>
+                                    );
+                                })}
+                            </tbody>
+                        </table>
+                    )}
+
+                    {/* 绑定记录：同一篇论文可以用不同项目复现，每次绑定留痕 */}
+                    <div style={{ fontWeight: 700, margin: "12px 0 4px" }}>
+                        绑定记录 <span style={{ color: "#64748b", fontSize: 11, fontWeight: 400 }}>（这篇论文用过的项目/环境）</span>
+                    </div>
+                    {bindings.length === 0 ? (
+                        <div style={{ color: "#64748b", fontSize: 11 }}>
+                            尚无绑定记录——点「② 复现」后会记下「本论文 ↔ 当前项目」。
+                        </div>
+                    ) : (
+                        <table style={tableStyle}>
+                            <colgroup>
+                                <col style={{ width: "26%" }} />
+                                <col style={{ width: "14%" }} />
+                                <col style={{ width: "16%" }} />
+                                <col style={{ width: "10%" }} />
+                                <col style={{ width: "22%" }} />
+                                <col style={{ width: "12%" }} />
+                            </colgroup>
+                            <thead>
+                                <tr>
+                                    <th style={thStyle}>项目</th>
+                                    <th style={thStyle}>首次绑定</th>
+                                    <th style={thStyle}>最近使用</th>
+                                    <th style={thStyle}>次数</th>
+                                    <th style={thStyle}>最近一次复现的条目</th>
+                                    <th style={thStyle}>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {bindings.map(b => {
+                                    const pid = String(b.project_id);
+                                    const open = openBinding === pid;
+                                    const taskId = b.last_task_id === null || b.last_task_id === undefined
+                                        ? "" : String(b.last_task_id);
+                                    // 该次复现产出的条目由后端按 task_id 反查给出（run_id 不是 task_id）
+                                    const runItems = Array.isArray(b.last_run_items)
+                                        ? (b.last_run_items as Array<Record<string, unknown>>)
+                                        : [];
+                                    return (
+                                        <Fragment key={pid}>
+                                            <tr>
+                                                <td style={tdStyle}>
+                                                    {String(b.project_name ?? pid.slice(0, 8))}
+                                                    <span style={{ color: "#475569", fontFamily: "monospace", fontSize: 10, marginLeft: 6 }}>
+                                                        #{pid.slice(0, 6)}
+                                                    </span>
+                                                </td>
+                                                <td style={{ ...tdStyle, fontSize: 11, color: "#94a3b8" }}>
+                                                    {shortTime(b.created_at)}
+                                                </td>
+                                                <td style={{ ...tdStyle, fontSize: 11, color: "#94a3b8" }}>
+                                                    {shortTime(b.last_used_at)}
+                                                </td>
+                                                <td style={tdStyle}>{String(b.uses ?? "")}</td>
+                                                <td style={{ ...tdStyle, fontSize: 11, color: "#94a3b8" }}>
+                                                    {runItems.length
+                                                        ? `${runItems.length} 条（${runItems.map(r => String(r.metric_name ?? "?")).join("、")}）`
+                                                        : "—"}
+                                                </td>
+                                                <td style={tdStyle}>
+                                                    <button
+                                                        style={btnStyle}
+                                                        disabled={!runItems.length}
+                                                        title={runItems.length ? undefined : "该次没有产出对照结果"}
+                                                        onClick={() => setOpenBinding(open ? null : pid)}
+                                                    >
+                                                        {open ? "收起" : "看条目"}
+                                                    </button>
+                                                </td>
+                                            </tr>
+                                            {open && (
+                                                <tr>
+                                                    <td colSpan={6} style={{ ...tdStyle, background: "#0f172a" }}>
+                                                        <div style={{ fontSize: 11, color: "#64748b", marginBottom: 4 }}>
+                                                            最近一次复现任务 {taskId}
+                                                        </div>
+                                                        {runItems.map(r => (
+                                                            <div key={String(r.result_id)} style={{ fontFamily: "monospace", fontSize: 11 }}>
+                                                                {String(r.dataset_name ?? "—")} · {String(r.metric_name ?? "?")}：
+                                                                报告 {String(r.metric_value_reported ?? "—")} → 实测{" "}
+                                                                {r.metric_value_actual === null || r.metric_value_actual === undefined
+                                                                    ? "—" : String(r.metric_value_actual)}{" "}
+                                                                <span style={{ color: verdictColor(r.verdict as string | undefined) }}>
+                                                                    [{String(r.verdict ?? "—")}]
+                                                                </span>
+                                                            </div>
+                                                        ))}
+                                                    </td>
+                                                </tr>
+                                            )}
+                                        </Fragment>
                                     );
                                 })}
                             </tbody>
@@ -711,6 +945,16 @@ const infoBanner: CSSProperties = {
     fontSize: 12,
     marginBottom: 8,
 };
-const tableStyle: CSSProperties = { width: "100%", borderCollapse: "collapse", fontSize: 11 };
+const tableStyle: CSSProperties = {
+    width: "100%",
+    borderCollapse: "collapse",
+    fontSize: 11,
+    tableLayout: "fixed", // 配合 colgroup 定宽
+};
 const thStyle: CSSProperties = { textAlign: "left", color: "#64748b", fontWeight: 600, padding: "3px 6px", borderBottom: "1px solid #1f2937" };
-const tdStyle: CSSProperties = { padding: "4px 6px", borderBottom: "1px solid #1f2937", verticalAlign: "top" };
+const tdStyle: CSSProperties = {
+    padding: "4px 6px",
+    borderBottom: "1px solid #1f2937",
+    verticalAlign: "top",
+    overflowWrap: "anywhere", // 长 JSON / 长 URL 换行而不是撑列
+};

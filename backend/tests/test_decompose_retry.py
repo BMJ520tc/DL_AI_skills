@@ -113,6 +113,8 @@ def test_progress_reporter_keeps_stage_while_emitting_activity(app_client):
 def dec_env(isolated_db, tmp_path, monkeypatch):
     # 本文件的用例测**单次生成**那条路径；分步生成另有专门用例
     monkeypatch.setattr(decompose_service, "DECOMPOSE_STEPWISE", False)
+    # 追踪优先也是「另开分支」的开关：本文件测 agent 路径，显式关掉，防开发机上设了环境变量扰动
+    monkeypatch.setattr(decompose_service, "DECOMPOSE_TRACE_IR", False)
     monkeypatch.setattr(project_manager, "PROJECTS_DIR", tmp_path / "projects")
     pid = project_manager.create_project("original", source="local-test")
     ws = Path(project_manager.get_project(pid)["workspace_path"])

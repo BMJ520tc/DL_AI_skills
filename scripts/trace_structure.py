@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _model_loader import (  # noqa: E402
     accepted_kwargs, accepted_positional, call_kwargs, instantiate,
-    load_entry_class, make_dummy_input, make_extra_inputs, prepare_torch,
+    load_entry_class, build_inputs, prepare_torch,
 )
 
 # 导出伪影：只用于元数据断言/布局，不产生真实数据流，比对与生成都要跳过
@@ -40,7 +40,7 @@ def _refs(node) -> list[str]:
     return out
 
 
-def trace_model(model, spec: dict) -> dict:
+def trace_model(model, spec: dict, source_dir: str | None = None) -> dict:
     """在**已实例化**的真实模型上追踪结构（供保真度自检复用，避免二次加载模型）。
 
     返回 `{"skipped": bool, "reason"?: str, "modules": [...], "ops": [...], "edges": [...]}`。
@@ -51,7 +51,7 @@ def trace_model(model, spec: dict) -> dict:
 
     try:
         dt = getattr(torch, str(spec.get("dtype") or "float32").replace("torch.", ""), torch.float32)
-        xs = (make_dummy_input(spec.get("shape") or [1, 100], dt), *make_extra_inputs(spec))
+        xs = build_inputs(model, spec, source_dir)
         args = accepted_positional(model.forward, xs)
         kwargs = accepted_kwargs(model.forward, call_kwargs(spec))
         ep = torch.export.export(model, args, kwargs=kwargs or None, strict=False)
@@ -119,12 +119,12 @@ def main() -> None:
     prepare_torch()
     try:
         cls = load_entry_class(source_dir, ir.get("source_file"), ir.get("entry_class"))
-        model = instantiate(cls, ir.get("entry_args")).eval()
+        model = instantiate(cls, ir.get("entry_args"), source_dir).eval()
     except Exception as e:  # noqa: BLE001 —— 模型起不来属「跳过」而非失败
         _write({"skipped": True, "reason": f"{type(e).__name__}: {e}"})
         return
 
-    traced = trace_model(model, spec)
+    traced = trace_model(model, spec, source_dir)
     traced.update({"schema_version": "1.0", "entry_class": ir.get("entry_class")})
     _write(traced)
 

@@ -8,12 +8,13 @@
 #      - 项目列表渲染、无「后端连接失败」横幅；检索与下载入口存在；
 #      - 「＋ 新建模型」创建结构化项目并直接打开画布（空图正常渲染，无报错）；
 #      - 经 HTTP 复核：新项目 graph.json = {nodes:[], edges:[]}、status=ready；
-#      - 返回列表 → 打开原始项目查看器：三并列入口（先复现/先使用/先拆解）齐备；
+#      - 返回列表 → 打开原始项目查看器：并列入口（先使用/先拆解）齐备，**不再有**「先复现」；
 #      - 模块一新增入口：独立环境/最小可运行命令验证按钮、结构报告内容渲染（报告页签）、
 #        参数区「入口输入规格」PUT 真写回后端；
 #      - 模块四 6.2 延伸「结构」页签：结构校验提示、新增节点 / 新增边 / 删除边 / 删除节点
 #        逐项经 HTTP 复核真写回后端（ir.json）；
-#      - 「先复现」面板：论文下拉含种子论文 → 实验条目五要素表 + 编辑入口 → 点「确认」过 4.2 闸门
+#      - 初始界面「论文复现」卡片（模块二入口已从查看器迁到这里）：绑定项目 + 论文下拉
+#        → 进入独立复现视图 → 实验条目五要素表 + 编辑入口 → 点「确认」过 4.2 闸门
 #        （按钮 ② 变为「已确认 1/1 条」）→ 「⓪ 解析论文」真的发起 pdf_parse 任务（失败原因可见）；
 #      - 「先使用」面板：数据集下拉含种子数据集、四个操作按钮齐备、「⓪ 数据预处理」真的发起
 #        preprocess 任务（空路径先给可见校验提示）、公开数据检索入口存在；
@@ -455,8 +456,9 @@ def main() -> int:
                                  "模型查看器打开")
             if ok_viewer:
                 body = cdp.evaluate("document.body.innerText")
-                for label in ("先复现", "先使用", "先拆解"):
-                    check(f"三并列入口「{label}」存在", label in body)
+                for label in ("先使用", "先拆解"):
+                    check(f"查看器入口「{label}」存在", label in body)
+                check("查看器不再有「先复现」（已迁到初始界面）", "先复现" not in body)
                 check("默认先拆解模式渲染", "原始项目操作目录" in body)
                 # --- 模块一：独立环境 / 最小可运行命令验证 / 结构报告内容 / 输入规格补参 ---
                 check("原始项目查看器有「建独立环境」按钮", "建独立环境" in body or "重建独立环境" in body)
@@ -578,48 +580,6 @@ def main() -> int:
                                   all(n["id"] != "relu" for n in ir_now["nodes"]),
                                   f"nodes={[n['id'] for n in ir_now['nodes']]}")
 
-        # --- 先复现：选论文 → 看条目 → 过 4.2 确认闸门 ---
-        if click_button(cdp, "先复现"):
-            wait_for(cdp, "document.body.innerText.includes('抽取实验条目')", True,
-                     "先复现面板渲染")
-            wait_for(cdp, "document.body.innerText.includes('4a 自检论文')", True,
-                     "论文下拉加载种子论文")
-            picked = cdp.evaluate(f"""
-                (() => {{
-                    const sel = [...document.querySelectorAll('select')]
-                        .find(s => [...s.options].some(o => o.textContent.includes('4a 自检论文')));
-                    if (!sel) return false;
-                    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set
-                        .call(sel, {json.dumps(PAPER_ID)});
-                    sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                    return true;
-                }})()""")
-            check("论文下拉含种子论文并选中", bool(picked))
-            if picked:
-                wait_for(cdp, "document.body.innerText.includes('Accuracy')", True,
-                         "实验条目表渲染（种子条目）")
-                if click_button(cdp, "确认", exact=True):
-                    wait_for(cdp, "document.body.innerText.includes('已确认 1/1 条')", True,
-                             "4.2 闸门：条目确认后计数更新")
-                    wait_for(cdp, "document.body.innerText.includes('条目已确认')", True,
-                             "确认成功提示")
-                # 模块二 4.1：解析入口（PDF→markdown）能发起任务；种子论文无 PDF，失败原因必须可见
-                item_body = cdp.evaluate("document.body.innerText")
-                check("先复现面板有「解析论文（PDF→markdown）」入口", "解析论文" in item_body)
-                check("先复现面板显示条目五要素表头（数据集/划分方式/超参数/对比基线）",
-                      all(k in item_body for k in ("数据集", "划分方式", "超参数", "对比基线")))
-                check("先复现面板有条目「编辑」入口", "编辑" in item_body)
-                if click_button(cdp, "⓪ 解析论文"):
-                    parse_task = wait_for_task("pdf_parse", None, timeout=25)
-                    check("论文解析任务已发起（POST /papers/{id}/parse）", parse_task is not None,
-                          f"status={parse_task.get('status') if parse_task else 'None'}")
-                    wait_for(cdp, "document.body.innerText.includes('pdf_parse')"
-                                  " || document.body.innerText.includes('PDF 不存在')", True,
-                             "解析任务状态/失败原因可见", timeout=25)
-                    parse_body = cdp.evaluate("document.body.innerText")
-                    check("解析失败原因透出（不静默）",
-                          ("pdf_parse" in parse_body) or ("PDF 不存在" in parse_body))
-
         # --- 先使用：数据集下拉 + 按钮齐备 ---
         if click_button(cdp, "先使用"):
             wait_for(cdp, "document.body.innerText.includes('自带数据基准运行')", True,
@@ -652,6 +612,66 @@ def main() -> int:
             search_body = cdp.evaluate("document.body.innerText")
             check("先使用面板有公开数据检索入口",
                   "公开数据检索" in search_body and "检索公开数据" in search_body)
+
+        # --- 论文复现（模块二 4.1~4.4）：入口已迁到初始界面「论文复现」卡片 ---
+        if click_button(cdp, "← 返回"):
+            wait_for(cdp, "document.body.innerText.includes('4a 自检原始项目')", True,
+                     "返回项目列表")
+        repro_body = cdp.evaluate("document.body.innerText")
+        check("初始界面有「论文复现」入口卡片",
+              "论文复现" in repro_body and "进入论文复现" in repro_body)
+        # 绑定项目下拉：以占位符「绑定项目」定位，避开「创建结构化项目」里的父项目下拉
+        picked_proj = cdp.evaluate(f"""
+            (() => {{
+                const sel = [...document.querySelectorAll('select')]
+                    .find(s => [...s.options].some(o => o.textContent.startsWith('绑定项目')));
+                if (!sel) return false;
+                Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set
+                    .call(sel, {json.dumps(ORIG_PROJECT_ID)});
+                sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                return true;
+            }})()""")
+        check("卡片含绑定项目下拉并选中种子项目", bool(picked_proj))
+        if picked_proj:
+            wait_for(cdp, "document.body.innerText.includes('4a 自检论文')", True,
+                     "卡片论文下拉加载种子论文")
+            picked = cdp.evaluate(f"""
+                (() => {{
+                    const sel = [...document.querySelectorAll('select')]
+                        .find(s => [...s.options].some(o => o.textContent.startsWith('论文')));
+                    if (!sel) return false;
+                    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set
+                        .call(sel, {json.dumps(PAPER_ID)});
+                    sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return true;
+                }})()""")
+            check("卡片论文下拉含种子论文并选中", bool(picked))
+            if picked and click_button(cdp, "进入论文复现"):
+                wait_for(cdp, "document.body.innerText.includes('抽取实验条目')", True,
+                         "论文复现面板渲染（独立视图）")
+                wait_for(cdp, "document.body.innerText.includes('Accuracy')", True,
+                         "实验条目表渲染（种子条目）")
+                if click_button(cdp, "确认", exact=True):
+                    wait_for(cdp, "document.body.innerText.includes('已确认 1/1 条')", True,
+                             "4.2 闸门：条目确认后计数更新")
+                    wait_for(cdp, "document.body.innerText.includes('条目已确认')", True,
+                             "确认成功提示")
+                # 模块二 4.1：解析入口（PDF→markdown）能发起任务；种子论文无 PDF，失败原因必须可见
+                item_body = cdp.evaluate("document.body.innerText")
+                check("论文复现面板有「解析论文（PDF→markdown）」入口", "解析论文" in item_body)
+                check("论文复现面板显示条目五要素表头（数据集/划分方式/超参数/对比基线）",
+                      all(k in item_body for k in ("数据集", "划分方式", "超参数", "对比基线")))
+                check("论文复现面板有条目「编辑」入口", "编辑" in item_body)
+                if click_button(cdp, "⓪ 解析论文"):
+                    parse_task = wait_for_task("pdf_parse", None, timeout=25)
+                    check("论文解析任务已发起（POST /papers/{id}/parse）", parse_task is not None,
+                          f"status={parse_task.get('status') if parse_task else 'None'}")
+                    wait_for(cdp, "document.body.innerText.includes('pdf_parse')"
+                                  " || document.body.innerText.includes('PDF 不存在')", True,
+                             "解析任务状态/失败原因可见", timeout=25)
+                    parse_body = cdp.evaluate("document.body.innerText")
+                    check("解析失败原因透出（不静默）",
+                          ("pdf_parse" in parse_body) or ("PDF 不存在" in parse_body))
 
         # --- 控制台错误汇总 ---
         time.sleep(1.0)

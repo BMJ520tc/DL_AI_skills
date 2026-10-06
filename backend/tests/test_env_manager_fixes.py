@@ -244,24 +244,85 @@ def test_cuda_without_driver_selects_cpu_wheel(tmp_path, monkeypatch):
     assert "未检测到 NVIDIA 驱动" in plan["reason"]
 
 
-def test_cuda_match_keeps_default_wheel(tmp_path, monkeypatch):
-    """驱动满足要求 → 不降级（action=None）。"""
+def test_cuda_match_uses_cuda_wheel(tmp_path, monkeypatch):
+    """驱动满足要求 → **装 CUDA 版 wheel**。
+
+    原来这里是 `action=None`（「按默认 wheel 安装」）——但**默认索引（Windows 上的 PyPI/镜像）
+    给的 torch 就是 CPU 版**，于是环境永远拿不到 GPU 轮子（实测 scGPT 装出 `torch 2.14.1+cpu`）。
+    """
     source = _src(tmp_path, "ok_src", {"requirements.txt": "torch==2.1.2+cu118\n"})
     monkeypatch.setattr(env_manager, "_detect_cuda", lambda: "12.1")
+    monkeypatch.setattr(env_manager, "_index_reachable", lambda *a, **k: True)
 
     plan = env_manager.detect_versions(source)["cuda_plan"]
 
-    assert plan["match"] is True and plan["action"] is None
+    assert plan["match"] is True and plan["action"] == "cuda_wheel"
+    assert plan["index"].endswith("/cu121")                 # 驱动 12.1 → 最高可用档
+    assert plan["torch_spec"] == "torch==2.1.2+cu118"       # 尊重清单的钉
 
 
-def test_cuda_plan_none_without_declaration(tmp_path, monkeypatch):
-    """依赖清单未声明 CUDA → 不臆断降级（match/action 均为 None）。"""
+def test_cuda_plan_uses_cuda_wheel_without_declaration(tmp_path, monkeypatch):
+    """清单**未声明 CUDA** 但本机有 GPU → 照样装 CUDA 版（有驱动却装 CPU 轮子才是缺陷）。"""
     source = _src(tmp_path, "nocuda_src", {"requirements.txt": "numpy\npandas\n"})
-    monkeypatch.setattr(env_manager, "_detect_cuda", lambda: "12.1")
+    monkeypatch.setattr(env_manager, "_detect_cuda", lambda: "13.1")
+    monkeypatch.setattr(env_manager, "_index_reachable", lambda *a, **k: True)
 
     plan = env_manager.detect_versions(source)["cuda_plan"]
 
-    assert plan["match"] is None and plan["action"] is None
+    assert plan["required"] is None and plan["match"] is True
+    assert plan["action"] == "cuda_wheel" and plan["index"].endswith("/cu130")
+    assert plan["torch_spec"] == "torch"                    # 清单没有 torch → 不钉版本
+
+
+def test_cuda_plan_disabled_by_flag(tmp_path, monkeypatch):
+    """`ENV_USE_GPU_TORCH=0` → 按默认 wheel 安装（不装 CUDA 版），原因写明。"""
+    source = _src(tmp_path, "off_src", {"requirements.txt": "numpy\n"})
+    monkeypatch.setattr(env_manager, "_detect_cuda", lambda: "13.1")
+    monkeypatch.setattr(env_manager, "GPU_TORCH_ENABLED", False)
+
+    plan = env_manager.detect_versions(source)["cuda_plan"]
+
+    assert plan["action"] is None and "ENV_USE_GPU_TORCH=0" in plan["reason"]
+
+
+def test_cuda_plan_index_unreachable_falls_back(tmp_path, monkeypatch):
+    """候选索引全不可达 → 回落默认 wheel，并把「都不可达」写进原因（不静默）。"""
+    source = _src(tmp_path, "down_src", {"requirements.txt": "numpy\n"})
+    monkeypatch.setattr(env_manager, "_detect_cuda", lambda: "13.1")
+    monkeypatch.setattr(env_manager, "_index_reachable", lambda *a, **k: False)
+
+    plan = env_manager.detect_versions(source)["cuda_plan"]
+
+    assert plan["action"] is None and "不可达" in plan["reason"]
+
+
+def test_preinstall_torch_command_shape(tmp_path, monkeypatch, isolated_db):
+    """预装命令：有镜像就 `--find-links <wheel 页>` + **钉住版本**（否则 CPU 版会赢）；否则 `--index-url <cu>`。"""
+    seen: list[list[str]] = []
+
+    async def fake_run(cmd, **kw):
+        seen.append(list(cmd))
+        return 0, ""
+
+    monkeypatch.setattr(env_manager.proc_util, "run_command", fake_run)
+    # 解析要联网，这里给确定结果：钉 + 「真正列出 wheel 的那一层」
+    monkeypatch.setattr(env_manager, "resolve_mirror_torch_pin",
+                        lambda py, links: ("torch==2.14.1+cu126", str(links[0]).rstrip("/") + "/torch/"))
+    plan = {"index": "https://download.pytorch.org/whl/cu126", "torch_spec": "torch==2.14.1+cu126",
+            "find_links": ["https://mirror.sjtu.edu.cn/pytorch-wheels/cu126/"]}
+    assert asyncio.run(env_manager._preinstall_torch(
+        "pip", plan, {}, "https://mirrors.cloud.tencent.com/pypi/simple",
+        "pid-pp", "task-pp")) is True
+    cmd = seen[0]
+    assert "--find-links" in cmd and any("pytorch-wheels/cu126/torch/" in a for a in cmd)
+    assert "torch==2.14.1+cu126" in cmd
+    assert "--index-url" in cmd and any("pypi/simple" in a for a in cmd)   # 其余依赖走主索引
+
+    seen.clear()
+    plan2 = {"index": "https://download.pytorch.org/whl/cu126", "torch_spec": "torch", "find_links": []}
+    asyncio.run(env_manager._preinstall_torch("pip", plan2, {}, None, "pid-pp", "task-pp"))
+    cmd2 = seen[0]
+    assert "--index-url" in cmd2 and plan2["index"] in cmd2 and "--find-links" not in cmd2
 
 
 def test_install_with_fix_applies_cpu_index_and_progress(tmp_path, monkeypatch, isolated_db):
@@ -429,3 +490,173 @@ def test_install_with_fix_preapplies_known_pins(tmp_path, monkeypatch, isolated_
     assert (source / "requirements.txt").read_text(encoding="utf-8").strip() == "torch==1.0.0"
     # 预警与「已应用」在同一次进度写入里（避免 update_progress 覆盖丢键）
     assert any(p.get("env_precheck") and p.get("env_precheck_applied") for p in captured)
+
+
+# --------------------------- 建环境顺带取权重：扫描与筛选 ---------------------------
+
+
+def test_plan_weight_downloads_dedupes_and_mirrors(tmp_path, monkeypatch):
+    """按文件名去重；HuggingFace 官方域名换 hf-mirror（本机 huggingface.co 不可达）。"""
+    from app.services import env_manager
+
+    src = tmp_path / "source"
+    src.mkdir()
+    (src / "main.py").write_text(
+        'A = "https://huggingface.co/org/repo/resolve/main/model.ckpt"\n'
+        'B = "https://gateway.example.com/model.ckpt"\n'      # 同名的另一份 → 只留一条
+        'C = "https://hf-mirror.com/org/repo/resolve/main/other.safetensors"\n'
+        'D = "https://example.com/not_a_weight.txt"\n',
+        encoding="utf-8",
+    )
+
+    plans = env_manager.plan_weight_downloads(src)
+    names = sorted(p["filename"] for p in plans)
+    assert names == ["model.ckpt", "other.safetensors"]        # 同名去重、非权重后缀忽略
+    by_name = {p["filename"]: p["url"] for p in plans}
+    assert by_name["model.ckpt"].startswith("https://hf-mirror.com/")
+    assert by_name["other.safetensors"].startswith("https://hf-mirror.com/")
+
+
+def test_plan_weight_downloads_filters_by_entry_class(tmp_path, monkeypatch):
+    """默认只下与入口类同名的权重（entry）；全下用 ENV_WEIGHT_SCOPE=all。"""
+    from app.services import env_manager
+
+    src = tmp_path / "source"
+    src.mkdir()
+    (src / "main.py").write_text(
+        'A = "https://hf-mirror.com/x/boltz1_conf.ckpt"\n'
+        'B = "https://hf-mirror.com/x/boltz2_conf.ckpt"\n'
+        'C = "https://hf-mirror.com/x/boltz2_aff.ckpt"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(env_manager, "ENV_WEIGHT_SCOPE", "entry")
+    names = [p["filename"] for p in env_manager.plan_weight_downloads(src, "Boltz2")]
+    assert names == ["boltz2_aff.ckpt", "boltz2_conf.ckpt"]     # boltz1 被滤掉
+
+    monkeypatch.setattr(env_manager, "ENV_WEIGHT_SCOPE", "all")
+    assert len(env_manager.plan_weight_downloads(src, "Boltz2")) == 3
+
+
+def test_plan_weight_downloads_falls_back_when_name_matches_nothing(tmp_path, monkeypatch):
+    """入口类名对不上任何权重时退回全部——不能「因为名字对不上就一个都不下」。"""
+    from app.services import env_manager
+
+    src = tmp_path / "source"
+    src.mkdir()
+    (src / "m.py").write_text('A = "https://hf-mirror.com/x/weights.ckpt"\n', encoding="utf-8")
+    monkeypatch.setattr(env_manager, "ENV_WEIGHT_SCOPE", "entry")
+    assert [p["filename"] for p in env_manager.plan_weight_downloads(src, "TransformerModel")] \
+        == ["weights.ckpt"]
+
+
+# --------------------------- 镜像 torch 版本钉（CPU 版抢镜的修复） ---------------------------
+
+
+def test_resolve_mirror_torch_pin_picks_newest_matching_cu_wheel(monkeypatch):
+    """从镜像列表里挑**匹配本解释器/平台**的最新 cu 轮子 → `torch==<ver>+cuXXX`。
+
+    为什么必须钉：pip 在「镜像 + 主索引」间只按版本号取高，PyPI 的 CPU 版 torch 版本号常更高
+    （实测 2.14.1 > 2.9.1+cu126）→ 镜像配了也白配，环境装成 CPU 版。
+    """
+    from app.services import env_manager
+
+    html = "\n".join([
+        "torch-2.9.1%2Bcu126-cp312-cp312-win_amd64.whl",
+        "torch-2.8.0%2Bcu126-cp312-cp312-win_amd64.whl",
+        "torch-9.9.9%2Bcu126-cp311-cp311-win_amd64.whl",              # 别的解释器 → 不选
+        "torch-9.9.9%2Bcu126-cp312-cp312-manylinux_2_28_x86_64.whl",  # 别的平台 → 不选
+    ])
+    monkeypatch.setattr(env_manager, "_fetch_text", lambda url: html)
+    monkeypatch.setattr(env_manager, "_python_tag", lambda py: "cp312")
+    monkeypatch.setattr(env_manager, "_platform_tag", lambda: "win_amd64")
+
+    assert env_manager.resolve_mirror_torch_pin("python", ["https://m/x"]) == (
+        "torch==2.9.1+cu126", "https://m/x/torch/"      # 链接要指到真正列出 wheel 的那一层
+    )
+
+
+def test_resolve_mirror_torch_pin_none_when_no_match(monkeypatch):
+    """镜像里没有匹配的轮子 / 列表取不到 → None（调用方回退旧行为，不阻断建环境）。"""
+    from app.services import env_manager
+
+    monkeypatch.setattr(env_manager, "_python_tag", lambda py: "cp312")
+    monkeypatch.setattr(env_manager, "_platform_tag", lambda: "win_amd64")
+    monkeypatch.setattr(env_manager, "_fetch_text", lambda url: "torch-2.9.1%2Bcu126-cp311-cp311-win_amd64.whl")
+    assert env_manager.resolve_mirror_torch_pin("python", ["https://m/x"]) is None
+
+    monkeypatch.setattr(env_manager, "_fetch_text", lambda url: None)
+    assert env_manager.resolve_mirror_torch_pin("python", ["https://m/x"]) is None
+
+
+def test_preinstall_torch_cmd_pins_torch_when_mirror_configured(monkeypatch):
+    """配了镜像且钉到版本 → 命令里用 `torch==<ver>+cuXXX`（而不是会被 CPU 版压过的 `torch>=2.2`）。"""
+    from app.services import env_manager
+
+    plan = {"torch_spec": "torch>=2.2", "index": "https://download.pytorch.org/whl/cu130",
+            "find_links": ["https://m/cu126/"]}
+    cmd = env_manager.preinstall_torch_cmd("pip", plan, "https://pypi/simple",
+                                           torch_pin="torch==2.9.1+cu126",
+                                           torch_link="https://m/cu126/torch/")
+    assert "torch==2.9.1+cu126" in cmd
+    assert "--find-links" in cmd and "https://m/cu126/torch/" in cmd
+    # 没钉到 → 回退原来的宽松 spec
+    cmd2 = env_manager.preinstall_torch_cmd("pip", plan, "https://pypi/simple")
+    assert "torch>=2.2" in cmd2
+
+
+# --------------------------- 仓库自身装 editable（防缝合怪） ---------------------------
+
+
+def test_repo_package_name_reads_pyproject_and_setup(tmp_path):
+    """从 pyproject.toml / setup.cfg / setup.py 读出「仓库自己发布的包名」。"""
+    from app.services import env_manager
+
+    src = tmp_path / "with_pyproject"
+    src.mkdir()
+    (src / "pyproject.toml").write_text(
+        '[project]\nname = "boltz"\nversion = "2.2.1"\n', encoding="utf-8")
+    assert env_manager._repo_package_name(src) == "boltz"
+
+    src2 = tmp_path / "with_setup"
+    src2.mkdir()
+    (src2 / "setup.py").write_text('setup(name="MyPkg", version="1.0")\n', encoding="utf-8")
+    assert env_manager._repo_package_name(src2) == "MyPkg"
+
+    src3 = tmp_path / "nothing"
+    src3.mkdir()
+    assert env_manager._repo_package_name(src3) is None
+
+
+def test_install_repo_editable_skipped_without_packaging(tmp_path, monkeypatch):
+    """没有打包文件（pyproject/setup）就不做——不能凭空 pip install -e。"""
+    from app.services import env_manager
+
+    src = tmp_path / "src"
+    src.mkdir()
+    called: list = []
+    monkeypatch.setattr(env_manager.proc_util, "run_command",
+                        lambda *a, **k: called.append(a) or (0, ""))
+    asyncio.run(env_manager._install_repo_editable(src, tmp_path / "env", "t", lambda *a, **k: None))
+    assert called == []
+
+
+def test_install_repo_editable_runs_with_no_deps(tmp_path, monkeypatch):
+    """有 pyproject 就 `pip install -e <src> --no-deps`（只换来源、不动依赖图）。"""
+    from app.services import env_manager
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "pyproject.toml").write_text('[project]\nname = "boltz"\n', encoding="utf-8")
+    seen: list = []
+
+    async def fake_run(cmd, **kw):
+        seen.append(list(cmd))
+        return 0, ""
+
+    monkeypatch.setattr(env_manager.proc_util, "run_command", fake_run)
+    monkeypatch.setattr(env_manager, "_env_pip", lambda env_dir: "pip")
+    msgs: list = []
+    asyncio.run(env_manager._install_repo_editable(src, tmp_path / "env", "t",
+                                                   lambda s, **k: msgs.append(s)))
+    assert seen and "-e" in seen[0] and "--no-deps" in seen[0] and str(src) in seen[0]
+    assert any("editable" in m for m in msgs)

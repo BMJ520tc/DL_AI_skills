@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from _model_loader import (  # noqa: E402
     accepted_kwargs, accepted_positional, call_kwargs, instantiate,
-    load_entry_class, make_dummy_input, make_extra_inputs, prepare_torch,
+    load_entry_class, build_inputs, prepare_torch,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
@@ -39,6 +39,15 @@ from app.services.ir_schema import LEAF_REQUIRED_ARGS  # noqa: E402
 # 导出伪影：无真实数据流，直接跳过（注意**别把真算子写进来**——曾误把 `arange` 当伪影跳过，
 # 结果位置编码整链断掉、下游算子全缺入边）
 _SKIP_ATEN = ("_assert_tensor_metadata", "to.dtype_layout", "lift_fresh_copy")
+
+# **元数据算子**：只读形状/元素个数、**不消费数值**（`aten.sym_size.int` 等）。动态批量维下
+# dynamo 会把 `cos_sim.size(0)` 规范成 `src.size(0)`，于是根层出现一个「读用户输入形状」的算子——
+# 两个后果：① 它会被当成「根层消费了该用户输入」→ 把 `input_spec.inputs` 里那个输入模块挤掉；
+# ② `src` 在根层没有变量名 → 渲染成 `{ext:src}`，根类平白多一个错位形参。故单独处理（见 `meta_src`）。
+_META_ATEN = ("sym_size", "sym_numel", "sym_stride")
+
+# `aten.slice.Tensor` 的「到末尾」哨兵（dynamo 把 `x[:, 0, :]` 写成 `slice(dim=0, 0, INT64_MAX)`）。
+_SLICE_UNBOUNDED = 2 ** 62
 
 # 复合 nn.* 层的折叠模板：从**实例属性**拼出构造表达式（按 num_layers 之类折叠成 1 个节点）。
 # 只列项目里真会遇到的；命中不了的复合层会走「展开子模块」，展开会让节点数暴涨 → 由调用方决定。
@@ -64,11 +73,13 @@ _ATEN_EXPR: dict[str, str] = {
     "sigmoid.default": "torch.sigmoid({a})",
     "tanh.default": "torch.tanh({a})",
     "softmax.int": "torch.softmax({a}, dim=-1)",
-    "unsqueeze.default": "torch.unsqueeze({a}, -1)",
-    "squeeze.dim": "torch.squeeze({a}, -1)",
+    # 标量实参**从真实实参取**（写死会让不同调用塌成同一个节点、且语义错的——实测 scGPT 的
+    # `cell1.unsqueeze(1)`/`cell2.unsqueeze(0)` 曾被模板统一成 `unsqueeze(-1)`）
+    "unsqueeze.default": "torch.unsqueeze({a}, {b})",
+    "squeeze.dim": "torch.squeeze({a}, {b})",
     "squeeze.default": "torch.squeeze({a})",
-    "select.int": "torch.select({a}, 1, 0)",
-    "slice.Tensor": "torch.narrow({a}, 1, 0, 1)",
+    "select.int": "torch.select({a}, {b}, {c})",
+    "slice.Tensor": "torch.narrow({a}, {b}, {c}, {d})",
     "clamp.default": "torch.clamp({a}, max=512)",
     "clamp_min.default": "torch.clamp_min({a}, 1e-12)",
     "permute.default": "torch.permute({a}, (0, 2, 1))",
@@ -77,7 +88,10 @@ _ATEN_EXPR: dict[str, str] = {
     "cross_entropy_loss.default": "torch.nn.functional.cross_entropy({a}, {b})",
     "cosine_similarity.default": "torch.nn.functional.cosine_similarity({a}, {b}, dim=-1)",
     "linalg_vector_norm.default": "torch.linalg.vector_norm({a}, dim=-1, keepdim=True)",
-    "expand_as.default": "torch.expand_as({a}, {b})",
+    "expand_as.default": "{a}.expand_as({b})",
+    # 元数据算子（动态批量维下 dynamo 会引入）：读形状/元素个数，返回的是 **int 不是张量**
+    "sym_size.int": "{a}.size({b})",
+    "sym_numel.default": "{a}.numel()",
 }
 
 
@@ -102,6 +116,10 @@ _ATEN_CALL: dict[str, str] = {
     ".reshape": ".reshape", ".transpose": ".transpose", ".expand": ".expand",
     ".expand_as": ".expand_as", ".unsqueeze": ".unsqueeze", ".squeeze": ".squeeze",
     ".select": ".select", ".permute": ".permute", ".flatten": ".flatten",
+    # `torch.*` 函数形式（**不是** Tensor 方法——`rsub` 就没有 `Tensor.rsub`，回退成方法会 AttributeError）
+    "rsub.Scalar": "torch.rsub", "rsub.Tensor": "torch.rsub",
+    "remainder.Scalar": "torch.remainder", "fmod.Scalar": "torch.fmod",
+    "normalize.default": "torch.nn.functional.normalize",
 }
 
 
@@ -119,7 +137,7 @@ _TENSOR_METHODS = frozenset({
     "chunk", "split", "unbind", "stack", "clamp_", "fill_", "zero_", "add_", "mul_",
     "float", "long", "half", "double", "type",
     "rsub", "remainder", "fmod", "clamp_max", "clamp_min", "lerp", "addcmul", "addcdiv",
-})
+}) - {"rsub"}   # `Tensor.rsub` 不存在（`torch.rsub` 才是函数）——已在 `_ATEN_CALL` 显式给出
 
 
 def _call_repr(a) -> str | None:
@@ -144,18 +162,22 @@ def _call_repr(a) -> str | None:
     return None
 
 
-def _render_aten(n, user_inputs: list[str]) -> tuple[str, list[str]] | None:
+def _render_aten(n, user_inputs: list[str], ph_module: dict[str, str],
+                 op_anc: set[str], resolve) -> tuple[str, list[str]] | None:
     """按**真实实参**渲染一个 aten 调用 → `(code_hint, 用到的外部输入名)`；表达不了时 None。
 
-    操作数是图节点 → `{inputs[j]}`（j 只数「非外部输入」的操作数，与 IR 入边顺序一致）；
-    是用户输入占位 → `{ext:名}`；是标量/dtype/None/表 → 字面量；是参数/缓冲 → 表达不了。
+    操作数是图节点 → `{inputs[j]}`（j 只数「会产生入边」的操作数，与 IR 入边顺序一致）；
+    是**本模块输入**的用户占位（`ph_module` 认领且属于本模块）→ `{inputs[j]}`（由 `模块→算子` 边喂入）；
+    否则是根层外部输入 → `{ext:名}`；是标量/dtype/None/表 → 字面量；是参数/缓冲 → 表达不了。
     """
     aten = str(n.target).replace("torch.ops.", "").replace("aten.", "")
     fn = _ATEN_CALL.get(aten)
     if fn is None:
-        # 方法形式的算子（`to.dtype`/`t.default`/`view.default`…）：按**方法名**回退到 `.<head>(...)`
+        # 方法形式的算子（`to.dtype`/`t.default`/`view.default`…）：按**方法名**回退到 `.<head>(...)`。
+        # 白名单之外再用 `hasattr(torch.Tensor, head)` 兜一层（真方法才回退——`rsub` 这类会踩 AttributeError）。
+        import torch as _t
         head = aten.split(".")[0]
-        fn = ("." + head) if head in _TENSOR_METHODS else None
+        fn = ("." + head) if (head in _TENSOR_METHODS or hasattr(_t.Tensor, head)) else None
     if fn is None:
         return None
     parts: list[str] = []
@@ -163,10 +185,16 @@ def _render_aten(n, user_inputs: list[str]) -> tuple[str, list[str]] | None:
     node_idx = 0
     for a in n.args:
         if hasattr(a, "name") and hasattr(a, "op"):          # FX 节点
+            a = resolve(a)                                   # 透传节点（to.dtype_layout）解析到真数据源
             if a.op == "placeholder":
                 nm = str(a.name)
                 if nm not in user_inputs:
                     return None                              # 参数/缓冲被当数据用 → 表达不了
+                tm = ph_module.get(nm)
+                if tm is not None and tm in op_anc:
+                    parts.append("{inputs[%d]}" % node_idx)  # 本模块的输入（由模块→算子边喂入）
+                    node_idx += 1
+                    continue
                 parts.append(f"{{ext:{nm}}}")
                 if nm not in exts:
                     exts.append(nm)
@@ -227,17 +255,65 @@ def _ident(path: str, root_tag: str = "model") -> str:
 
 
 def _nn_name(cls) -> str:
-    """给 `torch.nn` 里认得的类名（沿 MRO 回溯，避免报出内部子类名）。"""
+    """给 `torch.nn` 里认得的类名（沿 MRO 回溯，避免报出内部子类名）。
+
+    **必须排除 `nn.Module` 本身**：用户自定义的 `nn.Module` 子类（如 scGPT 的 `Similarity`）MRO 回溯
+    到的第一个「torch.nn 里有同名属性」的基类就是 `nn.Module` → 会被误判成「无参 `nn.*`」而**折进
+    父层、整棵子树丢失**（实测 `Sim`/`Similarity` 因此消失 → loss_cce 分支丢）。
+    """
     import torch
 
     for base in cls.__mro__:
+        if base.__name__ in ("Module", "object"):
+            continue
         if getattr(base, "__module__", "").startswith("torch.nn") and hasattr(torch.nn, base.__name__):
             return f"nn.{base.__name__}"
     return cls.__name__
 
 
+# 有 `bias` 构造参数的叶子。实例上是 **Parameter 或 None**（不是构造参数那个 bool）——
+# **没有偏置才写 `bias=False`**：漏掉会静默用默认 True 构造、凭空多出一个 bias 参数（实测
+# scGPT 的 `MVCDecoder.W = nn.Linear(..., bias=False)` 参数量差 +512，且该随机 bias 参与前向
+# → `mvc_output` 数值对不上 3.9%）。
+_BIAS_LEAVES = frozenset({
+    "nn.Linear", "nn.Conv1d", "nn.Conv2d", "nn.Conv3d", "nn.ConvTranspose1d", "nn.ConvTranspose2d",
+})
+
+# 卷积类：形状语义相关的属性**一律带上**（`stride`/`padding` 等实例上是 tuple，与标量默认值归一
+# 比较很啰嗦，直接按实例值写全更稳）。
+_CONV_ATTRS: dict[str, tuple[str, ...]] = {
+    "nn.Conv1d": ("stride", "padding", "dilation", "groups"),
+    "nn.Conv2d": ("stride", "padding", "dilation", "groups"),
+    "nn.Conv3d": ("stride", "padding", "dilation", "groups"),
+    "nn.ConvTranspose1d": ("stride", "padding", "output_padding", "dilation", "groups"),
+    "nn.ConvTranspose2d": ("stride", "padding", "output_padding", "dilation", "groups"),
+}
+
+# 其余叶子：**值与默认不同才写**（写默认值只是噪音、还会让 IR 无故膨胀）。
+_LEAF_OPTIONAL: dict[str, dict[str, object]] = {
+    "nn.Embedding": {"padding_idx": None},
+    "nn.LeakyReLU": {"negative_slope": 0.01},
+    "nn.ELU": {"alpha": 1.0},
+}
+
+
+def _jsonable(val):
+    """实例属性 → JSON 可存的值（tuple→list；不可表达的返回 None）。
+
+    `nn.Linear.bias`/卷积 `bias` 在实例上是 **Parameter 或 None**（不是构造参数那个 bool），
+    故用 `bias is not None` 判「有没有偏置」。
+    """
+    if val is None:
+        return None
+    if isinstance(val, bool) or isinstance(val, (int, float, str)):
+        return val
+    if isinstance(val, (tuple, list)):
+        return list(val)
+    return None
+
+
 def _leaf_params(nn_name: str, mod) -> dict:
-    """叶子构造参数：白名单里的必填名直接从实例属性取（nn.Linear.in_features 等）。"""
+    """叶子构造参数：白名单里的必填名 + 非默认/形状相关的可选属性，直接从实例属性取。"""
     out: dict = {}
     for key in LEAF_REQUIRED_ARGS.get(nn_name, ()):
         val = getattr(mod, key, None)
@@ -245,8 +321,24 @@ def _leaf_params(nn_name: str, mod) -> dict:
             continue
         out[key] = list(val) if isinstance(val, (tuple, list)) else (
             val if isinstance(val, (int, float, bool, str)) else str(val))
-    if nn_name == "nn.Dropout" or nn_name.startswith("nn.Dropout"):
+    if nn_name.startswith("nn.Dropout"):
         out["p"] = float(getattr(mod, "p", 0.0))
+    if nn_name in _BIAS_LEAVES and getattr(mod, "bias", None) is None:
+        out["bias"] = False
+    if nn_name in _CONV_ATTRS:
+        for key in _CONV_ATTRS[nn_name]:
+            val = _jsonable(getattr(mod, key, None))
+            if val is not None:
+                out[key] = val
+        return out
+    for key, default in _LEAF_OPTIONAL.get(nn_name, {}).items():
+        if key == "padding_idx":
+            if isinstance(getattr(mod, "padding_idx", None), int):
+                out[key] = getattr(mod, "padding_idx")
+            continue
+        val = _jsonable(getattr(mod, key, None))
+        if val is not None and val != default:
+            out[key] = val
     return out
 
 
@@ -275,24 +367,118 @@ def _fold_hint(nn_name: str, mod) -> str | None:
     return None
 
 
-def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type: str = "other") -> dict:
+def _with_batch(spec: dict, batch: int) -> dict:
+    """spec 的**张量入参 dim0 全换成** `batch`（主形状 + `extra`）——动态批量维下的示例输入用。"""
+    s = dict(spec)
+    sh = list(s.get("shape") or [])
+    if sh:
+        s["shape"] = [batch, *sh[1:]]
+    if s.get("extra"):
+        s["extra"] = [{**e, "shape": [batch, *list(e.get("shape") or [1])[1:]]} for e in s["extra"]]
+    return s
+
+
+def _dynamic_shapes(model, args: tuple, kwargs: dict) -> dict | None:
+    """每个**张量**实参的 dim0 → 同一个符号 `batch`；非张量（bool 开关等）→ None。
+
+    dict 形态必须列出**全部实参名**（含 kwargs），否则 `torch.export` 直接 UserError。
+    形参名按 `model.forward` 的签名取（位置实参按序命名）。
+    """
+    import inspect
+
+    import torch
+    from torch.export import Dim
+
+    try:
+        names = [p for p in inspect.signature(model.forward).parameters if p != "self"][:len(args)]
+    except (TypeError, ValueError):
+        return None
+    if len(names) != len(args):
+        return None
+    dyn: dict = {}
+    for nm, val in zip(names, args):
+        dyn[nm] = {0: Dim("batch")} if isinstance(val, torch.Tensor) and val.dim() > 0 else None
+    for nm in kwargs:
+        dyn[nm] = None
+    return dyn
+
+
+def _export_traced(model, spec: dict, kwargs: dict, notes: list[str],
+                   source_dir: str | None = None):
+    """导出：**优先把批量维声明为动态**，失败则回退静态（并登记原因）。
+
+    为什么要动态：`labels = torch.arange(cos_sim.size(0))`、`mask = torch.eye(cos_sim.size(0))` 这类
+    **数据依赖**的常量，在静态导出下会被**用示例批量维折叠掉**（`arange(1)`/`eye(1)`）→ 生成的模型
+    批量维被写死：换 batch 直接崩（实测 scGPT 导出模型 batch>1 报 `cross_entropy` 尺寸不符），
+    且 batch=1 时 `loss_cce`/`loss_ecs` 恒为常数（退化）。声明动态后图表里留 `sym_size`，
+    IR 渲染成 `x0.size(0)`，模型对任意 batch 成立。
+    两条实测口径：① dynamo 会**特化常数 1**（示例批量=1 必失败）→ dummy 用 **2**；
+                  ② 模型若把 dim0 当别的语义（各入参 dim0 不一致）会导出失败 → **回退静态**。
+    """
+    import torch
+
+    def _export(spec_use: dict, dynamic: bool):
+        dt_ = getattr(torch, str(spec_use.get("dtype") or "float32").replace("torch.", ""), torch.float32)
+        xs = build_inputs(model, spec_use, source_dir)
+        a = accepted_positional(model.forward, xs)
+        dyn = _dynamic_shapes(model, a, kwargs) if dynamic else None
+        if dynamic and dyn is None:
+            return None
+        return torch.export.export(model, a, kwargs=kwargs or None, strict=False, dynamic_shapes=dyn)
+
+    try:
+        ep = _export(_with_batch(spec, 2), True)
+        if ep is not None:
+            notes.append("导出用**动态批量维**（dim0 符号化）：IR 对任意 batch 成立")
+            return ep
+    except Exception as e:  # noqa: BLE001 —— 动态失败很常见（模型把 dim0 当别的语义）→ 回退静态
+        notes.append(f"动态批量维导出失败，回退静态（批量维会被示例值写死）：{type(e).__name__}: {str(e)[:160]}")
+    return _export(spec, False)
+
+
+def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type: str = "other",
+             entry_args: dict | None = None, source_dir: str | None = None) -> dict:
     """在**已实例化**的真实模型上生成 IR。返回 (ir, notes)：notes 是如实登记的「没能表达」清单。"""
     import torch
 
     notes: list[str] = []
-    dt = getattr(torch, str(spec.get("dtype") or "float32").replace("torch.", ""), torch.float32)
-    xs = (make_dummy_input(spec.get("shape") or [1, 100], dt), *make_extra_inputs(spec))
-    args = accepted_positional(model.forward, xs)
     kwargs = accepted_kwargs(model.forward, call_kwargs(spec))
     # 导出本身会跑一次 forward → 顺手用 hook 捕获**真实返回值**（多输出模型的 dict 键名从这来，
     # 不必再调一次模型：重复调用在导出之后可能因实参个数解析不同而失败）。
     captured: dict = {}
     _h = model.register_forward_hook(lambda _m, _i, o: captured.__setitem__("out", o))
     try:
-        ep = torch.export.export(model, args, kwargs=kwargs or None, strict=False)
+        ep = _export_traced(model, spec, kwargs, notes, source_dir)
     finally:
         _h.remove()
     nodes = list(ep.graph_module.graph.nodes)
+
+    # **透传**节点：`arange(...).long()` 这类会被导出成 `to.dtype` → `to.dtype_layout`（dtype 已相同，
+    # 只是布局归一的**导出伪影**）。它在 `_SKIP_ATEN` 里、不建节点，但它的**消费者**若直接拿它当操作数
+    # 就会凭空缺一个入边 → 整条分支被当碎片删掉（实测 scGPT 的 `cross_entropy(cos_sim, labels)` 与
+    # `masked_fill(mm, mask)` 因此丢了 CCE/ECS 两条输出分支）。故把它当**别名**解析到真正的数据源。
+    passthrough: dict[int, object] = {}
+    for n in nodes:
+        if "to.dtype_layout" in str(n.target):
+            ins = [a for a in n.args if hasattr(a, "op")]
+            if len(ins) == 1:
+                passthrough[id(n)] = ins[0]
+
+    def resolve(node):
+        seen: set[int] = set()
+        while id(node) in passthrough and id(node) not in seen:
+            seen.add(id(node))
+            node = passthrough[id(node)]
+        return node
+
+    # **外部输入**：`torch.export` 的 graph_signature 把「参数/缓冲」记为 PARAMETER，其余即用户输入
+    # （如 scGPT 的 `src`/`values`/`src_key_padding_mask`）。顺序即 forward 形参顺序。
+    user_inputs: list[str] = []
+    for s in getattr(ep.graph_signature, "input_specs", []):
+        if "USER_INPUT" in str(getattr(s, "kind", "")).upper():
+            nm = getattr(getattr(s, "arg", None), "name", None)
+            if nm:
+                user_inputs.append(str(nm))
 
     # ---- 1) 模块树：从 nn_module_stack 收集路径 ----
     paths: set[str] = set()
@@ -310,6 +496,13 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
     kind_of: dict[str, str] = {"": "module"}
     class_of: dict[str, str] = {"": entry_class}
     mods = dict(model.named_modules())
+    # 节点顺序**按原模型的 `named_modules()` 顺序**（即声明/实例化序）——IR 节点顺序决定再生成模型的
+    # 子模块顺序 → `state_dict` 顺序 → ⑤ 结构比对**按位置**对齐与**按位置拷权重**。按名称字典序排
+    # （`sorted(paths)`）会让顺序与原模型不符（实测 `enc` 排到了 `head` 前面），权重逐位置错配。
+    _mod_order = {p: i for i, (p, _m) in enumerate(model.named_modules())}
+
+    def _order_key(p: str) -> int:
+        return _mod_order.get(_strip_calls(p), len(_mod_order))
 
     def _leaf_ancestor(p: str) -> bool:
         """祖先里是否有**已被折叠成叶子**的层（如 nn.TransformerEncoder）——它的子孙不再建节点。"""
@@ -320,7 +513,7 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
                 return True
         return False
 
-    for p in sorted(paths):
+    for p in sorted(paths, key=_order_key):
         if _leaf_ancestor(p):
             continue
         sub = mods.get(_strip_calls(p))       # 节点身份带 `@N`，查模块要用归一化路径
@@ -366,7 +559,7 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
     node_by_path: dict[str, str] = {"": root_id}
     ir_nodes.append({"id": root_id, "kind": "module", "class_name": entry_class,
                      "parent_id": None, "module_path": ""})
-    for p in sorted(kind_of):
+    for p in sorted(kind_of, key=_order_key):
         if p == "":
             continue
         nid = _ident(p)
@@ -386,9 +579,21 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
 
     # 折叠后仍**没有子节点**的 module 节点：实测同一模块的**第二次调用**，torch 不再展开其内部
     # 模块栈（`encoder@1` 直接承载算子）→ 无法重构内部结构。删除并如实登记（其下游会因此缺入边）。
+    # **但**「有算子归属」的模块不算空——它的子节点是**算子**、在第 4 段才创建（实测 scGPT 的
+    # `sim`(Similarity) 子模块全是无参 `nn.CosineSimilarity`（折进父层不建节点），此处被误删 →
+    # 整条 CCE 分支（loss_cce）丢失）。
+    _op_owners = set()
+    for _n in nodes:
+        if _n.op != "call_function":
+            continue
+        _aten = str(_n.target).replace("torch.ops.", "").replace("aten.", "")
+        if any(s in _aten for s in _SKIP_ATEN):
+            continue
+        _op_owners.add(node_by_path.get(nearest_ir_path(owner_of[id(_n)])))
     _parents = {n.get("parent_id") for n in ir_nodes}
     dropped = {n["id"] for n in ir_nodes
-               if n["kind"] == "module" and n["id"] != root_id and n["id"] not in _parents}
+               if n["kind"] == "module" and n["id"] != root_id and n["id"] not in _parents
+               and n["id"] not in _op_owners}
     if dropped:
         notes.append(f"{len(dropped)} 个 module 节点无子节点（重复调用未展开内部栈）——已删除：{sorted(dropped)[:4]}")
         ir_nodes = [n for n in ir_nodes if n["id"] not in dropped]
@@ -396,16 +601,100 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
             if _nid in dropped:
                 node_by_path.pop(_p, None)
 
-    # ---- 4) 模块层算子 → op 节点（叶子/容器内部的操作由它们自己承载，不再展开）----
-    # **外部输入**：`torch.export` 的 graph_signature 把「参数/缓冲」记为 PARAMETER，其余即用户输入
-    # （如 scGPT 的 `src`/`values`/`labels`）。op 引用它们时写 `{ext:名}`，根类会加同名形参。
-    user_inputs: list[str] = []
-    for s in getattr(ep.graph_signature, "input_specs", []):
-        if "USER_INPUT" in str(getattr(s, "kind", "")).upper():
-            nm = getattr(getattr(s, "arg", None), "name", None)
-            if nm:
-                user_inputs.append(str(nm))
+    # ---- 3.5) 输入接线：用户输入 placeholder → 承载它的**顶层模块** ----
+    # 真实 forward 的外部输入（`src`/`values`…）在导出图里是 placeholder，被某个模块子树的算子消费。
+    # 承载它的**顶层 module 节点**（root 的直接子节点）就是这份输入的模块级入口 → 写进
+    # `input_spec.inputs`，根类据此把它作为形参按序传给该模块；模块内部的算子把它当**自己的输入**
+    # 用（`{inputs[N]}` + `模块→算子` 边，见第 4/5 段），**不再写 `{ext:…}`**——那样在子模块的
+    # forward 里是未定义名（实测 scGPT 的 `Decomp_value_encoder.forward` 出现裸 `values`）。
+    # 若某 placeholder 还被**根层/折叠叶子**消费（无顶层模块可承载），则整份按外部输入处理
+    # （`{ext:…}` + `input_spec.external`），与单输入模型的既有行为一致。
+    node_by_id = {n["id"]: n for n in ir_nodes}
+    _chain_cache: dict[str, list[str]] = {}
 
+    def _owner_chain(owner_path: str) -> list[str]:
+        """模块路径 → 从最近 IR 节点起的祖先 id 链（自身在前、root 在末）。"""
+        if owner_path not in _chain_cache:
+            chain: list[str] = []
+            cur = nearest_ir_path(owner_path)
+            while cur:
+                nid = node_by_path.get(cur)
+                if nid:
+                    chain.append(nid)
+                cur = _parent_path(cur)
+            _chain_cache[owner_path] = chain
+        return _chain_cache[owner_path]
+
+    def _top_module(owner_path: str) -> str | None:
+        """消费点所属的顶层 module 节点（root 的直接子节点）；消费在根层/折叠叶子内则 None。"""
+        for nid in _owner_chain(owner_path):
+            n = node_by_id.get(nid)
+            if n is not None and n.get("parent_id") == root_id and n["kind"] == "module":
+                return nid
+        return None
+
+    ph_module: dict[str, str] = {}          # placeholder → 承载它的顶层模块 id
+    ph_at_root: set[str] = set()            # 还被根层消费的 placeholder（整份按外部输入处理）
+    ph_conflict: dict[str, str] = {}
+    for n in nodes:
+        if n.op in ("placeholder", "output"):
+            continue
+        if any(k in str(n.target) for k in _META_ATEN):
+            continue      # 元数据算子只读形状、不消费数值 → 不算「根层消费了该用户输入」
+        for a in list(n.args) + list(n.kwargs.values()):
+            if not (hasattr(a, "op") and a.op == "placeholder"):
+                continue
+            nm = str(a.name)
+            if nm not in user_inputs:
+                continue
+            tm = _top_module(owner_of[id(n)])
+            if tm is None:
+                ph_at_root.add(nm)
+            elif nm not in ph_module:
+                ph_module[nm] = tm
+            elif ph_module[nm] != tm:
+                ph_conflict[nm] = f"{ph_module[nm]} / {tm}"
+    for nm in ph_at_root:
+        ph_module.pop(nm, None)
+    # `input_spec.inputs`：按 forward 形参顺序列出承载外部输入的顶层模块（去重保序）
+    input_mods: list[str] = []
+    for nm in user_inputs:
+        tm = ph_module.get(nm)
+        if tm and tm not in input_mods:
+            input_mods.append(tm)
+    for nm, why in ph_conflict.items():
+        notes.append(f"外部输入 `{nm}` 被多个顶层模块消费（{why}）——按首个模块接线，其余引用可能落空")
+    if input_mods:
+        notes.append("输入接线：" + "、".join(f"`{nm}`→{ph_module[nm]}" for nm in user_inputs if nm in ph_module))
+    _unwired = [nm for nm in user_inputs if nm not in ph_module and nm not in ph_at_root]
+    if _unwired:
+        notes.append(f"用户输入 {_unwired} 只被折叠叶子/未建模处消费——未接模块输入（其算子不参与再生成）")
+
+    # 每个 IR 节点的祖先 id 集（判「某模块是不是该节点的祖先」用）。**按需算**——op 节点在其后的
+    # 第 4 段才创建，预先算好的快照会漏掉它们（曾因此漏建 `模块→算子` 的输入边、算子被当碎片删）。
+    def _anc_of(nid: str) -> set[str]:
+        pmap = {x["id"]: x.get("parent_id") for x in ir_nodes}
+        s: set[str] = set()
+        cur = pmap.get(nid)
+        while cur:
+            s.add(cur)
+            cur = pmap.get(cur)
+        return s
+
+    # **元数据算子的操作数改接**：`src.size(0)`（动态批量维下 dynamo 把 `cos_sim.size(0)` 规范成它）
+    # 里的 `src` 是**用户输入 placeholder**，在根层没有变量名。改接**承载该输入的模块节点**——
+    # `var_encoder.size(0)` 与 `x0.size(0)` 批量维一致，且根层本来就有这个变量。
+    meta_src: dict[int, str] = {}          # 图节点 id → 操作数应取的 IR 节点 id
+    for n in nodes:
+        if n.op != "call_function" or not any(k in str(n.target) for k in _META_ATEN):
+            continue
+        ph = [a for a in n.args if hasattr(a, "op") and a.op == "placeholder"]
+        if len(ph) == 1:
+            tm = ph_module.get(str(ph[0].name))
+            if tm:
+                meta_src[id(n)] = node_by_path[tm]
+
+    # ---- 4) 模块层算子 → op 节点（叶子/容器内部的操作由它们自己承载，不再展开）----
     op_of_grapnode: dict[int, str] = {}
     skipped: set[int] = set()
     used_exts: list[str] = []          # 实际被算子引用的外部输入（只声明用到的）
@@ -416,8 +705,25 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
         _pid = node_by_path.get(nearest_ir_path(owner_of[id(_n)]))
         if _pid is not None:
             ir_node_of[id(_n)] = _pid
-    counter = 0
     seen_ops: dict[tuple, str] = {}       # (owner, aten, code_hint) → 复用的 op 节点 id
+    used_ids: set[str] = {n["id"] for n in ir_nodes}   # id 全局唯一（模块/叶子/容器先建、算子后建）
+
+    def _op_id(owner_path: str, aten: str) -> str:
+        """算子节点 id：`<归属模块末段>_<算子头>`（如 `value_encoder_unsqueeze`），重名加 `_2`/`_3`。
+
+        原来是 `op1`/`op12`——在查看器/画布上读不出内容，而这些 id 还会成为再生成代码的变量名。
+        """
+        seg = owner_path.rsplit(".", 1)[-1] if owner_path else "root"
+        base = re.sub(r"[^0-9A-Za-z_]", "_", f"{seg}_{aten.split('.')[0]}")
+        if not base or base[0].isdigit():
+            base = "op_" + base
+        oid, k = base, 1
+        while oid in used_ids:
+            k += 1
+            oid = f"{base}_{k}"
+        used_ids.add(oid)
+        return oid
+
     for n in nodes:
         if n.op != "call_function":
             continue
@@ -430,22 +736,69 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
             continue
         # 渲染路径：**先内置模板**（可读性好），不行再走**按真实实参的通用渲染**。
         # 两者都失败 → 跳过该算子并如实登记（它的下游会因此缺入边，下游问题随之暴露）。
-        counter += 1
-        oid = f"op{counter}"
         hint: str | None = None
+        # 本算子的祖先 id 集（含其归属模块）：判「某模块是不是它的祖先」——即该模块的输入是否直喂它
+        owner_id = node_by_path[owner]
+        op_anc = {owner_id} | _anc_of(owner_id)
+        if id(n) in meta_src:
+            # 元数据算子、且操作数是**用户输入 placeholder**（dynamo 把 `cos.size(0)` 规范成了
+            # `src.size(0)`）：该 placeholder 在根层没有变量名，操作数已改接成**承载它的模块节点**
+            # （见 `meta_src` 的注释）→ 直接渲染 `{inputs[0]}.size(dim)`。
+            # 操作数是普通中间张量的情形由下面的 `_ATEN_EXPR["sym_size.int"]` 模板覆盖。
+            dim = _call_repr(n.args[1]) if len(n.args) > 1 else "0"
+            hint = "{inputs[0]}.numel()" if "numel" in aten else "{inputs[0]}.size(%s)" % dim
+            oid = _op_id(owner, aten)
+            ir_nodes.append({"id": oid, "kind": "op", "class_name": aten,
+                             "parent_id": node_by_path.get(owner, root_id), "code_hint": hint})
+            op_of_grapnode[id(n)] = oid
+            ir_node_of[id(n)] = oid
+            continue
+        if aten == "slice.Tensor":
+            # `aten.slice.Tensor(self, dim, start, end, step)`。两种情形分开处理：
+            # ① **整维切片**（start=0 且 end 是「到末尾」哨兵）是**恒等** —— 动态形状下 dynamo 会把
+            #    `layer[:, 0, :]` 写成 `slice(dim=0, 0, INT64_MAX)` + `select(1, 0)`；照 `torch.narrow`
+            #    渲染会拼出 `narrow(x, 0, 0, INT64_MAX)`，运行期 `start+length exceeds dimension size`。
+            #    故当**别名**跳过（消费者直接接到被切的那个张量）。
+            # ② 其余：`torch.narrow(a, dim, start, end-start)`（`narrow` 的第 4 参是**长度**，不是 end）。
+            _a = list(n.args)
+            if _a and hasattr(_a[0], "op"):
+                _rest = [x for x in _a[1:] if not hasattr(x, "op")]
+                _dim = _rest[0] if _rest and isinstance(_rest[0], int) else 0
+                _start = _rest[1] if len(_rest) > 1 and isinstance(_rest[1], int) else 0
+                _end = _rest[2] if len(_rest) > 2 else None
+                if _start == 0 and isinstance(_end, int) and _end >= _SLICE_UNBOUNDED:
+                    passthrough[id(n)] = _a[0]
+                    skipped.add(id(n))          # 不建节点（同 `to.dtype_layout`：`ir_node_of` 会被剔除）
+                    continue
+                if isinstance(_end, int) and _end > _start:
+                    hint = "torch.narrow({inputs[0]}, %d, %d, %d)" % (_dim, _start, _end - _start)
+        if hint is not None:
+            oid = _op_id(owner, aten)
+            ir_nodes.append({"id": oid, "kind": "op", "class_name": aten,
+                             "parent_id": node_by_path.get(owner, root_id), "code_hint": hint})
+            op_of_grapnode[id(n)] = oid
+            ir_node_of[id(n)] = oid
+            continue
         tpl = _ATEN_EXPR.get(aten)
         if tpl is not None:
-            nargs = tpl.count("{a}") + tpl.count("{b}") + tpl.count("{c}")
+            nargs = sum(tpl.count(f"{{{c}}}") for c in "abcde")
             args = list(n.args)
             reps: list[str] = []
             ok = len(args) >= nargs
             node_idx = 0
             for a in args[:nargs] if ok else []:
+                if hasattr(a, "op"):
+                    a = resolve(a)
                 if hasattr(a, "op") and a.op == "placeholder":
                     nm = str(a.name)
                     if nm not in user_inputs:
                         ok = False
                         break
+                    tm = ph_module.get(nm)
+                    if tm is not None and tm in op_anc:
+                        reps.append("{inputs[%d]}" % node_idx)   # 本模块的输入
+                        node_idx += 1
+                        continue
                     reps.append(f"{{ext:{nm}}}")
                     if nm not in used_exts:
                         used_exts.append(nm)
@@ -464,11 +817,11 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
                 reps.append(lit)
             if ok:
                 hint = tpl
-                for i, ph in enumerate(("{a}", "{b}", "{c}")):
+                for i, ph in enumerate(("{a}", "{b}", "{c}", "{d}", "{e}")):
                     if ph in hint and i < len(reps):
                         hint = hint.replace(ph, reps[i])
         if hint is None:
-            gen = _render_aten(n, user_inputs)
+            gen = _render_aten(n, user_inputs, ph_module, op_anc, resolve)
             if gen is not None:
                 hint, gexts = gen
                 for e in gexts:
@@ -477,7 +830,6 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
         if hint is None:
             notes.append(f"算子 `{aten}`（{owner or 'root'} 层）无法渲染（实参不可表达或缺模板）——已跳过")
             skipped.add(id(n))
-            counter -= 1
             continue
         # **同一算子被重复调用**（`unsqueeze`/`unsqueeze_13`）会产生多个图节点，但 IR 级输入完全相同
         # （同一模块、同一算子、同一组 IR 入参 → code_hint 一字不差）→ **复用同一个 op 节点**。
@@ -485,13 +837,19 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
         key = (owner, aten, hint)
         if key in seen_ops:
             oid = seen_ops[key]
-            counter -= 1
         else:
             # class_name 用**完整 aten 名**（如 `div.Scalar`）：`div.Scalar` 只有一个张量操作数，
             # 不该按「二元算子（OP_BINARY 的 `div`）」校验；语义由 code_hint 承载。
-            ir_nodes.append({"id": oid, "kind": "op",
-                             "class_name": aten, "parent_id": node_by_path.get(owner, root_id),
-                             "code_hint": hint})
+            oid = _op_id(owner, aten)
+            node = {"id": oid, "kind": "op", "class_name": aten,
+                    "parent_id": node_by_path.get(owner, root_id), "code_hint": hint}
+            # 归属模块**自己没有节点**时（无参 `nn.*` 折进父层当函数用，如 `nn.CrossEntropyLoss`），
+            # 把**真实模块路径**记在该 op 上：保真度自检与补形状都按 `module_path` 查「真实调用到的
+            # 模块是否被 IR 覆盖」，不记就会被误判成「漏拆 creterion_cce」而拒收（实测踩到）。
+            raw_owner = owner_of[id(n)]
+            if raw_owner and raw_owner != owner:
+                node["module_path"] = _strip_calls(raw_owner)
+            ir_nodes.append(node)
             seen_ops[key] = oid
         op_of_grapnode[id(n)] = oid
         ir_node_of[id(n)] = oid          # 该图节点今后代表这个 op
@@ -513,9 +871,27 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
             cur, p = p, parent_of.get(p)
         return cur
 
+    def _top_child(nid: str) -> str:
+        """节点所属的**顶层子节点**（root 的直接子节点；自己就是则返回自己，root 返回 root）。"""
+        cur = nid
+        while True:
+            p = parent_of.get(cur)
+            if not p or p == root_id:
+                return cur
+            cur = p
+
     edges: list[dict] = []
     seen_edges: set[tuple[str, str]] = set()
     live_ids = {n["id"] for n in ir_nodes}
+    # 元数据算子（`sym_size`）在 IR 里的节点 id —— 它们的值**不是张量**，不能喂进折叠叶子/容器
+    meta_ids = {ir_node_of[k] for k in meta_src if k in ir_node_of}
+
+    def _emit(s: str, t: str) -> None:
+        if s != t and s in live_ids and t in live_ids and (s, t) not in seen_edges:
+            seen_edges.add((s, t))
+            edges.append({"from": s, "to": t})
+
+    _meta_leaf_skips: set[str] = set()      # 被忽略的「元数据 → 折叠层」边的目标（循环后统一登记）
     for n in nodes:
         if n.op in ("placeholder", "output"):
             continue
@@ -526,17 +902,55 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
         for src in n.args:
             if not hasattr(src, "name"):
                 continue
+            if id(n) in meta_src:
+                # 元数据算子：操作数固定改接承载该输入的模块节点（见 meta_src 的注释）
+                _emit(_lift(meta_src[id(n)]), tgt)
+                break
+            if hasattr(src, "op"):
+                src = resolve(src)      # 透传节点 → 真数据源（否则消费者缺入边）
             if src.op == "placeholder":
                 # `torch.export` 把**参数/缓冲**也提升成 graph 输入（placeholder）——那是权重不是数据流；
-                # 真实外部输入也一样（IR 约定：无入边的节点即吃外部输入）。都不建边。
-                continue
-            s = ir_node_of.get(id(src))
-            if s is None:
-                continue
+                # 但**用户输入**若由消费点所属的顶层模块承载，则补一条 `模块 → 消费节点` 的边
+                # （codegen 据 `_ext_var` 把该模块的输入形参喂给它；未连边 = 该模块的输入未被使用）。
+                nm = str(src.name)
+                tm = ph_module.get(nm)
+                if tm is None:
+                    continue
+                if tm not in _anc_of(tgt):
+                    continue
+                s = tm
+            else:
+                s = ir_node_of.get(id(src))
+                if s is None:
+                    continue
             s = _lift(s)
-            if s != tgt and s in live_ids and tgt in live_ids and (s, tgt) not in seen_edges:
-                seen_edges.add((s, tgt))
-                edges.append({"from": s, "to": tgt})
+            # **元数据值流进折叠叶子/容器**（如融合的 `_transformer_encoder_layer_fwd` 内部要用形状）：
+            # 叶子是**整体实例化**的黑盒（code_hint 一条构造式），多喂一个 int 会让 `self.X(...)` 多一个
+            # 参数、运行期直接报错。这类边不建（叶子内部本就未建模）。
+            if s in meta_ids and kind_by_id.get(tgt) in ("leaf", "container"):
+                _meta_leaf_skips.add(tgt)
+                continue
+            # 跨「顶层子节点」的边：
+            # - **目标是模块**（内层节点）：`_module_class` 只在**直接子节点**间接线，故必须补一条
+            #   `源模块 → 目标模块` 的边（追踪得到的边挂在最深消费节点：`transformer_encoder →
+            #   decoder_fc`，而 root 需要 `transformer_encoder → decoder`）。目标模块**多输入**时
+            #   （如 scGPT 的 `MVCDecoder(cell_emb, gene_embs)`），内部节点还要知道「自己吃哪个参数」
+            #   → 再保留一条 `源模块 → 该内部节点` 的路由边（codegen 的 `_ext_var` 按来源在
+            #   `sources` 里的位置取形参）。
+            # - **目标不是模块**（根层算子/叶子）：**原样保留**。上抬会把模块内的汇点算子（如 `Sim`
+            #   里的 `cosine_similarity`）变成「IR 级无人消费」→ 被断头清理误删；保持原样则由
+            #   codegen 的 `_sink_of` 解析成该模块的输出变量（内部源只会是模块汇点）。
+            st, tt = _top_child(s), _top_child(tgt)
+            if st == tt:
+                _emit(s, tgt)
+            elif kind_by_id.get(tt) == "module":
+                _emit(st, tt)
+                _emit(st, tgt)
+            else:
+                _emit(s, tgt)
+    if _meta_leaf_skips:
+        notes.append(f"元数据算子（sym_size）的值流进折叠层 {sorted(_meta_leaf_skips)}——该边已忽略"
+                     "（叶子内部未建模）")
 
     # ---- 6) 多输出模型（如 scGPT 返回 `dict(mlm_output=…, cell_emb=…, …)`）----
     # root 会有**多个汇点**，而 IR 要求模块唯一汇点 → 合成一个「装配输出」算子把各分支汇成
@@ -626,17 +1040,22 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
     # ---- 8) 装配输出算子：把存活的多输出分支汇成**真实返回结构**（root 因此唯一汇点）----
     if len(pairs) > 1:
         hint = "dict(" + ", ".join(f"{k}={{inputs[{i}]}}" for i, (k, _) in enumerate(pairs)) + ")"
-        oid = "output" if all(n["id"] != "output" for n in ir_nodes) else "output_"
+        oid = "output" if "output" not in used_ids else "output_"
         ir_nodes.append({"id": oid, "kind": "op", "class_name": "build_output",
                          "parent_id": root_id, "code_hint": hint})
         for _k, t in pairs:
             edges.append({"from": t, "to": oid})
 
     spec_out = dict(spec)
+    # `inputs`（root 的模块级形参）：**由追踪推导**——按 forward 形参顺序列出承载外部输入的顶层模块。
+    # 推导不出（没有任何输入落在模块内，如单输入模型的输入只在根层被消费）时保留参考 IR 的值/缺省，
+    # 此时 root 只有默认形参 `x`，`{ext:…}` 与 no-in-edge 子节点都落到它上面，行为与既有单输入模型一致。
+    if input_mods:
+        spec_out["inputs"] = input_mods
     if used_exts:
         spec_out["external"] = [{"name": n} for n in used_exts]
-    # 注：`input_spec.inputs`（root 的模块级形参）目前仍沿用参考 IR 的值——从追踪里推它还需要
-    # 想清楚「模块级输入」与「外部输入(ext)」的分工（草稿版把叶子节点当成输入，反而更差，已回退）。
+    else:
+        spec_out.pop("external", None)
     ir = {
         "schema_version": "1.0",
         "source_file": source_file,
@@ -647,6 +1066,10 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
         "nodes": ir_nodes,
         "edges": edges,
     }
+    # 入口类构造参数（用户补的）**必须带过**：它决定原模型怎么实例化（`verify`/`trace` 都靠它），
+    # 也在 `ir_hash` 里——漏了会让验证脚本无法构造原模型。
+    if entry_args:
+        ir["entry_args"] = entry_args
     return ir, notes
 
 
@@ -664,9 +1087,10 @@ def main() -> None:
 
     prepare_torch()
     cls = load_entry_class(source_dir, source_file, entry_class)
-    model = instantiate(cls, entry_args).eval()
+    model = instantiate(cls, entry_args, source_dir).eval()
     ir, notes = build_ir(model, entry_class=entry_class, source_file=source_file,
-                         spec=spec, task_type=task_type)
+                         spec=spec, task_type=task_type, entry_args=entry_args,
+                         source_dir=source_dir)
     Path(out_path).write_text(json.dumps(ir, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"written: {out_path}（{len(ir['nodes'])} 节点 / {len(ir['edges'])} 边）")
     for x in notes[:20]:

@@ -57,6 +57,39 @@ def test_check_syntax_reports_line():
         ir_codegen._check_syntax("x = 1\ndict(a=1, b)\n")
 
 
+# ---------------------------------------------------------------- 常量算子（2026-10-06 追踪链路暴露）
+
+def _const_ir(hint: str, with_edge: bool) -> dict:
+    """一个**常量算子**（无操作数、无外部输入，如 `torch.arange(1)`/`torch.eye(1)`——导出时
+    批量维度等已被常量折叠）。`ir_schema.validate_ir` 本就允许（「纯常量表达式本来就不消费任何
+    节点」），此前 `generate` 却拒绝 → 「校验通过、生成报错」，整条 loss 分支因此丢失。
+    """
+    nodes = [
+        {"id": "net", "kind": "module", "class_name": "Net", "parent_id": None, "module_path": ""},
+        {"id": "k", "kind": "op", "class_name": "arange.default", "parent_id": "net",
+         "code_hint": hint},
+    ]
+    edges = []
+    if with_edge:
+        nodes.append({"id": "a", "kind": "leaf", "class_name": "nn.Identity", "parent_id": "net"})
+        edges = [{"from": "a", "to": "k"}]
+    return {"source_file": "m.py", "entry_class": "Net", "task_type": "classification",
+            "input_spec": {"shape": [1, 4], "dtype": "float32"}, "root_id": "net",
+            "nodes": nodes, "edges": edges}
+
+
+def test_constant_op_without_operands_is_allowed():
+    """常量表达式（不引用 `{inputs}` 也没有入边）必须能再生成——与 validate_ir 同口径。"""
+    code = ir_codegen.generate(_const_ir("torch.arange(1)", with_edge=False))
+    assert "var_k = torch.arange(1)" in code
+
+
+def test_op_with_in_edges_must_still_consume_them():
+    """有入边却完全不引用操作数 → 仍是错误（常量放行不等于「忽略入边」）。"""
+    with pytest.raises(IrIncompleteError, match="没有引用任何操作数"):
+        ir_codegen.generate(_const_ir("torch.arange(1)", with_edge=True))
+
+
 # ---------------------------------------------------------------- 多输入（边界 ⑯）
 
 def _two_input_ir(**spec_extra) -> dict:

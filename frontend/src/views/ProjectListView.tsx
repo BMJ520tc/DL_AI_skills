@@ -6,20 +6,31 @@ import { useCallback, useEffect, useState, type CSSProperties } from "react";
 import {
     ApiError,
     createProject,
+    listKnowledge,
     listProjects,
     type Project,
 } from "../api/client";
 import SearchDownloadPanel from "./panels/SearchDownloadPanel";
 
 const BUSY_STATUSES = new Set(["loading", "preparing", "queued", "running"]);
+/** 本地记住的「论文复现」选择（论文 + 绑定项目）。 */
+const REPRO_PICK_KEY = "dlai_repro_pick";
 
 export type ProjectListViewProps = {
     onOpenViewer: (projectId: string) => void;
     onOpenCanvas: (projectId: string) => void;
+    onOpenReproduce: (projectId: string, paperId?: string) => void;
+    onOpenTasks: () => void;
     onOpenSandbox: () => void;
 };
 
-export default function ProjectListView({ onOpenViewer, onOpenCanvas, onOpenSandbox }: ProjectListViewProps) {
+export default function ProjectListView({
+    onOpenViewer,
+    onOpenCanvas,
+    onOpenReproduce,
+    onOpenTasks,
+    onOpenSandbox,
+}: ProjectListViewProps) {
     const [projects, setProjects] = useState<Project[]>([]);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
@@ -31,6 +42,66 @@ export default function ProjectListView({ onOpenViewer, onOpenCanvas, onOpenSand
     const [modelParentId, setModelParentId] = useState("");
     const [creatingModel, setCreatingModel] = useState(false);
     const [createModelError, setCreateModelError] = useState<string | null>(null);
+    // 论文复现入口（模块二）：论文库 + 绑定项目（复现跑在它的独立环境里）
+    const [papers, setPapers] = useState<Array<Record<string, unknown>>>([]);
+    const [reproPaperId, setReproPaperId] = useState("");
+    const [reproProjectId, setReproProjectId] = useState("");
+
+    useEffect(() => {
+        void (async () => {
+            try {
+                setPapers(await listKnowledge("paper"));
+            } catch {
+                setPapers([]);
+            }
+        })();
+    }, []);
+
+    // 记住上次的「论文 + 绑定项目」：论文复现要跑在某个原始项目的独立环境里，
+    // 每次都从头选两个下拉很烦。存在本地（同一台机器、同一浏览器）。
+    useEffect(() => {
+        try {
+            const saved = JSON.parse(localStorage.getItem(REPRO_PICK_KEY) || "{}") as Record<string, unknown>;
+            if (typeof saved.paperId === "string") setReproPaperId(saved.paperId);
+            if (typeof saved.projectId === "string") setReproProjectId(saved.projectId);
+        } catch {
+            /* 本地记忆损坏：忽略，按未选处理 */
+        }
+    }, []);
+
+    useEffect(() => {
+        if (!reproPaperId && !reproProjectId) return;
+        try {
+            localStorage.setItem(REPRO_PICK_KEY, JSON.stringify({
+                paperId: reproPaperId, projectId: reproProjectId,
+            }));
+        } catch {
+            /* 隐私模式等写入失败：不影响使用 */
+        }
+    }, [reproPaperId, reproProjectId]);
+
+    // 记着的对象可能已被删：论文/项目列表回来后校验一次，失效就清掉（避免下拉显示空白）
+    useEffect(() => {
+        if (!papers.length && !projects.length) return;
+        if (reproPaperId && papers.length && !papers.some(p => String(p.paper_id) === reproPaperId)) {
+            setReproPaperId("");
+        }
+        if (reproProjectId && projects.length
+            && !projects.some(p => p.project_id === reproProjectId)) {
+            setReproProjectId("");
+        }
+    }, [papers, projects, reproPaperId, reproProjectId]);
+
+    /** 选论文时，若还没绑定项目，按「项目名出现在论文标题里」自动挑一个（可改）。 */
+    const pickPaper = (paperId: string) => {
+        setReproPaperId(paperId);
+        if (reproProjectId) return;
+        const title = String(papers.find(p => String(p.paper_id) === paperId)?.title ?? "").toLowerCase();
+        const guessed = projects.find(p => p.project_type === "original"
+            && (p.name ?? "").trim().length >= 3
+            && title.includes((p.name ?? "").trim().toLowerCase()));
+        if (guessed) setReproProjectId(guessed.project_id);
+    };
 
     const refresh = useCallback(async () => {
         try {
@@ -174,9 +245,14 @@ export default function ProjectListView({ onOpenViewer, onOpenCanvas, onOpenSand
             <div style={{ maxWidth: 1100, margin: "0 auto" }}>
                 <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 24 }}>
                     <h1 style={{ fontSize: 22, margin: 0 }}>项目</h1>
-                    <button style={{ ...btn, background: "transparent" }} onClick={onOpenSandbox}>
-                        打开本地沙盒画布（原编辑器）
-                    </button>
+                    <div style={{ display: "flex", gap: 8 }}>
+                        <button style={btn} onClick={onOpenTasks}>
+                            任务看板
+                        </button>
+                        <button style={{ ...btn, background: "transparent" }} onClick={onOpenSandbox}>
+                            打开本地沙盒画布（原编辑器）
+                        </button>
+                    </div>
                 </div>
 
                 {error && (
@@ -218,6 +294,54 @@ export default function ProjectListView({ onOpenViewer, onOpenCanvas, onOpenSand
                         <SearchDownloadPanel />
                     </div>
                 </details>
+
+                {/* 论文复现（模块二 4.1~4.4）：选论文 + 绑定项目 → 独立视图。
+                    原先只能从「原始项目 → 模型查看器 → 先复现」进入，入口藏得深且名不符实。 */}
+                <div style={{ ...card, marginBottom: 28 }}>
+                    <h2 style={{ fontSize: 15, margin: "0 0 12px" }}>
+                        论文复现 <span style={{ color: "#64748b", fontSize: 12, fontWeight: 400 }}>（解析论文 → 抽取实验条目 → 确认 → 复现执行 → 可信度结论）</span>
+                    </h2>
+                    <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                        <select
+                            style={{ ...input, flex: "none", minWidth: 280, maxWidth: 380 }}
+                            value={reproPaperId}
+                            onChange={e => pickPaper(e.target.value)}
+                        >
+                            <option value="">论文（可选，进去后也能选）</option>
+                            {papers.map(p => (
+                                <option key={String(p.paper_id)} value={String(p.paper_id)}>
+                                    {String(p.title || "(未命名)")}（{String(p.paper_id).slice(0, 8)}）
+                                </option>
+                            ))}
+                        </select>
+                        <select
+                            style={{ ...input, flex: "none", minWidth: 220, maxWidth: 300 }}
+                            value={reproProjectId}
+                            onChange={e => setReproProjectId(e.target.value)}
+                            title="复现要跑在某个原始项目的独立环境里（模块一）"
+                        >
+                            <option value="">绑定项目（复现执行的独立环境）</option>
+                            {projects.filter(p => p.project_type === "original").map(p => (
+                                <option key={p.project_id} value={p.project_id}>
+                                    {p.name || p.project_id}
+                                </option>
+                            ))}
+                        </select>
+                        <button
+                            style={btn}
+                            disabled={!reproProjectId}
+                            title={reproProjectId ? undefined : "请先选择绑定项目"}
+                            onClick={() => onOpenReproduce(reproProjectId, reproPaperId || undefined)}
+                        >
+                            进入论文复现 →
+                        </button>
+                    </div>
+                    {papers.length === 0 && (
+                        <div style={{ color: "#64748b", fontSize: 12, marginTop: 8 }}>
+                            论文库为空（先用上面「检索与下载」把论文入库）
+                        </div>
+                    )}
+                </div>
 
                 {loading ? (
                     <div style={{ color: "#64748b" }}>加载中…</div>

@@ -89,6 +89,19 @@ CREATE TABLE IF NOT EXISTS credibility_conclusion (
     schema_version  TEXT NOT NULL DEFAULT '1.0'
 );
 
+-- 论文↔项目 绑定留痕：同一篇论文可以用不同项目（各自的独立环境）复现，每次绑定都留档。
+-- 复现任务创建时 upsert（按 paper_id + project_id 唯一），「复现板」据此列出用过的项目。
+CREATE TABLE IF NOT EXISTS paper_project_binding (
+    paper_id       TEXT NOT NULL,
+    project_id     TEXT NOT NULL,
+    created_at     TEXT NOT NULL,                  -- 首次绑定时间
+    last_used_at   TEXT NOT NULL,                  -- 最近一次用它复现的时间
+    uses           INTEGER NOT NULL DEFAULT 1,     -- 用它发起过几次复现
+    last_task_id   TEXT,                           -- 最近一次复现任务 id（据此查那次的结果）
+    schema_version TEXT NOT NULL DEFAULT '1.0',
+    PRIMARY KEY (paper_id, project_id)
+);
+
 -- 运行记录（数据设计五.4）
 CREATE TABLE IF NOT EXISTS run_record (
     run_id          TEXT PRIMARY KEY NOT NULL,

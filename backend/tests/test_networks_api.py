@@ -675,7 +675,7 @@ def _train_params(project_id: str, dataset_id: str, original_id: str) -> dict:
     }
 
 
-async def _fake_ok_run(cmd, *, cwd, timeout):
+async def _fake_ok_run(cmd, *, cwd, timeout, on_line=None):
     """假训练脚本：把指标写进 argv 末位的 out_json（与既有用例同风格）。"""
     from pathlib import Path
 
@@ -696,7 +696,7 @@ def test_train_orchestration_writes_run_record(tmp_networks, monkeypatch):
 
     from app.services import network_service, proc_util, project_manager
 
-    async def fake_run(cmd, *, cwd, timeout):
+    async def fake_run(cmd, *, cwd, timeout, on_line=None):
         # 校验落盘产物：model.py 与 train.py 均已写入运行目录
         from pathlib import Path
 
@@ -763,7 +763,7 @@ def test_train_task_endpoint_and_failure_path(tmp_networks, monkeypatch):
 
     from app.services import network_service, proc_util
 
-    async def failing_run(cmd, *, cwd, timeout):
+    async def failing_run(cmd, *, cwd, timeout, on_line=None):
         return 1, "Traceback: boom"
 
     monkeypatch.setattr(proc_util, "run_command", failing_run)
@@ -931,7 +931,7 @@ def test_train_failure_creates_version_node(tmp_networks, monkeypatch):
 
     from app.services import knowledge_service as ks, network_service, proc_util, version_service
 
-    async def failing_run(cmd, *, cwd, timeout):
+    async def failing_run(cmd, *, cwd, timeout, on_line=None):
         return 1, "Traceback: boom"
 
     monkeypatch.setattr(proc_util, "run_command", failing_run)
@@ -984,7 +984,7 @@ def test_train_failure_version_commit_error_does_not_mask_failure(tmp_networks, 
 
     from app.services import knowledge_service as ks, network_service, proc_util, version_service
 
-    async def failing_run(cmd, *, cwd, timeout):
+    async def failing_run(cmd, *, cwd, timeout, on_line=None):
         return 1, "Traceback: boom"
 
     def broken_commit_run(*_args, **_kwargs):
@@ -1039,7 +1039,7 @@ def test_autotune_selects_best_and_distills(tmp_networks, monkeypatch):
 
     from app.services import knowledge_service as ks, network_service, proc_util
 
-    async def fake_run(cmd, *, cwd, timeout):
+    async def fake_run(cmd, *, cwd, timeout, on_line=None):
         from pathlib import Path
         lr = float(cmd[5])
         acc = 0.9 if abs(lr - 0.1) < 1e-9 else 0.5   # 只有 lr=0.1 表现好

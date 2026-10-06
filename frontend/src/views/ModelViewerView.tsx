@@ -47,12 +47,18 @@ import CodeViewer from "../components/CodeViewer";
 import DiagramView from "../components/DiagramView";
 import { useTaskPolling } from "../hooks/useTaskPolling";
 import KnowledgeBringBanner from "../components/KnowledgeBringBanner";
-import { graphIRToFlow, irToGraphIR } from "../utils/irAdapter";
-import ReproducePanel from "./panels/ReproducePanel";
+import {
+    COLLAPSE_HINT_THRESHOLD,
+    collapseForDisplay,
+    containerIds,
+    graphIRToFlow,
+    irToGraphIR,
+} from "../utils/irAdapter";
+import { relayoutWithElk } from "../utils/elkCompoundLayout";
 import UseDatasetPanel from "./panels/UseDatasetPanel";
 
+// 论文复现（模块二）已迁到初始界面的独立入口（views/ReproduceView），此处只留两种用法。
 const ENTRY_MODES = [
-    { kind: "reproduce", label: "先复现" },
     { kind: "use", label: "先使用" },
     { kind: "decompose", label: "先拆解" },
 ] as const;
@@ -1255,8 +1261,38 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
         [ir, selectedNodeId]
     );
 
-    const graph = useMemo(() => (ir ? irToGraphIR(ir) : null), [ir]);
+    // 大图默认折叠容器（几千个节点全渲染会卡死）；null = 用默认（大图折叠、小图展开）
+    const [expandedIds, setExpandedIds] = useState<Set<string> | null>(null);
+    useEffect(() => {
+        setExpandedIds(null);   // 换 IR/换项目时回到默认
+    }, [ir]);
+    const displayIr = useMemo(
+        () => (ir ? collapseForDisplay(ir, expandedIds) : null),
+        [ir, expandedIds],
+    );
+    const graph = useMemo(() => (displayIr ? irToGraphIR(displayIr) : null), [displayIr]);
     const flow = useMemo(() => (graph ? graphIRToFlow(graph) : null), [graph]);
+    const nodeContainers = useMemo(() => (ir ? containerIds(ir) : []), [ir]);
+    const hiddenCount = (ir?.nodes.length ?? 0) - (displayIr?.nodes.length ?? 0);
+    // **左→右层叠布局**（ELK compound，见 utils/elkCompoundLayout）：后端给的网格是「2 列往下排」，
+    // 30 个顶层子节点铺 15 行、长边来回穿（用户实测反馈）。这里异步算一遍并覆盖坐标；未算完/失败时
+    // 就用网格，不影响渲染。
+    const [elkNodes, setElkNodes] = useState<Map<string, Node> | null>(null);
+    useEffect(() => {
+        if (!flow) {
+            setElkNodes(null);
+            return;
+        }
+        let alive = true;
+        relayoutWithElk(flow.nodes, flow.edges, "LR")
+            .then(res => {
+                if (alive) setElkNodes(new Map(res.nodes.map(n => [n.id, n])));
+            })
+            .catch(() => { /* 失败保留网格 */ });
+        return () => {
+            alive = false;
+        };
+    }, [flow]);
 
     const toggleContainer = useCallback((id: string) => {
         setCollapsedContainers(prev => {
@@ -1313,21 +1349,27 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
             flow
                 ? flow.nodes
                       .filter(n => !hiddenNodeIds.has(n.id))
-                      .map(n => ({
-                          ...n,
-                          // 选中态自己下发：这个只读画布没传 onNodesChange，库发的 select 变更会被丢弃，
-                          // 于是点节点永远不高亮（ViewerNode 的 selected 恒为 false）
-                          selected: n.id === selectedNodeId,
-                          data: {
-                              ...(n.data || {}),
-                              __showShape: showShapes,
-                              __hasChildren: childCount.has(n.id) ? true : undefined,
-                              __collapsed: collapsedContainers.has(n.id) ? true : undefined,
-                              __toggleCollapse: toggleContainer,
-                          },
-                      }))
+                      .map(n => {
+                          const laid = elkNodes?.get(n.id);
+                          return {
+                              ...n,
+                              // ELK 布局算好之后覆盖坐标与容器尺寸（见上面的 effect）
+                              ...(laid ? { position: laid.position } : {}),
+                              // 选中态自己下发：这个只读画布没传 onNodesChange，库发的 select 变更会被丢弃，
+                              // 于是点节点永远不高亮（ViewerNode 的 selected 恒为 false）
+                              selected: n.id === selectedNodeId,
+                              data: {
+                                  ...(n.data || {}),
+                                  ...(laid ? { layout_hint: (laid.data as { layout_hint?: unknown }).layout_hint } : {}),
+                                  __showShape: showShapes,
+                                  __hasChildren: childCount.has(n.id) ? true : undefined,
+                                  __collapsed: collapsedContainers.has(n.id) ? true : undefined,
+                                  __toggleCollapse: toggleContainer,
+                              },
+                          };
+                      })
                 : [],
-        [flow, showShapes, hiddenNodeIds, childCount, collapsedContainers, toggleContainer, selectedNodeId]
+        [flow, elkNodes, showShapes, hiddenNodeIds, childCount, collapsedContainers, toggleContainer, selectedNodeId]
     );
 
     const step = (
@@ -1463,7 +1505,7 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                         </button>
                     ))}
                     <span style={{ fontSize: 11, color: "#64748b", alignSelf: "center" }}>
-                        原始项目操作目录：三种用法并列，随时切换
+                        原始项目操作目录：两种用法并列，随时切换（论文复现见首页「论文复现」入口）
                     </span>
                 </div>
                 {entryMode === "decompose" ? (
@@ -1569,7 +1611,7 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                     </>
                 ) : (
                     <div style={{ maxHeight: 340, overflowY: "auto", paddingRight: 4 }}>
-                        {entryMode === "reproduce" ? <ReproducePanel projectId={projectId} /> : <UseDatasetPanel projectId={projectId} />}
+                        <UseDatasetPanel projectId={projectId} />
                     </div>
                 )}
             </div>
@@ -1622,7 +1664,8 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                 <div style={{ flex: 1, minWidth: 0, position: "relative" }}>
                     {ir && flow ? (
                         <ReactFlow
-                            key={`${ir.nodes.length}-${ir.edges.length}`}
+                            // key 带上布局来源：ELK 布局到位后重挂一次，`fitView` 才按新坐标取景
+                            key={`${ir.nodes.length}-${ir.edges.length}-${elkNodes ? "elk" : "grid"}`}
                             nodes={viewerNodes}
                             edges={viewerEdges}
                             nodeTypes={{ ir: ViewerNode }}
@@ -1666,6 +1709,39 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
                             <input type="checkbox" checked={showShapes} onChange={e => setShowShapes(e.target.checked)} />
                             显示形状
                         </label>
+                    )}
+                    {/* 大图折叠：几千个节点的追踪图全渲染会卡死 → 容器默认折叠，这里按需展开 */}
+                    {ir && nodeContainers.length > 0 && (
+                        <div
+                            style={{
+                                position: "absolute", top: 14, left: 116, zIndex: 5,
+                                display: "flex", alignItems: "center", gap: 6,
+                                background: "rgba(15, 23, 42, 0.92)", border: "1px solid #1f2937",
+                                borderRadius: 6, padding: "3px 8px", fontSize: 12, color: "#cbd5e1",
+                            }}
+                        >
+                            <button
+                                style={miniBtnStyle}
+                                title="展开所有容器（大图可能很卡）"
+                                onClick={() => setExpandedIds(new Set(nodeContainers))}
+                            >
+                                展开全部
+                            </button>
+                            <button
+                                style={miniBtnStyle}
+                                title="折叠所有容器，只留顶层"
+                                onClick={() => setExpandedIds(new Set())}
+                            >
+                                折叠容器
+                            </button>
+                            <span style={{ color: hiddenCount > 0 ? "#fbbf24" : "#64748b" }}>
+                                {hiddenCount > 0
+                                    ? `已折叠 ${hiddenCount} 个节点`
+                                    : `共 ${ir.nodes.length} 个节点`}
+                                {ir.nodes.length > COLLAPSE_HINT_THRESHOLD && hiddenCount === 0
+                                    ? "（大图：建议折叠）" : ""}
+                            </span>
+                        </div>
                     )}
                     {/* 数据流图入口 */}
                     {ir && (
@@ -2010,6 +2086,15 @@ export default function ModelViewerView({ projectId, onBack, onOpenCanvas }: Mod
     );
 }
 
+const miniBtnStyle: CSSProperties = {
+    border: "1px solid #334155",
+    background: "#1e293b",
+    color: "#e2e8f0",
+    borderRadius: 4,
+    padding: "1px 8px",
+    fontSize: 11,
+    cursor: "pointer",
+};
 const btnStyle: CSSProperties = {
     border: "1px solid #334155",
     background: "#0f766e",

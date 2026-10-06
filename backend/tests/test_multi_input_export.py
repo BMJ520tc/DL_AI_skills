@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -212,3 +213,40 @@ def test_train_template_single_input_backward_compatible(tmp_path):
     res = _run(tmp, data, epochs=2)
     assert res.returncode == 0, res.stdout + res.stderr
     assert json.loads((tmp / "out.json").read_text(encoding="utf-8"))["metrics"]["accuracy"] >= 0.0
+
+
+# ---------------------------------------------------------------- C 设备选择（2026-10-06 GPU 支持）
+
+def test_train_template_selects_device_and_can_be_forced_to_cpu(tmp_path):
+    """设备：默认自动（有可用 CUDA 用 GPU），`TRAIN_DEVICE=cpu` 可强制；日志与结果 JSON 都带 device。
+
+    本用例在**后端解释器**（本机 `D:\python.exe` 的 torch 是 CPU 版）下跑 → 两条路径都应得到 `cpu`，
+    因此判据是确定的，不需要 GPU。真机上 GPU 路径由 `device=cuda` 的日志另行实测。
+    """
+    rows = [
+        {"id": i, "split": "train" if i < 8 else "test", "label": i % 2,
+         "input": "[1, 2, 3, 4]" if i % 2 == 0 else "[4, 3, 2, 1]",
+         "input_1": "[0.1, 0.2, 0.3, 0.4]" if i % 2 == 0 else "[0.9, 0.8, 0.7, 0.6]"}
+        for i in range(10)
+    ]
+    tmp = tmp_path / "dev"
+    tmp.mkdir()
+    data = _write_case(tmp, _MODEL_MULTI, rows, ["id", "split", "label", "input", "input_1"])
+
+    def _run_env(env: dict) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, str(tmp / "train.py"), str(data), "1", "4", "0.05", str(tmp / "out.json")],
+            cwd=str(tmp), capture_output=True, text=True, timeout=300, env={**os.environ, **env},
+        )
+
+    res = _run_env({"TRAIN_DEVICE": "cpu"})
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "device=cpu" in res.stdout
+    assert json.loads((tmp / "out.json").read_text(encoding="utf-8"))["device"] == "cpu"
+
+    res2 = _run_env({})
+    assert res2.returncode == 0, res2.stdout + res2.stderr
+    out2 = json.loads((tmp / "out.json").read_text(encoding="utf-8"))
+    assert out2["device"] in ("cuda", "cpu")
+    assert "[info] device=" in res2.stdout            # 启动即打印，train.log 里能看到
+    assert "用时" in res2.stdout                       # 每 epoch 用时（速度可见）

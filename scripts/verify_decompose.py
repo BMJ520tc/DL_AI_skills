@@ -15,7 +15,7 @@ import torch
 
 from _model_loader import (
     accepted_kwargs, accepted_positional, call_kwargs, first_tensor, _shape_of, instantiate,
-    load_entry_class, make_dummy_input, make_extra_inputs, prepare_torch,
+    load_entry_class, build_inputs, prepare_torch,
 )
 
 _NUM_DIFF_LIMIT = 10  # 数值失败定位的差异层上报上限
@@ -193,7 +193,7 @@ def main() -> None:
         sys.exit(3)
     dtype = getattr(torch, str(spec.get("dtype") or "float32"), torch.float32)
 
-    orig = instantiate(cls, ir.get("entry_args")).eval()
+    orig = instantiate(cls, ir.get("entry_args"), source_dir).eval()
     regen = getattr(_load_generated(Path(regen_path)), f"Decomp_{ir['root_id']}")().eval()
 
     # 权重同源（实施约定 6.6-3）：两模型各自随机初始化，直接比对必然不等。按结构比对
@@ -215,7 +215,7 @@ def main() -> None:
     fkw = call_kwargs(spec)          # forward 关键字参数（如 CLS/MVC 分支开关）
     fkw_o = accepted_kwargs(orig.forward, fkw)    # 原模型按开关跑对应分支
     fkw_g = accepted_kwargs(regen.forward, fkw)   # 再生成模型的 forward 是 IR 生成的，未必有这些开关
-    x0 = (make_dummy_input(shape, dtype), *make_extra_inputs(spec))
+    x0 = build_inputs(orig, {**spec, "shape": shape}, source_dir)
     x0_o = accepted_positional(orig.forward, x0)    # 原模型可能消费多输入（src/values/mask）
     x0_g = accepted_positional(regen.forward, x0)   # 再生成模型只声明它消费的输入
     try:
@@ -245,7 +245,7 @@ def main() -> None:
         if forward_error:
             break
         torch.manual_seed(seed)
-        x = (make_dummy_input(shape, dtype), *make_extra_inputs(spec))
+        x = build_inputs(orig, {**spec, "shape": shape}, source_dir)
         if seed == seeds[0]:
             o_m, r_m = o_map, r_map
         else:

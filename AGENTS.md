@@ -184,6 +184,25 @@ ir 与标准节点混拼不支持、容器通道未实现、单位归一误判�
 软错误不拒写、硬错误 400、改动即让旧验证 stale；后端新增用例 30 条（全量 **490 passed**），
 `ui_check_4a` 扩 6 项结构编辑断言（**48/48**，逐项 HTTP 复核真写回 ir.json）。
 后续：② 架构级自迭代 → 6.6-b 打包 → 6.5 文档升 v2.0。
+**触发链（2026-10-06，拆解保真度 → 治本：真实追踪生成 IR）**：LLM 猜不出忠实 IR（会漏模块、把子模块
+晾成孤立死块），故改走「**真实追踪**」——`scripts/trace_structure.py`（结构真相，用于保真度自检）、
+`scripts/trace_ir.py`（**由 `torch.export` 的 `nn_module_stack` 机械生成 IR**：模块树/算子归属/边/叶子参数
+全由追踪取到）。**scGPT 已首次走通 ④ 再生成 → ⑤ 两步验证**（`overall=passed`：87/87 带参层、参数量
+21,292,034 与真实模型**完全相等**、6 个输出键**逐键数值误差 0.0**）。**已接进拆解链路**：开关
+`DECOMPOSE_TRACE_IR`（**默认关**，置 1 启用）——「追踪优先、agent 兜底」，追踪不可用或产物不过校验
+即回退 agent；**前置是需要真实的 `input_spec.shape`**（导出会把数据依赖维度常量折叠，默认形状会把
+批量维写死）→ **首次拆解仍走 agent，补形状后重新拆解才走追踪**。产出留痕在 `run_record.metrics.via`。
+已知偏差：`src_key_padding_mask` 在被折叠的
+`nn.TransformerEncoder` 内消费、未接线；只覆盖导出时走到的分支组合。详见 `docs/模块详细设计.md` v1.40~v1.42。
+**批量维已符号化**（v1.42）：`torch.export` 的 `dynamic_shapes` 把入参 dim0 声明为 `batch`，`arange(size(0))`
+不再被示例批量**常量折叠** → 导出的画布模型**对任意 batch 成立**（此前 batch>1 直接崩）。
+**GPU 训练已打通（2026-10-06）**：① **环境创建有 NVIDIA 驱动就装 CUDA 版 torch**（`env_manager.plan_cuda`
+新增 `cuda_wheel`；此前「清单没声明 CUDA → 按默认 wheel」在 **Windows 上拿到的是 CPU 版轮子**）；
+② `templates/train.py` **自动选设备**（`device=cuda` 会打进 `train.log`，`TRAIN_DEVICE=cpu|cuda` 可强制）；
+③ 既有环境可就地换：`python scripts/install_cuda_torch.py --project-id <id>`（不带重建）。
+**镜像（本机必需）**：官方 CDN 下 2.6GB 的 CUDA wheel 会 `ReadTimeoutError`（实测失败）→ 用
+`--find-links https://mirror.sjtu.edu.cn/pytorch-wheels/cu126`（或设 `ENV_PYTORCH_FIND_LINKS`，
+建环境时走同一套逻辑）。可选开关：`ENV_USE_GPU_TORCH=0` 关掉自动装 CUDA 版、`ENV_CUDA_TORCH_INDEX` 指名索引。
 **另（2026-10-05）**：实测发现「后端进程没带模型凭证 → CLI 返回 `Not logged in` → 被当成『没产出』白试 12 轮」，
 已修（`is_auth_error` 立即中止、不重试）；并加「**按任务覆盖模型/端点**」——拆解可单独走强模型
 （`DECOMPOSE_MODEL`/`DECOMPOSE_BASE_URL`/`DECOMPOSE_API_KEY`，空则回退全局），其余任务仍走 DeepSeek。

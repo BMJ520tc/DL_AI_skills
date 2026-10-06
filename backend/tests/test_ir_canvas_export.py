@@ -363,7 +363,7 @@ def test_train_ir_graph_uses_same_code_as_export(app_client, tmp_path, monkeypat
 
     from app.services import network_service, proc_util, project_manager
 
-    async def fake_run(cmd, *, cwd, timeout):
+    async def fake_run(cmd, *, cwd, timeout, on_line=None):
         # 假训练脚本：把指标写进 argv 末位的 out_json（与既有用例同风格）
         run_dir = Path(cwd)
         assert (run_dir / "train.py").exists()

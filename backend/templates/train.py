@@ -15,6 +15,9 @@
   （MSE + mae/mse/rmse/r2）；字符串 → 按字典序编码为类别（交叉熵 + accuracy）。
 - 切分：split 列为 train 的行作训练集，其余行（test/val 等）作评估集；
   没有评估行时用训练集评估（指标里 eval_samples 与 train_samples 相同）。
+- **设备**：自动选——有可用 CUDA 就在 GPU 上训练（模型与每个 batch 的张量都建/搬到 device），
+  否则 CPU；启动即打印 `[info] device=…`，并写进结果 JSON 的 `device` 字段（随 run_record 可检索）。
+  环境里是否有 CUDA 版 torch 由环境创建时决定（`env_manager.plan_cuda`：有 NVIDIA 驱动就装 `+cuXXX` 轮子）。
 - 输出：训练结束把指标写入 <out_json>（CANONICAL_METRICS 键），供 backend 落 run_record；
   训练过程按 epoch 打印进度（进入 train.log）。
 
@@ -24,8 +27,10 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import random
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -190,34 +195,44 @@ def _loss_of(out, yb, head_idx: int, head_kind: str, mode: str, criterion) -> to
     return criterion(t, yb)
 
 
-def _pad_stack(rows: list[list], dtype: torch.dtype) -> torch.Tensor:
-    """变长序列右补零成批（标量特征为长度 1）；bool 也用 0/False 补齐。"""
-    tensors = [torch.tensor(r, dtype=dtype) for r in rows]
+def _pad_stack(rows: list[list], dtype: torch.dtype,
+               device: torch.device | None = None) -> torch.Tensor:
+    """变长序列右补零成批（标量特征为长度 1）；bool 也用 0/False 补齐；张量直接建在目标设备上。"""
+    dev = device or torch.device("cpu")
+    tensors = [torch.tensor(r, dtype=dtype, device=dev) for r in rows]
     length = max(t.shape[0] for t in tensors)
     padded = [
-        t if t.shape[0] == length else torch.cat([t, torch.zeros(length - t.shape[0], dtype=dtype)])
+        t if t.shape[0] == length
+        else torch.cat([t, torch.zeros(length - t.shape[0], dtype=dtype, device=dev)])
         for t in tensors
     ]
     return torch.stack(padded)
 
 
 def make_batch(idx: list[int], xs: list[list[list]], dtypes: list[str],
-               y: torch.Tensor) -> tuple[list[torch.Tensor], torch.Tensor]:
-    """每个输入各成一批（多输入模型逐个喂；单输入时长度 1 的列表）。"""
-    tensors = [_pad_stack([xs[k][i] for i in idx], _torch_dtype(dtypes[k])) for k in range(len(xs))]
-    return tensors, y[idx]
+               y: torch.Tensor, device: torch.device | None = None,
+               ) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """每个输入各成一批（多输入模型逐个喂；单输入时长度 1 的列表）。
+
+    张量**直接建在目标设备上**（`device` 缺省 CPU）：模型在 GPU 而数据在 CPU 会报设备不一致。
+    """
+    dev = device or torch.device("cpu")
+    tensors = [_pad_stack([xs[k][i] for i in idx], _torch_dtype(dtypes[k]), dev)
+               for k in range(len(xs))]
+    return tensors, y[idx].to(dev)
 
 
 def eval_metrics(mode: str, model: nn.Module, xs: list[list[list]], dtypes: list[str],
                  idx: list[int], y: torch.Tensor, batch_size: int, loss: float,
-                 num_classes: int, head_idx: int, head_kind: str) -> dict:
+                 num_classes: int, head_idx: int, head_kind: str,
+                 device: torch.device | None = None) -> dict:
     """评估集指标（CANONICAL_METRICS 键）。"""
     model.eval()
     preds, labels = [], []
     with torch.no_grad():
         for start in range(0, len(idx), batch_size):
             batch_idx = idx[start:start + batch_size]
-            xb, yb = make_batch(batch_idx, xs, dtypes, y)
+            xb, yb = make_batch(batch_idx, xs, dtypes, y, device)
             preds.append(_predict(model(*xb), head_idx, head_kind, mode))
             labels.append(yb)
     preds = torch.cat(preds)
@@ -279,10 +294,33 @@ def main() -> None:
     eval_idx = [i for i in range(len(rows)) if i not in train_idx] or train_idx
 
     torch.manual_seed(42)
-    model = GeneratedModel()
+    # **自动选设备**：有可用的 CUDA 就用 GPU（环境装了 CUDA 版 torch 才为真——见 env_manager 的
+    # `plan_cuda`：有 NVIDIA 驱动就装 `+cuXXX` 轮子）。启动即打印，进 train.log，作为可见证据。
+    # 设备：默认自动（有 CUDA 用 GPU）；`TRAIN_DEVICE=cpu|cuda` 可显式覆盖
+    # （Windows 上 `CUDA_VISIBLE_DEVICES=""` 不一定真能隐藏 GPU，实测无效 → 这个开关才是确定的）。
+    want = (os.environ.get("TRAIN_DEVICE") or "auto").strip().lower()
+    if want == "cpu":
+        device = torch.device("cpu")
+    elif want == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("TRAIN_DEVICE=cuda 但本机/本环境没有可用的 CUDA")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        # 再生成的模型里有**常量算子**（`torch.arange(size(0))` 造 labels、`torch.eye(...)` 造掩码），
+        # 它们不带 device → 默认建在 **CPU**，与 GPU 上的张量混算会报
+        # `Expected all tensors to be on the same device`（实测 scGPT 的 CCE 分支）。把默认设备设成
+        # cuda（PyTorch 2.0+ 官方 API），这些常量就跟着建在 GPU 上；显式给了 device 的调用不受影响。
+        torch.set_default_device(device)
+    if device.type == "cuda":
+        free, total = torch.cuda.mem_get_info()
+        print(f"[info] device=cuda（{torch.cuda.get_device_name(0)}，显存 {free / 2**30:.1f}/"
+              f"{total / 2**30:.1f} GiB 可用）")
+    else:
+        print("[info] device=cpu（无可用 CUDA：装的是 CPU 版 torch 或本机没有 GPU）")
+    model = GeneratedModel().to(device)
     # 先探一次输出、选定输出头：多输出头模型按形状匹配选（选不出即明确报错，不猜）
     with torch.no_grad():
-        probe_xb, _ = make_batch((train_idx or [0])[:1], xs, dtypes, y)
+        probe_xb, _ = make_batch((train_idx or [0])[:1], xs, dtypes, y, device)
         head_idx, head_kind = pick_output(model(*probe_xb), mode, num_classes)
     if mode == "classification" and head_kind == "bce":
         print("[info] 分类输出头最后一维为 1 → 按二分类 BCE 处理（>0.5 判正类）")
@@ -293,12 +331,13 @@ def main() -> None:
     last_loss = float("nan")
     for epoch in range(1, epochs + 1):
         model.train()
+        _t0 = time.time()
         total, count = 0.0, 0
         order = train_idx[:]
         random.Random(epoch).shuffle(order)
         for start in range(0, len(order), batch_size):
             batch_idx = order[start:start + batch_size]
-            xb, yb = make_batch(batch_idx, xs, dtypes, y)
+            xb, yb = make_batch(batch_idx, xs, dtypes, y, device)
             optimizer.zero_grad()
             loss = _loss_of(model(*xb), yb, head_idx, head_kind, mode, criterion)
             loss.backward()
@@ -306,13 +345,16 @@ def main() -> None:
             total += float(loss.item()) * len(batch_idx)
             count += len(batch_idx)
         last_loss = total / max(count, 1)
-        print(f"[epoch {epoch}/{epochs}] loss={last_loss:.6f}")
+        _dt = time.time() - _t0
+        print(f"[epoch {epoch}/{epochs}] loss={last_loss:.6f}  用时 {_dt:.1f}s")
+
 
     metrics = eval_metrics(mode, model, xs, dtypes, eval_idx, y, batch_size, last_loss,
-                           num_classes, head_idx, head_kind)
+                           num_classes, head_idx, head_kind, device)
     result = {
         "mode": mode,
         "classes": classes,
+        "device": str(device),          # 用了 CPU 还是 GPU：随指标进 run_record，可检索
         "output_head": {"index": head_idx, "kind": head_kind},
         "epochs": epochs,
         "batch_size": batch_size,

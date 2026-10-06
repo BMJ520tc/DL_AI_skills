@@ -83,8 +83,28 @@ function labelOf(node: Node): string {
 }
 
 /**
+ * `ancestor` 是不是 `node` 的祖先（沿 `parentId` 上溯，带上限防环）。
+ *
+ * 用于跳过**模块输入边**：IR 里 `模块 M → M 的子孙节点` 表示「M 的**输入**喂给该子节点」
+ * （后端 `ir_codegen._module_class._ext_var` 口径），**不是**「M 的输出流过去」。拿 M 的
+ * `__out_shape` 去比子节点的 `__in_shape` 必然对不上，会被误标成红线
+ * （实测 scGPT 的 `encoder → encoder_embedding`）。
+ */
+function isAncestor(byId: Map<string, Node>, ancestor: string, node: string): boolean {
+    let cur = byId.get(node);
+    let hops = 0;
+    while (cur && cur.parentId && hops++ < 64) {
+        if (cur.parentId === ancestor) return true;
+        cur = byId.get(cur.parentId);
+    }
+    return false;
+}
+
+/**
  * 校验 IR 图的所有连线：源节点 __out_shape ↔ 目标节点 __in_shape。
  * 同一目标节点的多条不匹配入边合并为一条 ShapeFailure（避免诊断面板被同一节点刷屏）。
+ *
+ * **模块输入边跳过**（源是目标的祖先）：那条边带的是模块的**输入**，不是输出（见 `isAncestor`）。
  */
 export function verifyIRShapes(nodes: Node[], edges: Edge[]): IrShapeVerification {
     const byId = new Map(nodes.map(n => [n.id, n]));
@@ -106,6 +126,7 @@ export function verifyIRShapes(nodes: Node[], edges: Edge[]): IrShapeVerificatio
         const sourceNode = byId.get(edge.source);
         const targetNode = byId.get(edge.target);
         if (!sourceNode || !targetNode) continue; // 孤立边由 useGraphState 统一清理
+        if (isAncestor(byId, edge.source, edge.target)) continue; // 模块输入边：带的是模块的输入
         const outShape = readIrShape(sourceNode.data, "__out_shape");
         const inShape = readIrShape(targetNode.data, "__in_shape");
         if (!isIrShapeKnown(outShape) || !isIrShapeKnown(inShape)) continue; // 缺形状不算失败

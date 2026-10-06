@@ -12,7 +12,9 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 _INSTANTIATE_FALLBACKS = (
@@ -23,6 +25,81 @@ _INSTANTIATE_FALLBACKS = (
     {"dims": [64, 128, 10]},
     {"hidden_size": 64},
 )
+
+
+MAKE_INPUTS_FILENAME = "make_inputs.py"
+MAKE_MODEL_FILENAME = "make_model.py"
+
+
+def make_model_path(source_dir: "str | None") -> "Path | None":
+    """项目约定：`<工作区>/reports/make_model.py`（工作区 = source 的父目录）。"""
+    if not source_dir:
+        return None
+    path = Path(source_dir).resolve().parent / "reports" / MAKE_MODEL_FILENAME
+    return path if path.is_file() else None
+
+
+def _load_make_model(path: Path):
+    """加载约定脚本里的 `build_model(entry_class, checkpoint=None)`；拿不到就 None。"""
+    try:
+        spec = importlib.util.spec_from_file_location("_project_make_model", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] {path.name} 加载失败（{type(e).__name__}: {e}）", file=sys.stderr)
+        return None
+    fn = getattr(module, "build_model", None)
+    return fn if callable(fn) else None
+
+
+def make_inputs_path(source_dir: "str | None") -> "Path | None":
+    """项目约定：`<工作区>/reports/make_inputs.py`（工作区 = source 的父目录）。"""
+    if not source_dir:
+        return None
+    path = Path(source_dir).resolve().parent / "reports" / MAKE_INPUTS_FILENAME
+    return path if path.is_file() else None
+
+
+def _load_make_inputs(path: Path):
+    """加载约定脚本里的 `build_inputs(model)`；没有该函数 / 加载失败 → None（并如实提示）。"""
+    try:
+        spec = importlib.util.spec_from_file_location("_project_make_inputs", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] {path.name} 加载失败（{type(e).__name__}: {e}），回退默认 dummy 输入",
+              file=sys.stderr)
+        return None
+    fn = getattr(module, "build_inputs", None)
+    if not callable(fn):
+        print(f"[warn] {path.name} 未定义 build_inputs(model)，回退默认 dummy 输入", file=sys.stderr)
+        return None
+    return fn
+
+
+def build_inputs(model, spec: dict, source_dir: "str | None" = None) -> tuple:
+    """造喂给 `model(...)` 的**位置实参**。
+
+    优先用项目的 `make_inputs.py`（`build_inputs(model) -> tuple`）——真实仓库的 forward 常常
+    不吃「一个张量」：boltz 要的是 `feats` **特征字典**（键多、维度各异，由 featurizer 造），
+    平台按 shape+dtype 喂的 dummy 张量必然 `IndexError: too many indices`（实测踩到）。
+    没有约定脚本时，退回原来的 shape+dtype dummy 张量 + `input_spec.extra` 额外输入。
+    """
+    path = make_inputs_path(source_dir)
+    if path is not None:
+        build = _load_make_inputs(path)
+        if build is not None:
+            produced = build(model)
+            return produced if isinstance(produced, tuple) else (produced,)
+    import torch
+
+    shape = list(spec.get("shape") or [])
+    dtype = getattr(torch, str(spec.get("dtype") or "float32"), torch.float32)
+    return (make_dummy_input(shape, dtype), *make_extra_inputs(spec))
 
 
 def _fallbacks() -> tuple[dict, ...]:
@@ -37,6 +114,104 @@ def _fallbacks() -> tuple[dict, ...]:
     return _INSTANTIATE_FALLBACKS
 
 
+def _find_checkpoint(source_dir: "str | None") -> "Path | None":
+    """找一个可用的 checkpoint 文件。
+
+    顺序：显式环境变量 `DECOMPOSE_CHECKPOINT` → 项目工作区 `data/` 下的 `*.ckpt`/`*.pt`
+    （工作区 = source 的父目录；项目数据按约定放那儿）→ 工作区顶层。
+    """
+    hint = os.environ.get("DECOMPOSE_CHECKPOINT")
+    if hint:
+        p = Path(hint)
+        if p.is_file():
+            return p
+    if not source_dir:
+        return None
+    ws = Path(source_dir).resolve().parent
+    for root, recursive in ((ws / "data", True), (ws, False)):
+        if not root.is_dir():
+            continue
+        found = sorted(root.glob("**/*.ckpt") if recursive else root.glob("*.ckpt"))
+        found += sorted(root.glob("**/*.pt") if recursive else root.glob("*.pt"))
+        if found:
+            return found[0]
+    return None
+
+
+_EXCESS_KWARG_RE = re.compile(r"unexpected keyword argument '([^']+)'")
+
+
+def _drop_key_deep(obj, key: str) -> bool:
+    """从嵌套配置里删掉某个键（深度优先，删第一个命中）。返回是否删到。
+
+    嵌套配置实测是 OmegaConf 的 `DictConfig`（Mapping，但不是 dict），所以按 `Mapping` 认。
+    """
+    if isinstance(obj, Mapping):
+        if key in obj:
+            try:
+                del obj[key]
+            except Exception:  # noqa: BLE001 —— 只读/struct 模式的配置删不动，当没删到
+                return False
+            return True
+        for value in list(obj.values()):
+            if _drop_key_deep(value, key):
+                return True
+    elif isinstance(obj, (list, tuple)):
+        for value in obj:
+            if _drop_key_deep(value, key):
+                return True
+    return False
+
+
+def _checkpoint_entry_args(source_dir: "str | None") -> "dict | None":
+    """从 checkpoint 的 `hyper_parameters` 取**权威构造参数**（Lightning 的 save_hyperparameters 存这里）。
+
+    为什么需要：Lightning 系仓库（boltz 就是）的 `__init__` 要一二十个结构化参数
+    （`atom_s`/`training_args`/`msa_args`/…），代码里**没有直接构造调用**——只有
+    `Model.load_from_checkpoint(...)`，参数藏在 ckpt 里。agent 猜不出来 → 实例化失败 →
+    真实追踪起不来 → 只能退回「让 LLM 猜 IR」（实测拆出 7 个孤立死模块）。
+    """
+    ckpt = _find_checkpoint(source_dir)
+    if ckpt is None:
+        return None
+    try:
+        import torch
+
+        obj = torch.load(str(ckpt), map_location="cpu", weights_only=False)
+    except Exception:  # noqa: BLE001 —— 权重读不了就当没有，不改变原有报错路径
+        return None
+    if not isinstance(obj, dict):
+        return None
+    for key in ("hyper_parameters", "hparams"):
+        hp = obj.get(key)
+        if isinstance(hp, dict) and hp:
+            # validators 不可序列化；Boltz2 的 save_hyperparameters 本来就 ignore 它
+            return {k: v for k, v in hp.items() if k != "validators"}
+    return None
+
+
+def _prefer_repo_package(fpath: Path) -> None:
+    """把仓库源码的**包根父目录**插到 `sys.path` 最前，让 `import <包名>` 解析到仓库这版。
+
+    为什么需要：很多仓库把自己的包也发到 PyPI，依赖清单一引就把**安装版**装进 site-packages
+    （boltz 实测装成 `boltz-2.2.1` 实体包，不是 editable）。此时从**仓库文件**加载入口类，
+    它内部的 `import boltz.xxx` 却会命中 site-packages 那版 → 两版混着跑，报
+    `AttentionPairBias.forward() got an unexpected keyword argument` 这种"缝合怪"错误
+    （实测踩到：追踪的根本不是仓库这份代码）。
+    """
+    pkg = fpath.parent
+    top: Path | None = None
+    while (pkg / "__init__.py").is_file():
+        top = pkg
+        pkg = pkg.parent
+    if top is None:
+        return
+    root = str(top.parent)
+    if root in sys.path:
+        sys.path.remove(root)
+    sys.path.insert(0, root)
+
+
 def load_entry_class(source_dir: str, model_file: str, entry_class: str):
     """返回入口类（模块与类均找不到时 RuntimeError，错误信息供任务 error 展示）。"""
     source = Path(source_dir).resolve()
@@ -49,6 +224,8 @@ def load_entry_class(source_dir: str, model_file: str, entry_class: str):
         raise RuntimeError(f"模型定义文件必须位于项目目录内: {model_file}")
     if not fpath.exists():
         raise RuntimeError(f"模型定义文件不存在: {model_file}")
+
+    _prefer_repo_package(fpath)
 
     # 包内模块优先走常规 import（相对导入可用）
     if "/" in model_file.replace("\\", "/"):
@@ -205,16 +382,38 @@ def make_extra_inputs(spec: dict) -> list:
     return out
 
 
-def instantiate(cls, entry_args: dict | None = None):
-    """实例化入口类：**IR 里用户补的 entry_args 优先** → 无参 → 常见关键字签名兜底。
+def instantiate(cls, entry_args: dict | None = None, source_dir: "str | None" = None):
+    """实例化入口类：**IR/用户补的 entry_args** → 无参 → 常见关键字签名 → **checkpoint 的 hparams**。
 
     `entry_args` 来自 IR（`PUT /api/projects/{id}/ir/entry_args`）：像 scGPT 的
     `TransformerModel(ntoken, d_model, nhead, d_hid, nlayers, vocab=…)`，参数取自运行期配置与
     数据，固定猜测列表必然失败——由用户给出最小可构造的 args 后，trace/verify 才能实例化。
-    均失败时 RuntimeError 说明签名与已尝试的候选。
+
+    都失败时再试 **checkpoint 的 `hyper_parameters`**（Lightning 的 save_hyperparameters 存的
+    权威构造参数）——boltz 这类「只 load_from_checkpoint、代码里不直接构造」的仓库靠它才能起来。
+    `source_dir` 用于定位权重（见 `_find_checkpoint`）；读权重较贵，故放在最后兜底。
     """
     attempts: list[str] = []
     last: Exception | None = None
+
+    # ① 项目自己的构造脚本最权威：仓库常把构造方式写在 `load_from_checkpoint(ckpt, **覆盖)` 里，
+    #    ckpt 的 hparams 并不足以还原一个能跑的模型（实测 boltz：ckpt 的 pairformer_args 没有 v2，
+    #    而当前代码的 forward 无条件用 v2 才有的参数）。
+    builder = None
+    model_script = make_model_path(source_dir)
+    if model_script is not None:
+        builder = _load_make_model(model_script)
+    if builder is not None:
+        attempts.append("make_model.py")
+        try:
+            built = builder(cls, _find_checkpoint(source_dir))
+            if built is not None:
+                return built
+            attempts[-1] = "make_model.py（返回 None，回退其它方式）"
+        except Exception as e:  # noqa: BLE001
+            last = e
+            attempts[-1] = f"make_model.py（失败: {type(e).__name__}: {str(e)[:120]}）"
+
     candidates: list[dict] = []
     if isinstance(entry_args, dict) and entry_args:
         candidates.append(entry_args)      # IR 里用户补的优先（最可能对）
@@ -227,5 +426,31 @@ def instantiate(cls, entry_args: dict | None = None):
             if last is None:
                 last = e  # 首个（无参构造）TypeError 最富信息：列出缺失的位置参数
         except Exception as e:  # noqa: BLE001 —— 非 TypeError（数据缺失等）优先保留为最终原因
+            last = e
+
+    hparams = _checkpoint_entry_args(source_dir)
+    if hparams is not None:
+        # ckpt 可能是**另一个版本的代码**存下来的：hparams 里会有当前 __init__ 不认的键
+        # （boltz 实测 `chain_sampling_args`）→ 按签名过滤，别为一个多余键整条路失败。
+        filtered = accepted_kwargs(cls.__init__, hparams)
+        attempts.append(
+            f"checkpoint hparams（{len(hparams)} 个，签名接受 {len(filtered)} 个）"
+        )
+        try:
+            return cls(**filtered)
+        except TypeError as e:
+            last = e
+            # 嵌套配置（如 diffusion_process_args）里也可能有当前代码不认的键——
+            # 错误信息会点名那个键，从嵌套里删掉再试。ckpt 与代码版本不一致时很常见，
+            # 删掉的键本来就用不了，退回当前代码的默认值反而更贴近本仓库的结构。
+            for _ in range(30):
+                m = _EXCESS_KWARG_RE.search(str(last))
+                if not m or not _drop_key_deep(filtered, m.group(1)):
+                    break
+                try:
+                    return cls(**filtered)
+                except TypeError as e2:
+                    last = e2
+        except Exception as e:  # noqa: BLE001
             last = e
     raise RuntimeError(f"入口类 {cls.__name__} 无法实例化（尝试: {attempts}）: {last}")

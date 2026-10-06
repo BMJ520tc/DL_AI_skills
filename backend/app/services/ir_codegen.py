@@ -117,10 +117,9 @@ def _render_op(node: dict, in_vars: list[str]) -> str:
         raise IrIncompleteError([f"op 节点 {node['id']}（{cls}）既不在白名单也无 code_hint"])
     exts = _ext_names(tpl)
     consumes = "{inputs}" in tpl or "{inputs[" in tpl
-    if not consumes and not exts and cls not in OP_WHITELIST:
-        # 既不引用操作数、也不引用外部输入：只允许**常量表达式**（如 torch.arange(0, 1200)）
-        raise IrIncompleteError(
-            [f"op 节点 {node['id']} 的 code_hint 必须含 {{inputs}} 占位符（或用 {{ext:名字}} 引用外部输入）: {tpl}"])
+    # 既不引用操作数、也不引用外部输入 = **常量表达式**（`torch.arange(1)`/`torch.eye(1)`，
+    # 导出时批量维度等已被常量折叠）。`ir_schema.validate_ir` 本就允许（「纯常量表达式本来就不消费
+    # 任何节点」），此处须同口径放行——否则「校验通过、生成报错」。有入边却不引用才是真错误。
     if not consumes and in_vars:
         raise IrIncompleteError(
             [f"op 节点 {node['id']} 有 {len(in_vars)} 条入边，但 code_hint 没有引用任何操作数（{{inputs}}）: {tpl}"])

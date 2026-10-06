@@ -122,11 +122,25 @@ def get_task(task_id: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def list_tasks(limit: int = 100, offset: int = 0) -> list[dict]:
+def list_tasks(limit: int = 100, offset: int = 0, order: str = "recent") -> list[dict]:
+    """列出任务（带 `project_name`，便于看板直接显示项目名）。
+
+    `order="board"` 用**看板口径**排序：执行中 → 排队中 → 其余按创建时间倒序。
+    活动任务置顶，是为了「一眼看到现在在跑什么」——纯时间倒序时，一个跑半小时的
+    长任务会被后来创建的一堆短任务挤到看不见的地方。
+    """
+    order_by = (
+        "CASE t.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, t.created_at DESC"
+        if order == "board"
+        else "t.created_at DESC"
+    )
     conn = get_connection()
     try:
         rows = conn.execute(
-            "SELECT * FROM task ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)
+            "SELECT t.*, p.name AS project_name FROM task t "
+            "LEFT JOIN project p ON p.project_id = t.project_id "
+            f"ORDER BY {order_by} LIMIT ? OFFSET ?",
+            (limit, offset),
         ).fetchall()
     finally:
         conn.close()
