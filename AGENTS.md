@@ -211,6 +211,19 @@ ir 与标准节点混拼不支持、容器通道未实现、单位归一误判�
 **启动后端务必带上模型凭证环境**（`ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`，或在设置页填写凭证），
 否则所有 agent 任务都会以「未登录」立即失败。
 
+**架构级自迭代建议（2026-10-06，需求六.1 延伸，《新增需求补充》② / 任务 6.8）**：自迭代原只有**超参**档
+（`network_autotune`），本笔补**架构级**且**人在环**——**建议（agent 起草）→ 用户确认 → 改动落到画布
+（保存 = 新版本）→ 用户手动训练 → 既有蒸馏钩子回写知识**。后端 `services/arch_service.py`（任务 `arch_suggest`）：
+agent 读「画布摘要 + 已确认知识 + 入库模块目录 + **可用单入单出节点类型**」起草 `replace_module`/`add_layer`/`rewire`
+三类建议；**确定性校验**（目标存在 / 模块**句柄数与被替换节点边数一致** / 加层**单入单出** / 锚点与端点合法）
+把不可执行的标 `valid=false` + 原因（前端禁用「应用」，**不猜**）；`apply_suggestion` 是**纯函数**（**不写盘**）。
+API：`POST /arch-suggest`、`GET /arch-suggestions[/{task_id}]`、`POST /arch-apply`（报告带**位置无关的 `graph_hash`**，
+建议生成后画布被改 → **409**）。前端画布工具栏「架构建议」按钮（与运行/版本互斥）+ `ArchSuggestPanel.tsx`
+（应用 = **整图替换**，提示「尚未保存」）。**边界**：仅「标准节点 + module_ref」图，**拆解 ir 图一律拒（400）**
+（与 `network_export` 导出/训练同一口径）；**不自动改画布、不自动训练**；agent 空产出/失败 → 报告记 `agent_error`、
+任务仍 success（实测模型会据实拒绝在不该改架构时给建议——这是「建议而非强制」的正确行为）。
+验收 `scripts/arch_acceptance.py` **9/9**、后端 **608 passed**、lint 0 + build、浏览器探针全绿。详见《模块详细设计》**8.5**（连带修订 **7.5** 边界）。
+
 **任务看板 + 任务实时进度（2026-10-06，`cfeb1a0`）**：长任务原先「看不到」（`task.progress` 只在结束时写）
 → `proc_util.run_command` 加 **`on_line` 逐行回调**（返回值语义不变）、复现/训练边跑边写 progress、
 `task_manager.list_tasks(order="board")`（执行中→排队中→时间倒序 + `project_name`）、

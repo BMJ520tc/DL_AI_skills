@@ -33,6 +33,7 @@ import { LAYER_REGISTRY } from "./types/nodeTypes";
 import { estimateGraphCost } from "./utils/computeEstimator";
 import NetworkRunPanel from "./features/network/NetworkRunPanel";
 import VersionPanel from "./features/network/VersionPanel";
+import ArchSuggestPanel from "./features/network/ArchSuggestPanel";
 import { exportNetwork } from "./api/client";
 import { graphIRToFlow } from "./utils/irAdapter";
 import { relayoutWithElk } from "./utils/elkCompoundLayout";
@@ -264,6 +265,9 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
     // 版本面板开关（阶段4 4d-2：版本树/对比/回退）
     const [showVersionPanel, setShowVersionPanel] = useState(false);
 
+    // 架构建议面板开关（需求六.1 延伸：agent 起草的架构改动建议 → 确认后落画布）
+    const [showArchPanel, setShowArchPanel] = useState(false);
+
     // 回退成功：把目标版本的图替换进画布（与 onUploadGraph 同一替换模式），
     // 继续编辑后保存会生成新版本（树上分叉的新节点）。
     const handleRollback = useCallback((graph: GraphIR) => {
@@ -275,6 +279,10 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
         setSaveState("idle");
         setSaveWarning(null);
     }, [setNodes, setEdges]);
+
+    // 架构建议「应用」：同样是把一张新图整图替换进画布（与回退同一替换模式），尚未保存——
+    // 用户点「保存」才落 graph.json 并生成新版本，再去「运行训练」手动训练。
+    const handleApplyArch = useCallback((graph: GraphIR) => handleRollback(graph), [handleRollback]);
 
     // 节点复制（需求五.1「在节点上直接编辑：改参数、复制、删除、成组」）：
     // 工具栏「复制」按钮与 Ctrl/Cmd+D 共用同一入口；无选中时 duplicateSelected 返回 false 不动作。
@@ -513,6 +521,7 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                                         <button
                                             onClick={() => {
                                                 setShowVersionPanel(false);
+                                                setShowArchPanel(false);
                                                 layout.setShowDiagnostics(false);
                                                 layout.setShowComputePanel(false);
                                                 setShowRunPanel(v => !v);
@@ -533,6 +542,7 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                                         <button
                                             onClick={() => {
                                                 setShowRunPanel(false);
+                                                setShowArchPanel(false);
                                                 layout.setShowDiagnostics(false);
                                                 layout.setShowComputePanel(false);
                                                 setShowVersionPanel(v => !v);
@@ -549,6 +559,27 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                                             }}
                                         >
                                             版本
+                                        </button>
+                                        <button
+                                            onClick={() => {
+                                                setShowRunPanel(false);
+                                                setShowVersionPanel(false);
+                                                layout.setShowDiagnostics(false);
+                                                layout.setShowComputePanel(false);
+                                                setShowArchPanel(v => !v);
+                                            }}
+                                            style={{
+                                                border: "1px solid #1f2a2f",
+                                                borderRadius: 8,
+                                                padding: "6px 14px",
+                                                fontWeight: 600,
+                                                fontSize: 12,
+                                                cursor: "pointer",
+                                                background: showArchPanel ? "#0e7490" : "#0891b2",
+                                                color: "#e2e8f0",
+                                            }}
+                                        >
+                                            架构建议
                                         </button>
                                     </>
                                 )}
@@ -709,6 +740,14 @@ function FlowContent({ initialGraph, onSave, projectId }: FlowEditorProps) {
                         projectId={projectId}
                         onRollback={handleRollback}
                         onClose={() => setShowVersionPanel(false)}
+                    />
+                )}
+
+                {projectId && showArchPanel && (
+                    <ArchSuggestPanel
+                        projectId={projectId}
+                        onApply={handleApplyArch}
+                        onClose={() => setShowArchPanel(false)}
                     />
                 )}
 

@@ -14,7 +14,7 @@ from app.services import (
     task_manager, agent_service, env_manager, analysis_service,
     preprocess_service, baseline_service, dataset_service, compare_service, download_service,
     paper_service, decompose_service, network_service, distill_service, multi_model_service,
-    assistant_service,
+    assistant_service, arch_service,
 )
 from app.api import (
     tasks, projects, knowledge, agents, environments, search, analysis, preprocess, datasets, papers,
@@ -39,6 +39,7 @@ async def lifespan(app: FastAPI):
     paper_service.register()
     decompose_service.register()
     network_service.register()
+    arch_service.register()
     distill_service.register()
     multi_model_service.register()
     assistant_service.register()

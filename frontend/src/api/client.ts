@@ -231,6 +231,54 @@ export const putGraph = (projectId: string, graph: GraphIR) =>
     });
 
 // ---------------------------------------------------------------------------
+// 架构级自迭代建议（backend/app/services/arch_service.py，需求六.1 延伸）
+// ---------------------------------------------------------------------------
+
+export interface ArchSuggestion {
+    suggestion_id: string;
+    op: "replace_module" | "add_layer" | "rewire";
+    op_label: string;
+    description: string;
+    rationale: string;
+    source_knowledge_ids: string[];
+    target_node_id: string;
+    payload: Record<string, unknown>;
+    /** 确定性校验结果：false 时「应用」禁用，原因在 invalid_reason。 */
+    valid: boolean;
+    invalid_reason: string | null;
+    source?: string;
+}
+
+export interface ArchSuggestReport {
+    task_id: string;
+    project_id: string;
+    created_at: string;
+    graph_hash: string;
+    task_type?: string | null;
+    model?: string | null;
+    dataset?: string | null;
+    knowledge_used: Record<string, number>;
+    module_catalog_size: number;
+    suggestions: ArchSuggestion[];
+    agent_error: string | null;
+}
+
+/** 发起架构建议任务（agent 起草）。ir 图/非结构化项目 → 400。 */
+export const postArchSuggest = (projectId: string, body: {
+    task_type?: string; model?: string; dataset?: string; hint?: string;
+}) => request<{ task_id: string; status: string; graph_hash: string }>(
+    `/api/networks/${projectId}/arch-suggest`, { method: "POST", body: JSON.stringify(body) });
+
+/** 取最近一次架构建议报告（未生成过 → 404）。 */
+export const getArchSuggestions = (projectId: string) =>
+    request<ArchSuggestReport>(`/api/networks/${projectId}/arch-suggestions`);
+
+/** 把某条建议作用到画布图的副本上并返回（不写盘）；画布已变 409、非法建议 400。 */
+export const postArchApply = (projectId: string, body: { task_id: string; suggestion_id: string }) =>
+    request<{ graph: GraphIR; suggestion_id: string; changes: Record<string, unknown> }>(
+        `/api/networks/${projectId}/arch-apply`, { method: "POST", body: JSON.stringify(body) });
+
+// ---------------------------------------------------------------------------
 // 任务（2.1）
 // ---------------------------------------------------------------------------
 
