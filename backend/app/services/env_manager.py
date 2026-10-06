@@ -28,7 +28,11 @@ from app.config import CONDA_PATH, ENV_VENV_PYTHON, PIP_FALLBACK_INDEX, PIP_INDE
 from app.services import agent_service, knowledge_service, long_paths, proc_util, project_manager, prompts, task_manager
 
 ENV_TASK_TYPE = "env_create"
-INSTALL_TIMEOUT_S = 600  # 单次 pip 安装上限（超时即杀进程树）
+# 单次 pip 安装上限（超时即杀进程树）。**可配**：真实项目里 torch(+cuXXX)/dgl 这类
+# 大 wheel 动辄 2GB+，600s 会把「下载慢」误判成「装不上」——实测 ATBAN-DTI 就是这样
+# 被拖进依赖修正循环的（它的修正建议里写着「本次失败是 pip install 硬超时（>600s），
+# 不是版本冲突」）。装不动的判断应当由 pip 自己给（无匹配版本/编译失败），而不是墙钟。
+INSTALL_TIMEOUT_S = int(os.getenv("ENV_INSTALL_TIMEOUT_S", "600"))
 
 FIX_SCHEMA = {
     "type": "object",

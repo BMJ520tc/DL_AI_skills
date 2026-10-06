@@ -70,13 +70,16 @@ DECOMPOSE_MAX_NODES = int(os.getenv("DECOMPOSE_MAX_NODES", "60"))
 # 实测能显著改善稳定性（第 1 次就产出结构合法的 IR），但**每次拆解的会话数 × 模块数**，
 # token 消耗高得多；未经验证优于单次路径前，默认仍走单次生成。
 DECOMPOSE_STEPWISE = os.getenv("DECOMPOSE_STEPWISE", "0") != "0"
-# **追踪优先**（默认**关**，置 1 启用）：第 1 次尝试先用**真实追踪**（`scripts/trace_ir.py`，torch.export
-# 机械生成）产出的 IR；它仍要过同一条校验链，不过或追踪不可用即回退 agent，行为与今天完全一致。
+# **追踪优先**（默认**开**，置 0 关闭）：第 1 次尝试先用**真实追踪**（`scripts/trace_ir.py`，torch.export
+# 机械生成）产出的 IR；它仍要过同一条校验链，不过或追踪不可用即回退 agent。
 # 为什么：LLM 猜不出忠实 IR（漏模块、把子模块晾成孤立死块），追踪按构造忠实。
+# 为什么**默认开**：保真度自检（真实**被调用模块**覆盖）会把 agent 推着拆细，而节点数上限只豁免
+# 追踪产物——实测 scGPT 忠实 IR 需 62 节点 > 60，agent 路径**必然撞上限**、重试到预算耗尽仍失败。
+# 即「追踪优先」在这条链路上不是可选优化，而是前提：关掉它 = 把能拆的模型拆坏。
 # **前置**：要有真实的 `input_spec.shape`——导出会把数据依赖的维度常量折叠（`arange(size(0))` →
 # `arange(1)`），拿默认形状去追踪会把批量维写死。故缺形状时**跳过追踪**并写明原因
 # （即：首次拆解仍走 agent，补形状后**重新拆解**才走追踪）。
-DECOMPOSE_TRACE_IR = os.getenv("DECOMPOSE_TRACE_IR", "0") != "0"
+DECOMPOSE_TRACE_IR = os.getenv("DECOMPOSE_TRACE_IR", "1") != "0"
 # 重试时是否续接上一次 agent 会话。默认**不续接**（每轮全新会话）：实测续接的长会话到后期
 # 常直接「不产出 IR」（12 次里 8 次），换新会话给干净上下文；置 1 可切回续接（省一轮读源码）。
 DECOMPOSE_RETRY_RESUME = os.getenv("DECOMPOSE_RETRY_RESUME", "0") != "0"

@@ -1073,6 +1073,148 @@ def build_ir(model, *, entry_class: str, source_file: str, spec: dict, task_type
     return ir, notes
 
 
+def _load_ctors(source_dir: str) -> dict[str, str]:
+    """读 `<ws>/reports/module_ctors.py` 的 CTORS（缺文件/缺 CTORS → 空表 = 不折叠）。"""
+    path = Path(source_dir).resolve().parent / "reports" / "module_ctors.py"
+    if not path.exists():
+        return {}
+    import importlib.util
+
+    spec_mod = importlib.util.spec_from_file_location("_module_ctors", path)
+    if spec_mod is None or spec_mod.loader is None:
+        return {}
+    mod = importlib.util.module_from_spec(spec_mod)
+    spec_mod.loader.exec_module(mod)
+    ctors = getattr(mod, "CTORS", None)
+    return {str(k): str(v) for k, v in ctors.items()} if isinstance(ctors, dict) else {}
+
+
+def _output_is_tensor(model, spec: dict, source_dir: str | None) -> dict[str, bool]:
+    """跑一次前向，记录每个顶层子模块的输出**是否为单个张量**（hook，失败返回空表）。
+
+    黑盒节点在 IR 里代表「一路张量」，而真实子模块的 forward 可能返回**容器**
+    （实测 scGPT 的 `ExprDecoder.forward` 返回 `dict(pred=…)`）——展开版在追踪时把这层
+    拆掉了，黑盒直接调真实类就会把整个 dict 交给下游。这类模块**不能黑盒**。
+    """
+    import torch
+
+    import _model_loader as ml
+
+    try:
+        inputs = ml.build_inputs(model, _with_batch(spec, 2), source_dir)
+        kwargs = ml.call_kwargs(spec)
+    except Exception:  # noqa: BLE001 —— 探测失败就不限制（宁可保守展开）
+        return {}
+    seen: dict[str, bool] = {}
+    handles = []
+    for name, child in model.named_children():
+        def _hook(_m, _a, out, _n=name):  # noqa: ANN001
+            seen.setdefault(_n, isinstance(out, torch.Tensor))
+
+        handles.append(child.register_forward_hook(_hook))
+    try:
+        with torch.no_grad():
+            model(*inputs, **kwargs)
+    except Exception:  # noqa: BLE001
+        return {}
+    finally:
+        for h in handles:
+            h.remove()
+    return seen
+
+
+def collapse_blackboxes(ir: dict, ctors: dict[str, str],
+                        tensor_out: dict[str, bool] | None = None) -> tuple[dict, list[str]]:
+    """把**有构造契约的顶层子模块**整棵子树折叠成单个「黑盒」leaf 节点。
+
+    为什么：追踪展开到叶子会让真实模型的 IR 过大（画布不可读、节点数撞上限）。而
+    「这个子模块怎么造」这件事，`<ws>/reports/module_ctors.py` 已经给出了**可验证**的
+    构造表达式（`scripts/module_ctors_check.py` 逐项比对类名/子模块序列/参数量）。
+    两者一合：把展开的子树换成一个 `leaf` + `code_hint` = 契约表达式，IR 既小又忠实。
+
+    折叠规则：
+    - 只折叠 **root 的直接子节点**、且其 `module_path` 在契约里（嵌套模块不折——它的
+      构造表达式无从验证）；
+    - 折叠 = 删掉该子节点的**整棵子树**，在原位留一个 `leaf` 节点（id/class_name/
+      module_path 保留，`code_hint` = 契约表达式）；
+    - 边重接：跨子树边折到黑盒上，子树内部的边删除；去重、去自环；
+    - 多入边对「带 code_hint 的 leaf」合法（回退后按入边序传参），不额外处理。
+    """
+    notes: list[str] = []
+    if not ctors:
+        return ir, notes
+    root_id = ir["root_id"]
+    nodes, edges = ir["nodes"], ir["edges"]
+    kids: dict[str, list[str]] = {}
+    for n in nodes:
+        if n.get("parent_id"):
+            kids.setdefault(n["parent_id"], []).append(n["id"])
+
+    def _subtree(nid: str) -> set[str]:
+        out: set[str] = set()
+        stack = [nid]
+        while stack:
+            cur = stack.pop()
+            if cur in out:
+                continue
+            out.add(cur)
+            stack.extend(kids.get(cur, []))
+        return out
+
+    new_nodes: list[dict] = []
+    fold: dict[str, str] = {}          # 被折叠掉的节点 id → 黑盒节点 id
+    indeg: dict[str, int] = {}
+    for e in edges:
+        indeg[e["to"]] = indeg.get(e["to"], 0) + 1
+    for n in nodes:
+        if n["id"] in fold:
+            continue
+        is_top = n.get("parent_id") == root_id
+        mod_path = str(n.get("module_path") or "")
+        if is_top and mod_path in ctors and indeg.get(n["id"], 0) > 1:
+            # **多输入模块不黑盒**：IR 的入边顺序来自「内部消费序」，而黑盒是直接调用
+            # 真实类——真实 `forward` 的**位置实参顺序**数据流里没有（实测 scGPT 的
+            # `MVCDecoder.forward(cell_emb, gene_embs)` 与入边序正好相反，黑盒传反 →
+            # `bmm` 报 batch1 must be a 3D tensor）。宁可展开，不可传错。
+            notes.append(f"黑盒跳过 {n['id']}（{n.get('class_name')}）：多输入"
+                         f"（{indeg.get(n['id'], 0)} 条入边）——位置实参顺序无法从数据流推出")
+            new_nodes.append(n)          # 保持展开（节点本身必须留下，否则其子节点成孤儿）
+            continue
+        if is_top and mod_path in ctors and (tensor_out or {}).get(n["id"]) is False:
+            # **输出不是单个张量**（dict/tuple）——黑盒代表的是「一路张量」，展开版在追踪时
+            # 已把这层容器拆掉（如 scGPT 的 `ExprDecoder` 返回 `dict(pred=…)`，原模型取 `["pred"]`）。
+            notes.append(f"黑盒跳过 {n['id']}（{n.get('class_name')}）：forward 返回容器而非单个张量")
+            new_nodes.append(n)
+            continue
+        if is_top and mod_path in ctors:
+            sub = _subtree(n["id"])
+            for sid in sub - {n["id"]}:
+                fold[sid] = n["id"]
+            new_nodes.append({**n, "kind": "leaf", "code_hint": ctors[mod_path]})
+            notes.append(f"黑盒折叠 {n['id']}（{n.get('class_name')}）：{len(sub)} 个节点 → 1 个")
+            continue
+        new_nodes.append(n)
+    if not fold:
+        return ir, notes
+
+    live = {n["id"] for n in new_nodes}
+    seen: set[tuple[str, str]] = set()
+    new_edges: list[dict] = []
+    for e in edges:
+        f, t = fold.get(e["from"], e["from"]), fold.get(e["to"], e["to"])
+        if f not in live or t not in live or f == t or (f, t) in seen:
+            continue
+        seen.add((f, t))
+        new_edges.append({**e, "from": f, "to": t})
+
+    out = {**ir, "nodes": new_nodes, "edges": new_edges}
+    if isinstance(out.get("input_spec"), dict):
+        spec = dict(out["input_spec"])
+        # 被折叠的顶层模块若在 `inputs` 里，它的 id 仍然存在（就是黑盒那个节点），无需改
+        out["input_spec"] = spec
+    return out, notes
+
+
 def main() -> None:
     source_dir, ir_in, out_path = sys.argv[1:4]
     spec = {"shape": [1, 4], "dtype": "float32"}
@@ -1091,6 +1233,12 @@ def main() -> None:
     ir, notes = build_ir(model, entry_class=entry_class, source_file=source_file,
                          spec=spec, task_type=task_type, entry_args=entry_args,
                          source_dir=source_dir)
+    # 顶层「黑盒折叠」：有构造契约的顶层子模块折成一个 leaf+code_hint（IR 从展开态变小）。
+    # 契约由 `<ws>/reports/module_ctors.py` 给出、由 `scripts/module_ctors_check.py` 验证。
+    ctors = _load_ctors(source_dir)
+    ir, fold_notes = collapse_blackboxes(
+        ir, ctors, _output_is_tensor(model, spec, source_dir) if ctors else None)
+    notes.extend(fold_notes)
     Path(out_path).write_text(json.dumps(ir, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"written: {out_path}（{len(ir['nodes'])} 节点 / {len(ir['edges'])} 边）")
     for x in notes[:20]:

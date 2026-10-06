@@ -189,9 +189,11 @@ ir 与标准节点混拼不支持、容器通道未实现、单位归一误判�
 `scripts/trace_ir.py`（**由 `torch.export` 的 `nn_module_stack` 机械生成 IR**：模块树/算子归属/边/叶子参数
 全由追踪取到）。**scGPT 已首次走通 ④ 再生成 → ⑤ 两步验证**（`overall=passed`：87/87 带参层、参数量
 21,292,034 与真实模型**完全相等**、6 个输出键**逐键数值误差 0.0**）。**已接进拆解链路**：开关
-`DECOMPOSE_TRACE_IR`（**默认关**，置 1 启用）——「追踪优先、agent 兜底」，追踪不可用或产物不过校验
-即回退 agent；**前置是需要真实的 `input_spec.shape`**（导出会把数据依赖维度常量折叠，默认形状会把
+`DECOMPOSE_TRACE_IR`（**默认开**，置 0 关闭）——「追踪优先、agent 兜底」，追踪不可用或产物不过校验
+即回退 agent；**默认开是必须的**：保真度自检会把 agent 推着拆细，而节点数上限（60）只豁免追踪产物，
+实测 scGPT 忠实 IR 需 62 节点 → 关掉开关 = agent 路径必然撞上限、重试到预算耗尽仍失败；**前置是需要真实的 `input_spec.shape`**（导出会把数据依赖维度常量折叠，默认形状会把
 批量维写死）→ **首次拆解仍走 agent，补形状后重新拆解才走追踪**。产出留痕在 `run_record.metrics.via`。
+**顶层「黑盒折叠」（v1.51）**：追踪 IR 默认展开到叶子，节点多。若项目有 **`<ws>/reports/module_ctors.py`**（`CTORS`：顶层子模块名 → 构造表达式源码），`scripts/trace_ir.py::collapse_blackboxes` 会把那些顶层子模块的**整棵子树折成一个 `leaf`**（`code_hint` = 契约表达式）——scGPT **62 → 46 节点**，⑤ 仍 `passed`（87/87 层、参数相等、逐键数值 0.0）。契约由 **`scripts/module_ctors_check.py`** 验证（实例化后比 类名/子模块序列/参数量）。**两道守卫**：多输入模块不折（入边序 ≠ 调用点的位置实参序，实测 `MVCDecoder(cell_emb, gene_embs)` 正好相反）、forward 返回容器的模块不折（实测 `ExprDecoder` 返回 `dict(pred=…)`）。**边界**：`torch.export` 跑不了的模型（boltz 的 data-dependent 分支）追踪不可用；且 IR 是「从原语重建 + 模块黑盒」，**根层命令式胶水多**的模型（boltz 根层 ~14k 算子）任何粒度都省不下来。ATB 类**首参是图对象**的模型需 `make_inputs.py` 输入契约。
 已知偏差：`src_key_padding_mask` 在被折叠的
 `nn.TransformerEncoder` 内消费、未接线；只覆盖导出时走到的分支组合。详见 `docs/模块详细设计.md` v1.40~v1.42。
 **批量维已符号化**（v1.42）：`torch.export` 的 `dynamic_shapes` 把入参 dim0 声明为 `batch`，`arange(size(0))`
