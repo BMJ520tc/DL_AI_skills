@@ -17,6 +17,9 @@ node_modules/
 dist/
 .vite/
 
+# 打包中间产物（PyInstaller 的 workpath；产物 zip 落仓库外 D:\releases）
+/build/
+
 # 环境与凭证
 .env
 .env.*

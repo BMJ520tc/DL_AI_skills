@@ -6,6 +6,7 @@
 import asyncio
 import contextlib
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Optional
@@ -14,6 +15,14 @@ from app.db.connection import get_connection
 
 # 任务执行函数签名: (params: dict, task_id: str) -> None（结果由 handler 自行写 run_record）
 Handler = Callable[[dict, str], Awaitable[None]]
+
+# 训练脚本的**单次**上限（秒）。与 `network_service.TRAIN_TIMEOUT_S` **共用同一个 env 旋钮**，
+# 从而保证「任务级上限 > 脚本级上限」——否则任务会先于脚本被杀、连脚本给的超时原因都留不下
+# （实测 2026-10-07：脚本级 1800s 先到，任务级却报「timeout after 3600s」，把原因说错）。
+# 默认 3h：大模型 + 长序列（如 scGPT 1200 token × 12 层 × 39.5M 参数）在 8GB 卡上必须用小 batch，
+# 步数多、总时长久。`TRAIN_TIMEOUT_S` 环境变量可整体调。
+TRAIN_SCRIPT_TIMEOUT_S = float(os.environ.get("TRAIN_TIMEOUT_S", "10800"))
+_TASK_MARGIN_S = 900  # 任务级比脚本级多留的收尾余量（落库/杀进程树/写日志）
 
 _handlers: dict[str, Handler] = {}
 _queue: Optional[asyncio.Queue] = None
@@ -39,11 +48,12 @@ TASK_TIMEOUTS: dict[str, float] = {
     "decompose_trace": 900,  # 脚本 600s + 余量
     "decompose_verify": 2400,  # 脚本 1800s + 余量
     "module_ingest": 600,
-    "network_train": 3600,  # 训练脚本 1800s + 余量
+    "network_train": TRAIN_SCRIPT_TIMEOUT_S + _TASK_MARGIN_S,  # 脚本级上限 + 余量（见上）
     "multi_model": 900,     # 多模型综合分析（含分歧归因 agent）
     "paper_distill": 3600,  # 论文蒸馏（逐篇 agent 起草，多篇可能耗时）
     "knowledge_distill": 600,  # 任务后蒸馏（单次 agent 起草）
-    "network_autotune": 3600,  # 自动调参（逐候选训练，每个训练上限见 TRAIN_TIMEOUT_S）
+    # 自动调参逐个训练候选，**每个候选**都可能跑满脚本级上限，故按候选数 × (脚本上限+余量) 给足
+    "network_autotune": 4 * (TRAIN_SCRIPT_TIMEOUT_S + _TASK_MARGIN_S),
     "arch_suggest": 900,     # 架构级自迭代建议（单次 agent 起草，需求六.1 延伸）
     "assistant_chat": 900,  # 前端 AI 助手对话（单次只读 agent 会话）
 }
@@ -291,16 +301,21 @@ async def _execute(task_id: str) -> None:
         t = asyncio.create_task(handler(params, task_id))
         _running_tasks[task_id] = t
         try:
-            await asyncio.wait_for(t, timeout=timeout)
-        except asyncio.TimeoutError:
-            _set_status(task_id, "failed", error=f"timeout after {timeout}s")
-            t.cancel()
-            # 必须等 handler 真正收尾（它在收尾时会杀掉子进程树、释放环境目录）再返回，
-            # 否则 worker 立刻处理 retry 入队的新任务，会与尚未退出的旧执行并发写同一环境。
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await t
-            _schedule_finish_hooks(task_id, "failed")
-            return
+            # 用 `asyncio.wait`（而非 `wait_for`）区分「**任务级**超时」与「**handler 自己**抛的
+            # TimeoutError」：后者（如 proc_util 的脚本级超时）会被 `wait_for` 一并当作超时吃掉，
+            # 于是任务被误报成「timeout after <任务级上限>s」，把真正的原因（脚本级上限）说错。
+            done, _ = await asyncio.wait({t}, timeout=timeout)
+            if not done:
+                _set_status(task_id, "failed", error=f"任务超时（超过 {timeout:g}s）")
+                t.cancel()
+                # 必须等 handler 真正收尾（它在收尾时会杀掉子进程树、释放环境目录）再返回，
+                # 否则 worker 立刻处理 retry 入队的新任务，会与尚未退出的旧执行并发写同一环境。
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await t
+                _schedule_finish_hooks(task_id, "failed")
+                return
+            # handler 已结束：在此重抛它自己的异常/取消，交外层分支按真实原因处理
+            t.result()
         except asyncio.CancelledError:
             # 被 cancel_task 取消（协作式）：同样等收尾后再返回（不重新抛出以免传播到 worker）
             _set_status(task_id, "cancelled")

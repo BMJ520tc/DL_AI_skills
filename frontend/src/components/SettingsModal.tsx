@@ -210,7 +210,7 @@ export default function SettingsModal({ open, firstRun, onClose }: Props) {
                     </div>
                     <div style={FIELD_ROW}>
                         <span style={FIELD_LABEL}>接口地址</span>
-                        <input style={INPUT} value={baseUrl} placeholder="留空使用默认（如 https://api.deepseek.com）" onChange={e => setBaseUrl(e.target.value)} />
+                        <input style={INPUT} value={baseUrl} placeholder="留空使用默认（https://api.deepseek.com/anthropic）" onChange={e => setBaseUrl(e.target.value)} />
                     </div>
                     <div style={FIELD_ROW}>
                         <span style={FIELD_LABEL}>默认模型</span>

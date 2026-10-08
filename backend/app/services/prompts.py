@@ -21,9 +21,9 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from app.config import PROJECT_ROOT
+from app.config import resource_path
 
-PROMPTS_DIR = PROJECT_ROOT / "agents" / "prompts"
+PROMPTS_DIR = resource_path("agents/prompts")
 
 # 模板名白名单：只允许这三份（《阶段1实施方案》第 197 行列出的落位文件）
 TEMPLATE_NAMES = ("address_extract", "dynamic_analysis", "dependency_fix")

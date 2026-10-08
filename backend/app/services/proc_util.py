@@ -11,8 +11,9 @@ import asyncio
 import os
 import signal
 import subprocess
-from pathlib import Path
 from typing import Callable, Optional
+
+from app.config import DATA_DIR
 
 
 async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
@@ -61,8 +62,14 @@ async def run_command(
     # 项目工作区路径本就深，容易突破 Windows MAX_PATH(260) → FileNotFoundError。
     # 统一把缓存指到项目内的短目录（可用 NUMBA_CACHE_DIR 覆盖）。
     run_env = {**os.environ, **(env or {})}
+    # 逐行回调要求**子进程行缓冲**：Python 连到管道时 stdout 是**块缓冲**（要写满 8KB 才吐），
+    # 于是 print 出来的行根本到不了这里 —— 长任务（训练/复现）的进度会一直停在「进行中」，
+    # 超时/取消被杀后更是连一行日志都没留下（实测：训练一小时无任何 [epoch] 行）。设
+    # PYTHONUNBUFFERED=1 让子进程行缓冲（只在本函数**用了 on_line** 时设，不影响其它调用）。
+    if on_line is not None and not run_env.get("PYTHONUNBUFFERED"):
+        run_env["PYTHONUNBUFFERED"] = "1"
     if os.name == "nt" and not run_env.get("NUMBA_CACHE_DIR"):
-        short_cache = Path(__file__).resolve().parents[3] / "data" / "numba_cache"
+        short_cache = DATA_DIR / "numba_cache"
         try:
             short_cache.mkdir(parents=True, exist_ok=True)
             run_env["NUMBA_CACHE_DIR"] = str(short_cache)
@@ -97,7 +104,10 @@ async def run_command(
         text = await asyncio.wait_for(_drain(), timeout=timeout)
     except asyncio.TimeoutError:
         await _kill_tree(proc)
-        raise
+        # **带消息**重抛：裸 TimeoutError 的 str() 是空串，会让上层落库的失败记录 error 字段一片
+        # 空白、任务级又把它误报成「任务超时」（见 task_manager._execute）。这里给足原因。
+        limit = f"{timeout:g}s" if timeout else "上限"
+        raise TimeoutError(f"脚本执行超时（超过 {limit}）") from None
     except asyncio.CancelledError:
         await _kill_tree(proc)
         raise

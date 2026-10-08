@@ -112,6 +112,26 @@ def test_apply_credentials_env(monkeypatch, tmp_path):
     assert os.environ["ANTHROPIC_DEFAULT_MODEL"] == "file-model"
 
 
+def test_apply_credentials_env_defaults_base_url(monkeypatch, tmp_path):
+    """设置页「接口地址」留空时必须回落到**缺省端点**（DeepSeek 的 Anthropic 兼容端点）。
+
+    否则 CLI 会打默认的 api.anthropic.com，用 DeepSeek 的 key 必然 401——开发机好使是因为
+    shell 里带了 ANTHROPIC_BASE_URL，打包形态没有（实测踩到：AI 助手报 401）。
+    """
+    import os
+
+    from app import settings_store
+    from app.config import DEFAULT_ANTHROPIC_BASE_URL
+
+    _isolate_credentials(monkeypatch, tmp_path)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+
+    settings_store.save_credentials({"api_key": "sk-ds", "base_url": "", "model": ""})
+    settings_store.apply_credentials_env()
+    assert os.environ["ANTHROPIC_BASE_URL"] == DEFAULT_ANTHROPIC_BASE_URL
+    assert settings_store.status()["base_url"] == DEFAULT_ANTHROPIC_BASE_URL
+
+
 def test_env_check_shape(app_client, monkeypatch, tmp_path):
     _isolate_credentials(monkeypatch, tmp_path)
 

@@ -22,7 +22,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from app.config import PROJECT_ROOT
+from app.config import resource_path
 from app.contracts import CANONICAL_METRICS, normalize_metrics
 from app.services import proc_util
 from app.services import (
@@ -31,7 +31,7 @@ from app.services import (
 
 TASK_TYPE = "baseline"
 EVAL_ENTRY_NAME = "eval_entry.py"
-EVAL_TEMPLATE = PROJECT_ROOT / "scripts" / "eval_entry_template.py"
+EVAL_TEMPLATE = resource_path("scripts/eval_entry_template.py")
 BASELINE_TIMEOUT_S = 3600
 WEIGHT_EXTS = (".pth", ".pt", ".ckpt", ".safetensors", ".onnx", ".h5")
 

@@ -621,6 +621,44 @@ def test_run_options_lists_envs_and_datasets(tmp_networks):
     assert [d["dataset_id"] for d in opts2["datasets"]] == [dataset_id]
 
 
+def test_run_options_dataset_digest_and_model_contract(tmp_networks):
+    """数据集摘要（行数/划分/输入列/类别/形态）+ 模型输入契约（导出该图取回 MODEL_INPUTS）。"""
+    client, tmp_path = tmp_networks
+    original_id = _create_original(client)
+    project_id = _create_structured(client, original_id)
+    _record_dataset(tmp_path)  # id,split,label,input（数值，2 类）
+    client.put(f"/api/projects/{project_id}/graph", json={
+        "nodes": [{"id": "n1", "type": "linear_layer", "data": {"in_features": 1, "out_features": 2, "bias": True}}],
+        "edges": []})
+
+    opts = client.get(f"/api/networks/{project_id}/run-options").json()
+    d = opts["datasets"][0]["digest"]
+    assert d["rows"] == 2 and d["split_counts"] == {"train": 1, "test": 1}
+    assert d["input_columns"] == ["input"] and d["n_classes"] == 2 and d["input_kind"] == "numeric"
+    # 标准图无 MODEL_INPUTS → 训练模板默认单输入（train.py 同口径）
+    assert opts["model_inputs"] == [{"name": "input", "dtype": "float32"}]
+
+
+def test_run_options_flags_path_input(tmp_networks):
+    """input 是文件路径（图像/影像类）→ input_kind=path（前端据此提示「训练模板不支持」）。"""
+    client, tmp_path = tmp_networks
+    original_id = _create_original(client)
+    project_id = _create_structured(client, original_id)
+    from app.services import knowledge_service as ks
+
+    dirp = tmp_path / "ds_img"
+    dirp.mkdir(exist_ok=True)
+    (dirp / "preprocessed.csv").write_text(
+        "id,split,label,input,meta_width\n1,train,0,a/b.png,32\n2,test,1,c/d.jpg,32\n", encoding="utf-8")
+    ks.register_dataset({"dataset_id": "ds_img", "name": "img", "task_type": "classification",
+                         "local_path": str(dirp / "preprocessed.csv")})
+
+    opts = client.get(f"/api/networks/{project_id}/run-options").json()
+    d = opts["datasets"][0]["digest"]
+    assert d["input_kind"] == "path"
+    assert d["input_columns"] == ["input"]   # meta_* 不算输入列
+
+
 # ---------------------------------------------------------------------------
 # 训练编排（monkeypatch 掉训练脚本执行，handler 直跑——与 test_dataset_alignment 同风格）
 # ---------------------------------------------------------------------------

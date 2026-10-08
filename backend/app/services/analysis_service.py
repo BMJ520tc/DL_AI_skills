@@ -7,19 +7,18 @@ import asyncio
 import json
 import re
 import subprocess
-import sys
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.config import PROJECT_ROOT, project_env_dir
+from app.config import project_env_dir, resource_path, script_command
 from app.services import agent_service, download_service, knowledge_service, project_manager, prompts, task_manager
 
 VERIFY_TASK_TYPE = "verify"
 ANALYZE_TASK_TYPE = "analyze"
 
-SCAN_SCRIPT = PROJECT_ROOT / "scripts" / "scan_structure.py"
+SCAN_SCRIPT = resource_path("scripts/scan_structure.py")
 
 DYNAMIC_SCHEMA = {
     "type": "object",
@@ -729,7 +728,7 @@ async def _run_analyze(params: dict, task_id: str) -> None:
 
     await asyncio.to_thread(
         subprocess.run,
-        [sys.executable, str(SCAN_SCRIPT), str(source), str(report_path)],
+        script_command(SCAN_SCRIPT, source, report_path),
         check=True,
         capture_output=True,
     )

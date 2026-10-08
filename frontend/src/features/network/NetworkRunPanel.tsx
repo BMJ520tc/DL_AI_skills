@@ -7,8 +7,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
     bringKnowledge, createProjectEnv, getNetworkRunOptions, getProjectEnvStatus, listNetworkRuns, listProjects,
-    postNetworkAutotune, postNetworkRun, type KnowledgeBringResult, type NetworkRunOptions, type NetworkRunRecord,
-    type Project, type Task,
+    listTasks, postNetworkAutotune, postNetworkRun, type KnowledgeBringResult, type NetworkRunOptions,
+    type NetworkRunRecord, type Project, type Task,
 } from "../../api/client";
 import { useTaskPolling } from "../../hooks/useTaskPolling";
 
@@ -152,10 +152,68 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
         })();
     }, [projectId, refreshOptions, loadOriginals]);
 
+    // 重开面板**接管**本项目的活跃训练/调参任务：taskId 是组件本地态，面板一关（或离开画布再回来）
+    // 组件卸载即丢，而任务仍在跑 → 面板看起来「没有进度」（任务看板里却有）。挂载时查一次并接上。
+    useEffect(() => {
+        let cancelled = false;
+        void (async () => {
+            try {
+                const tasks = await listTasks("board", 100);
+                const mine = (tasks ?? []).filter(t =>
+                    t.project_id === projectId
+                    && (t.task_type === "network_train" || t.task_type === "network_autotune")
+                    && (t.status === "running" || t.status === "queued"));
+                if (cancelled || mine.length === 0) return;
+                const train = mine.find(t => t.task_type === "network_train");
+                const auto = mine.find(t => t.task_type === "network_autotune");
+                if (train) setTaskId(train.task_id);
+                if (auto) setAutotuneTaskId(auto.task_id);
+            } catch {
+                // 接管失败不阻塞面板（用户仍可重新发起）
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [projectId]);
+
     const selectedDataset = useMemo(
         () => options?.datasets.find(d => d.dataset_id === datasetId) ?? null,
         [options, datasetId],
     );
+
+    // 数据集摘要（判断「选对没」）：任务类型/行数/划分/输入列/标签类别数。
+    const datasetInfo = useMemo(() => {
+        const d = selectedDataset?.digest;
+        if (!d) return null;
+        const splits = Object.entries(d.split_counts || {}).map(([k, v]) => `${k} ${v}`).join(" / ");
+        return [
+            selectedDataset?.task_type ?? null,
+            d.rows != null ? `${d.rows} 行` : null,
+            splits ? `划分 ${splits}` : null,
+            d.input_columns.length ? `输入列 ${d.input_columns.join(", ")}` : null,
+            d.n_classes != null ? `标签 ${d.n_classes} 类` : null,
+        ].filter(Boolean).join(" · ");
+    }, [selectedDataset]);
+
+    // 与**模型侧输入契约**比对（导出该图取回的 MODEL_INPUTS 列名）：训练模板按这些列读数据。
+    const compat = useMemo((): { level: "ok" | "warn"; text: string } | null => {
+        const d = selectedDataset?.digest;
+        if (!d) return null;
+        if (d.input_kind === "path") {
+            return { level: "warn", text: "⚠ 该数据集 input 是文件路径（图像/影像类），当前训练模板只支持数值输入，训练会失败" };
+        }
+        const mi = options?.model_inputs;
+        if (!mi || !d.input_columns.length) return null;
+        const need = mi.map(m => m.name);
+        const missing = need.filter(n => !d.input_columns.includes(n));
+        if (missing.length) {
+            return { level: "warn", text: `⚠ 模型需要列 [${need.join(", ")}]，数据集缺 [${missing.join(", ")}] → 训练会因缺列失败` };
+        }
+        const extra = d.input_columns.filter(c => !need.includes(c));
+        return {
+            level: "ok",
+            text: `✓ 输入列与模型契约一致（${need.join(", ")}）${extra.length ? `；数据集另有未用列 ${extra.join(", ")}` : ""}`,
+        };
+    }, [selectedDataset, options]);
 
     // 选好数据集 → 带入已确认知识（参数建议默认填入超参，冲突预警展示；用户均可忽略/改）。
     // 结果在 async 路径内落地（不在 effect 体内同步 setState）；渲染侧以 selectedDataset 门控，
@@ -397,6 +455,20 @@ export default function NetworkRunPanel({ projectId, saveGraph, onClose }: Netwo
                     </option>
                 ))}
             </select>
+
+            {datasetInfo && (
+                <div style={{ color: "#94a3b8", fontSize: 11, marginTop: 4, lineHeight: 1.5 }}>
+                    {datasetInfo}
+                </div>
+            )}
+            {compat && (
+                <div style={{
+                    color: compat.level === "ok" ? "#4ade80" : "#fbbf24",
+                    fontSize: 11, marginTop: 4, lineHeight: 1.5,
+                }}>
+                    {compat.text}
+                </div>
+            )}
 
             {selectedDataset && bringAdvice && (bringAdvice.param_advice.length > 0 || bringAdvice.dependency_conflict.length > 0) && (
                 <div

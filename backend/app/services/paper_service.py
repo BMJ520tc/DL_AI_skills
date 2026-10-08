@@ -17,13 +17,12 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from app import contracts
-from app.config import PAPERS_DIR, PROJECT_ROOT
+from app.config import PAPERS_DIR, resource_path, script_command
 from app.ids import fs_name, safe_id
 from app.services import (
     agent_service, analysis_service, env_manager, knowledge_service, proc_util,
@@ -35,8 +34,8 @@ TASK_EXTRACT = "extract_items"
 TASK_REPRODUCE = "reproduce"
 TASK_CONCLUSION = "conclusion"
 
-PDF_SCRIPT = PROJECT_ROOT / "scripts" / "pdf_to_markdown.py"
-REPRODUCE_TEMPLATE = PROJECT_ROOT / "scripts" / "reproduce_template.py"
+PDF_SCRIPT = resource_path("scripts/pdf_to_markdown.py")
+REPRODUCE_TEMPLATE = resource_path("scripts/reproduce_template.py")
 REPRODUCE_TIMEOUT_S = 3600
 REPRODUCE_MAX_PARALLEL = int(os.getenv("REPRODUCE_MAX_PARALLEL", "3"))  # 4.3 多条目在资源限额内并行
 # 4.2 抽取喂给 agent 的**总预算**：不再是「只取 markdown 头部」，超预算时按
@@ -523,7 +522,7 @@ async def _run_parse(params: dict, task_id: str) -> None:
     log: list[str] = []
 
     rc, out = await proc_util.run_command(
-        [sys.executable, str(PDF_SCRIPT), str(pdf_path), str(md_path), str(idx_path), str(tables_path)],
+        script_command(PDF_SCRIPT, pdf_path, md_path, idx_path, tables_path),
     )
     if rc != 0:
         raise RuntimeError(f"PDF 解析脚本失败（rc={rc}）: {out[-1500:]}")
@@ -550,7 +549,7 @@ async def _run_parse(params: dict, task_id: str) -> None:
             # 只有 agent 真的改了 markdown 才重建索引；重建时页码由脚本侧继承旧索引
             # （本服务不重复实现继承逻辑）。未改动则保留原索引，避免 page/n_pages 变空。
             rc, out = await proc_util.run_command(
-                [sys.executable, str(PDF_SCRIPT), "--index-only", str(md_path), str(idx_path)],
+                script_command(PDF_SCRIPT, "--index-only", md_path, idx_path),
             )
             if rc != 0:
                 raise RuntimeError(f"索引重建失败（rc={rc}）: {out[-800:]}")

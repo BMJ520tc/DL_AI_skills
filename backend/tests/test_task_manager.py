@@ -124,6 +124,49 @@ def test_failed_handler_records_error(isolated_db):
     assert "boom-detail" in task["error"]
 
 
+def test_handler_timeout_error_not_misreported_as_task_timeout(isolated_db):
+    """handler **自己**抛的 TimeoutError（如 proc_util 的脚本级超时）必须按其原文落库——
+    不能被任务级超时分支吞掉改写成「任务超时 <上限>s」（实测会把原因说错）。"""
+    async def script_timeout(params, task_id):
+        raise TimeoutError("脚本执行超时（超过 1800s）")
+
+    async def body():
+        task_manager.register_handler("script_timeout", script_timeout)
+        tid = task_manager.create_task("script_timeout")
+        return await _wait_terminal(tid)
+
+    task = _run_scenario(body)
+    assert task["status"] == "failed"
+    assert "脚本执行超时" in task["error"]
+    assert "任务超时" not in task["error"]
+
+
+def test_task_level_timeout_reported_with_real_limit(isolated_db, monkeypatch):
+    """handler 挂住不返回 → 任务级超时按**真实上限**报错（与脚本级超时区分）。"""
+    async def hang(params, task_id):
+        await asyncio.sleep(30)
+
+    monkeypatch.setitem(task_manager.TASK_TIMEOUTS, "hang", 0.3)
+
+    async def body():
+        task_manager.register_handler("hang", hang)
+        tid = task_manager.create_task("hang")
+        return await _wait_terminal(tid)
+
+    task = _run_scenario(body)
+    assert task["status"] == "failed"
+    assert "任务超时" in task["error"] and "0.3" in task["error"]
+
+
+def test_network_train_task_timeout_exceeds_script_timeout():
+    """任务级上限须**大于**脚本级上限，否则任务先于脚本被杀（实测根因）。"""
+    from app.services import network_service
+
+    assert task_manager.TASK_TIMEOUTS["network_train"] > network_service.TRAIN_TIMEOUT_S
+    # 自动调参逐候选训练，至少要容下候选数 × 脚本上限
+    assert task_manager.TASK_TIMEOUTS["network_autotune"] >= 4 * network_service.TRAIN_TIMEOUT_S
+
+
 def test_unknown_task_type_fails_without_crashing_worker(isolated_db):
     async def body():
         tid = task_manager.create_task("no-such-handler")

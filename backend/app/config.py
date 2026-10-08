@@ -17,6 +17,29 @@ PROJECT_ROOT = BACKEND_DIR.parent
 IS_FROZEN = bool(getattr(sys, "frozen", False))
 
 
+def resource_path(rel: str) -> Path:
+    """随包资源定位：冻结（PyInstaller）取 `sys._MEIPASS/rel`，否则取仓库根 `PROJECT_ROOT/rel`。
+
+    冻结后 `__file__`/`PROJECT_ROOT` 指向程序目录、不再对应源码树——提示词、训练模板、
+    脚本、schema、echarts 等**随包资源**一律经此定位（spec 的 datas 把它们映射到 `_MEIPASS` 下；
+    非冻结时行为与直接 `PROJECT_ROOT/rel` 完全一致）。
+    """
+    base = Path(sys._MEIPASS) if IS_FROZEN else PROJECT_ROOT
+    return base / rel
+
+
+def script_command(script, *args) -> list:
+    """构造「用后端自身解释器跑一个随包脚本」的命令。
+
+    冻结（PyInstaller）下 `sys.executable` 是 exe 本身、没有独立 python —— 经 exe 的
+    `--run-py` 自派发（launcher 实现 `runpy.run_path`）；非冻结下即普通 `python script args`。
+    """
+    args = [str(a) for a in args]
+    if IS_FROZEN:
+        return [sys.executable, "--run-py", str(script), *args]
+    return [sys.executable, str(script), *args]
+
+
 def _resolve_data_dir() -> Path:
     """数据目录解析：`DL_AI_DATA_DIR` 显式覆盖 > 打包缺省（用户数据目录）> 项目根 data/。
 
@@ -46,6 +69,15 @@ ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
 DEFAULT_MODEL = os.getenv("ANTHROPIC_DEFAULT_MODEL")
 SMALL_MODEL = os.getenv("ANTHROPIC_DEFAULT_SMALL_MODEL")
 
+# 设置页「接口地址」留空时的**缺省端点**（本项目端点 = DeepSeek 的 Anthropic 兼容端点，O2）。
+# 缺省必须真生效：否则 CLI 会打默认的 api.anthropic.com，用 DeepSeek 的 key 必然 401。
+# 开发机好使是因为 shell 里带了 ANTHROPIC_BASE_URL；打包形态没有，实测踩到 → 故设此默认。
+DEFAULT_ANTHROPIC_BASE_URL = (
+    os.getenv("DL_AI_DEFAULT_BASE_URL")
+    or os.getenv("ANTHROPIC_BASE_URL")
+    or "https://api.deepseek.com/anthropic"
+)
+
 
 def _detect_claude_cli() -> str | None:
     """探测原生 claude 可执行文件。
@@ -56,6 +88,12 @@ def _detect_claude_cli() -> str | None:
     env = os.getenv("CLAUDE_CLI_PATH")
     if env:
         return env
+    # 打包形态：优先用随包内置的 claude.exe（launcher 也会设 CLAUDE_CLI_PATH；这里兜底）。
+    if IS_FROZEN:
+        exe_dir = Path(sys.executable).resolve().parent
+        for c in (exe_dir / "claude" / "claude.exe", exe_dir.parent / "claude" / "claude.exe"):
+            if c.exists():
+                return str(c.resolve())
     appdata = os.environ.get("APPDATA")
     if appdata:
         base = Path(appdata) / "npm" / "node_modules" / "@anthropic-ai" / "claude-code"

@@ -24,13 +24,18 @@ ir 图缺字段/结构不合法 → `ExportError`：导出端点 400，训练入
 from __future__ import annotations
 
 import asyncio
+import ast
+import csv
 import json
 import logging
+import os
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from app.config import resource_path
 from app.services import (
     analysis_service, knowledge_service, network_export, proc_util,
     project_manager, task_manager, version_service,
@@ -39,7 +44,11 @@ from app.services import (
 logger = logging.getLogger(__name__)
 
 TASK_TYPE = "network_train"
-TRAIN_TIMEOUT_S = 1800  # 训练脚本超时（任务级上限见 task_manager.TASK_TIMEOUTS）
+# 训练脚本**单次**上限（秒）：与 `task_manager.TRAIN_SCRIPT_TIMEOUT_S` **同一个 env 旋钮**
+# （`TRAIN_TIMEOUT_S`，默认 3h），保证任务级上限恒大于脚本级上限。默认放长是因为大模型 + 长序列
+# （scGPT 1200 token × 12 层 × 39.5M 参数）在 8GB 卡上必须用小 batch，步数多、总时长久——
+# 旧的 1800s 会在半途把脚本杀掉（实测 2026-10-07：batch=32 每步 27s、10 epoch ≈ 2h+）。
+TRAIN_TIMEOUT_S = float(os.environ.get("TRAIN_TIMEOUT_S", "10800"))
 
 
 def _now() -> str:
@@ -87,9 +96,92 @@ def list_runs(project_id: str) -> list[dict]:
     return runs
 
 
+def _input_columns(header: list[str]) -> list[str]:
+    """喂给模型的列：去掉 id/split/label 与 meta_*（元信息列不参与前向）。"""
+    return [h for h in header if h and h not in ("id", "split", "label") and not h.startswith("meta_")]
+
+
+_PATH_HINT = re.compile(
+    r"[\\/]|\.(?:png|jpe?g|bmp|tiff?|nii|dcm|h5ad|h5|pt|pth|npy|npz|csv)$", re.IGNORECASE)
+
+
+def _dataset_digest(local_path: str) -> dict:
+    """预处理产物摘要——给用户**判断「数据集选对没」**的信息（7.5 运行面板）。
+
+    行数 / 划分分布 / 输入列 / 标签类别数 / 输入形态（数值 vs 文件路径）。文件过大时只读表头。
+    """
+    out: dict = {"rows": None, "split_counts": {}, "input_columns": [],
+                 "n_classes": None, "label_values": [], "input_kind": "unknown"}
+    p = Path(local_path).parent / "preprocessed.csv"
+    try:
+        if p.stat().st_size > 50 * 1024 * 1024:
+            with p.open(encoding="utf-8", newline="") as f:
+                out["input_columns"] = _input_columns([h.strip() for h in next(csv.reader(f), [])])
+            return out
+        with p.open(encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            header = [h.strip() for h in next(reader, [])]
+            idx = {h: i for i, h in enumerate(header)}
+            out["input_columns"] = _input_columns(header)
+            inputs = out["input_columns"]
+            in_col = idx.get("input")
+            rows = 0
+            splits: dict = {}
+            labels: set = set()
+            path_like = 0
+            sampled = 0
+            for row in reader:
+                if not row:
+                    continue
+                rows += 1
+                if "split" in idx and len(row) > idx["split"]:
+                    s = row[idx["split"]] or "(空)"
+                    splits[s] = splits.get(s, 0) + 1
+                if "label" in idx and len(row) > idx["label"]:
+                    labels.add(row[idx["label"]])
+                if in_col is not None and len(row) > in_col and sampled < 50:
+                    sampled += 1
+                    if _PATH_HINT.search(row[in_col] or ""):
+                        path_like += 1
+            out["rows"] = rows
+            out["split_counts"] = splits
+            if "label" in idx:
+                out["n_classes"] = len(labels)
+                out["label_values"] = sorted(labels)[:8]
+            if inputs and sampled:
+                out["input_kind"] = "path" if path_like > sampled / 2 else "numeric"
+    except (OSError, csv.Error):
+        pass
+    return out
+
+
+_MODEL_INPUTS_RE = re.compile(r"^MODEL_INPUTS\s*=\s*(\[[^\n]*\])\s*$", re.M)
+
+
+def _model_input_contract(graph: dict) -> Optional[list[dict]]:
+    """模型侧输入契约：**导出该图**（与训练同一引擎）并取回 `MODEL_INPUTS` 的列名+dtype。
+
+    无 `MODEL_INPUTS`（标准图/旧导出）→ 训练模板按单输入 `input/float32` 处理（train.py 同口径）。
+    图不可导出 → None（面板给不出契约，如实不提示）。
+    """
+    try:
+        code = network_export.generate(graph)
+    except Exception:  # noqa: BLE001 —— 导出失败不阻塞面板
+        return None
+    m = _MODEL_INPUTS_RE.search(code)
+    if not m:
+        return [{"name": "input", "dtype": "float32"}]
+    try:
+        val = ast.literal_eval(m.group(1))
+    except (ValueError, SyntaxError):
+        return None
+    return val if isinstance(val, list) else None
+
+
 def run_options(project_id: str) -> dict:
     """运行面板初始化数据：父项目、可用环境（original 项目已建好的独立环境）、
-    可训练数据集（模块三预处理产物仍在的注册表条目）。"""
+    可训练数据集（模块三预处理产物仍在的注册表条目，附**可判断选对没**的摘要），
+    以及**模型侧输入契约**（供前端比对数据集列）。"""
     project = _require_network(project_id)
     parent_id = project.get("parent_project_id")
     parent = project_manager.get_project(parent_id) if parent_id else None
@@ -116,13 +208,20 @@ def run_options(project_id: str) -> dict:
                 "name": ds.get("name"),
                 "task_type": ds.get("task_type"),
                 "local_path": local,
+                "digest": _dataset_digest(local),
             })
+
+    try:
+        model_inputs = _model_input_contract(_graph(project))
+    except LookupError:
+        model_inputs = None
 
     return {
         "parent_project_id": parent_id,
         "parent_name": parent.get("name") if parent else None,
         "environments": environments,
         "datasets": datasets,
+        "model_inputs": model_inputs,
     }
 
 
@@ -304,7 +403,7 @@ async def _do_train(params: dict, task_id: str, ctx: dict) -> None:
     run_dir = ws / "runs" / task_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "model.py").write_text(code, encoding="utf-8")
-    template = Path(__file__).resolve().parents[2] / "templates" / "train.py"
+    template = resource_path("backend/templates/train.py")
     shutil.copyfile(template, run_dir / "train.py")
 
     out_json = run_dir / "train_metrics.json"
@@ -319,17 +418,27 @@ async def _do_train(params: dict, task_id: str, ctx: dict) -> None:
     ctx["log_path"] = str(log_path)
     ctx["environment"] = {"python": python, "environment_project_id": env_project_id}
 
+    captured: list[str] = []
+
     def _on_line(line: str) -> None:
         # 把 train.py 的逐 epoch 行透到任务进度（原先只在 train.log 里，界面看不到）
+        captured.append(line)
         text = line.strip()
         if text.startswith("[epoch") or text.startswith("device="):
             task_manager.update_progress(
                 task_id, {"stage": f"训练中 · {text[:200]}", "command": " ".join(cmd)}
             )
 
-    rc, output = await proc_util.run_command(
-        cmd, cwd=str(run_dir), timeout=TRAIN_TIMEOUT_S, on_line=_on_line
-    )
+    try:
+        rc, output = await proc_util.run_command(
+            cmd, cwd=str(run_dir), timeout=TRAIN_TIMEOUT_S, on_line=_on_line
+        )
+    except BaseException:
+        # 超时/取消：run_command 不会返回完整输出 → 把**已收到**的行落盘，否则训练日志全丢、
+        # 失败记录只剩一句超时（实测：跑了一小时的训练连一行都没留下，无从判断卡在哪）。
+        if captured:
+            log_path.write_text("".join(captured), encoding="utf-8", errors="replace")
+        raise
     log_path.write_text(output, encoding="utf-8", errors="replace")
     if rc != 0:
         raise RuntimeError(f"训练脚本失败（退出码 {rc}）：{output[-800:]}")
@@ -569,7 +678,7 @@ async def _run_autotune(params: dict, task_id: str) -> None:
     run_dir = ws / "runs" / task_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "model.py").write_text(code, encoding="utf-8")
-    shutil.copyfile(Path(__file__).resolve().parents[2] / "templates" / "train.py", run_dir / "train.py")
+    shutil.copyfile(resource_path("backend/templates/train.py"), run_dir / "train.py")
 
     results: list[dict] = []
     for i, cand in enumerate(candidates, 1):

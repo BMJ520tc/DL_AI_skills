@@ -6,17 +6,16 @@
 import asyncio
 import hashlib
 import json
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.config import DATASETS_DIR, PROJECT_ROOT
+from app.config import DATASETS_DIR, resource_path, script_command
 from app.services import proc_util
 from app.services import agent_service, knowledge_service, project_manager, task_manager
 
 TASK_TYPE = "preprocess"
-PREPROCESS_SCRIPT = PROJECT_ROOT / "scripts" / "preprocess_dataset.py"
+PREPROCESS_SCRIPT = resource_path("scripts/preprocess_dataset.py")
 
 MAP_SCHEMA = {
     "type": "object",
@@ -97,10 +96,10 @@ def _resolve_dirs(params: dict, task_id: str) -> tuple[Path, Path, str]:
 
 
 async def _run_script(input_path: str, out_dir: Path, name: str, task_type: str) -> dict:
-    cmd = [
-        sys.executable, str(PREPROCESS_SCRIPT), input_path, str(out_dir),
+    cmd = script_command(
+        PREPROCESS_SCRIPT, input_path, out_dir,
         "--dataset-name", name, "--task-type", task_type,
-    ]
+    )
     rc, raw = await proc_util.run_command(cmd, timeout=900)
     stdout = (raw or "").strip()
     if not stdout:

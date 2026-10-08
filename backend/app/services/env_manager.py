@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.config import CONDA_PATH, ENV_VENV_PYTHON, PIP_FALLBACK_INDEX, PIP_INDEX_URL, project_env_dir
+from app.config import CONDA_PATH, ENV_VENV_PYTHON, IS_FROZEN, PIP_FALLBACK_INDEX, PIP_INDEX_URL, project_env_dir
 from app.services import agent_service, knowledge_service, long_paths, proc_util, project_manager, prompts, task_manager
 
 ENV_TASK_TYPE = "env_create"
@@ -604,11 +604,12 @@ async def _install_with_fix(
                                  versions, project_id, task_id, env_type, _report)
 
 
-def _env_python(env_dir: Path) -> str:
+def _env_python(env_dir: Path) -> Optional[str]:
     for c in (env_dir / "Scripts" / "python.exe", env_dir / "python.exe", env_dir / "bin" / "python"):
         if c.exists():
             return str(c)
-    return sys.executable
+    # 冻结形态没有独立的后端解释器（sys.executable 是 exe 本身），找不到就交回 None。
+    return None if IS_FROZEN else sys.executable
 
 
 def _env_pip(env_dir: Path) -> str:
@@ -979,12 +980,23 @@ def resolve_env_python(source: Path) -> tuple[list[str], dict]:
                     f"{req['spec']}（{req['source']}）；仍按显式配置使用，依赖可能装不上"
                 )
         return [ENV_VENV_PYTHON], note
+    # 冻结（打包）形态没有「后端自身解释器」——`sys.executable` 是 exe 本身，拿去 `-m venv`
+    # 会被当成启动器再起一个服务。此时一律走本机探测到的 python（学生自装）。
+    backend_cmd = None if IS_FROZEN else [sys.executable]
     if req is None:
-        note.update(command=[sys.executable], origin="backend", matched=True)
-        return [sys.executable], note
-    if _constraint_ok(host, req["spec"]):
-        note.update(command=[sys.executable], origin="backend", matched=True, version=host)
-        return [sys.executable], note
+        if backend_cmd:
+            note.update(command=backend_cmd, origin="backend", matched=True)
+            return backend_cmd, note
+        exe = shutil.which("python") or shutil.which("py")
+        if exe:
+            note.update(command=[exe], origin="detected", matched=True)
+            return [exe], note
+        note.update(command=["python"], origin="fallback", matched=False,
+                    warning="打包形态未自带 Python：请安装 Python 3.10+（勾选 Add to PATH）后再建环境")
+        return ["python"], note
+    if backend_cmd and _constraint_ok(host, req["spec"]):
+        note.update(command=backend_cmd, origin="backend", matched=True, version=host)
+        return backend_cmd, note
     for candidate in _iter_python_interpreter_cmds(req["spec"]):
         exe = shutil.which(candidate[0])
         if exe is None:
@@ -994,11 +1006,17 @@ def resolve_env_python(source: Path) -> tuple[list[str], dict]:
         if ver and _constraint_ok(ver, req["spec"]):
             note.update(command=cmd, origin="detected", matched=True, version=ver)
             return cmd, note
-    note.update(command=[sys.executable], origin="fallback", matched=False,
+    if backend_cmd:
+        note.update(command=backend_cmd, origin="fallback", matched=False,
+                    warning=(f"清单要求 Python {req['spec']}（{req['source']}），但本机未找到满足要求的解释器"
+                             f"（候选 pythonX.Y / py -X.Y 均不可用）→ 回退后端解释器 {backend_cmd[0]}（{host}），"
+                             "依赖可能装不上；请安装匹配解释器或设 ENV_VENV_PYTHON"))
+        return backend_cmd, note
+    note.update(command=["python"], origin="fallback", matched=False,
                 warning=(f"清单要求 Python {req['spec']}（{req['source']}），但本机未找到满足要求的解释器"
-                         f"（候选 pythonX.Y / py -X.Y 均不可用）→ 回退默认解释器 {sys.executable}（{host}），"
-                         "依赖可能装不上；请安装匹配解释器或设 ENV_VENV_PYTHON"))
-    return [sys.executable], note
+                         "（候选 pythonX.Y / py -X.Y 均不可用），且打包形态未自带 Python → 请安装 Python "
+                         f"{req['spec']}（勾选 Add to PATH）或设 ENV_VENV_PYTHON"))
+    return ["python"], note
 
 
 def _framework_from_line(line: str) -> Optional[str]:

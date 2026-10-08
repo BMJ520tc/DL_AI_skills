@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from app.config import MODULES_DIR, PROJECT_ROOT
+from app.config import MODULES_DIR, resource_path
 from app.services import (
     agent_service, analysis_service, ir_codegen, ir_graphir, ir_schema,
     knowledge_service, proc_util, project_manager, task_manager, version_service,
@@ -46,10 +46,10 @@ TASK_TRACE = "decompose_trace"
 TASK_VERIFY = "decompose_verify"
 TASK_INGEST = "module_ingest"
 
-TRACE_SCRIPT = PROJECT_ROOT / "scripts" / "trace_shapes.py"
-VERIFY_SCRIPT = PROJECT_ROOT / "scripts" / "verify_decompose.py"
-FIDELITY_SCRIPT = PROJECT_ROOT / "scripts" / "ir_fidelity_probe.py"
-TRACE_IR_SCRIPT = PROJECT_ROOT / "scripts" / "trace_ir.py"
+TRACE_SCRIPT = resource_path("scripts/trace_shapes.py")
+VERIFY_SCRIPT = resource_path("scripts/verify_decompose.py")
+FIDELITY_SCRIPT = resource_path("scripts/ir_fidelity_probe.py")
+TRACE_IR_SCRIPT = resource_path("scripts/trace_ir.py")
 
 # 数值比对阈值（实施约定；仿 REPRO_DEVIATION_* 环境变量覆盖先例）
 DECOMPOSE_NUM_RTOL = float(os.getenv("DECOMPOSE_NUM_RTOL", "1e-5"))
@@ -1236,7 +1236,7 @@ async def _run_decompose(params: dict, task_id: str) -> None:
     prev_reason_sig = ""                 # 上一次失败原因的归一化签名（无进展守卫用）
     stalled = 0
 
-    # **追踪优先**（开关默认关，`DECOMPOSE_TRACE_IR=1` 启用）：第 1 次尝试先用**真实追踪**产出的 IR。
+    # **追踪优先**（开关默认开 `DECOMPOSE_TRACE_IR=1`，置 0 关闭）：第 1 次尝试先用**真实追踪**产出的 IR。
     # 它照样要过下面**同一条**校验链（结构 / inputs 形态 / 再生成自检 / 用户补参 / 保真度自检）；
     # 任何一步不过、或追踪不可用（环境/形状/脚本），就记下原因回退 agent。
     if DECOMPOSE_TRACE_IR:

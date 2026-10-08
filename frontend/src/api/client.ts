@@ -788,11 +788,28 @@ export const getProjectEnvStatus = (projectId: string) =>
 // 画布网络（阶段4 4c，模块详细设计 7.5）
 // ---------------------------------------------------------------------------
 
+/** 单个数据集的预处理产物摘要（后端 network_service._dataset_digest）——判断「选对没」。 */
+export interface DatasetDigest {
+    rows: number | null;
+    split_counts: Record<string, number>;
+    /** 喂给模型的列（去掉 id/split/label 与 meta_*） */
+    input_columns: string[];
+    n_classes: number | null;
+    label_values: string[];
+    /** numeric=数值；path=文件路径（图像/影像类，当前训练模板不支持） */
+    input_kind: "numeric" | "path" | "unknown";
+}
+
 export interface NetworkRunOptions {
     parent_project_id: string | null;
     parent_name: string | null;
     environments: Array<{ project_id: string; name: string; python: string }>;
-    datasets: Array<{ dataset_id: string; name: string | null; task_type: string | null; local_path: string | null }>;
+    datasets: Array<{
+        dataset_id: string; name: string | null; task_type: string | null;
+        local_path: string | null; digest?: DatasetDigest;
+    }>;
+    /** 模型侧输入契约（导出该图取回 MODEL_INPUTS）：训练模板按这些列名读数据。 */
+    model_inputs?: Array<{ name: string; dtype: string }> | null;
 }
 
 export interface NetworkRunRecord {

@@ -12,14 +12,13 @@ import asyncio
 import os
 import time
 import uuid
-from pathlib import Path
 from typing import Optional
 
-from app.config import BACKEND_DIR, DATA_DIR
+from app.config import DATA_DIR, resource_path
 from app.services import agent_service, project_manager, task_manager
 
 TASK_TYPE = "assistant_chat"
-REPO_ROOT = Path(BACKEND_DIR).parent
+REPO_ROOT = resource_path(".")
 
 # 只读模式的工具集（写模式 = agent_service.DEFAULT_ALLOWED_TOOLS 满工具）
 READ_TOOLS = ["Read", "Glob", "Grep"]

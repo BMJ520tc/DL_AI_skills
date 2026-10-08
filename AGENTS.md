@@ -57,7 +57,7 @@ Python 的 FastAPI）。`agents/prompts/` 里是交给大模型的任务提示�
 ```powershell
 # 解释器：D:\python.exe（本机后端解释器，Python 3.13.6，后端依赖 + torch 2.13.0+cpu/uvicorn/websockets 齐全）；
 # 若换到没有 D:\python.exe 的机器，把下文的 D:\python.exe 换成该机的后端环境解释器（如项目内虚拟环境）。
-#   后端自动化用例（当前 368 个，全部通过；用 `D:\python.exe -m pytest -o addopts="" -p no:cacheprovider` 可核对，
+#   后端自动化用例（当前 617 个，全部通过；用 `D:\python.exe -m pytest -o addopts="" -p no:cacheprovider` 可核对，
 #   注意 pytest.ini 里有 addopts=-q，命令行再给 -q 会变成 -qq 而不打印统计行）
 D:\python.exe scripts/run_tests.py
 
@@ -76,6 +76,11 @@ D:\python.exe scripts/ui_check_4d2.py
 #   注意：`m4_acceptance.py` 每次会**清空自己的工作区**，若 venv_smoke 是指向该工作区里环境的
 #   目录联接，跑完 m4 就会失效（4c 会明确报 FATAL）——重跑 4c 前把联接重建一次即可
 #   加 --headful 用**可见** Edge 窗口跑（人眼核），并把截图落到 data/_acceptance/shots/
+#   另有 ui_check_5a.py（阶段5 检索/带入/蒸馏面板）；ui_check_6a.py 只认 UI_CHECK_BACKEND_PORT / UI_CHECK_CDP_PORT
+#   其余阶段验收/联调脚本：m6_acceptance.py / m7_acceptance.py（真实环境 + 凭证）、
+#   m8_acceptance.py（**连真实后端 :8000**，6.1/6.2/6.3 三条联调链）、arch_acceptance.py（架构级建议，需凭证）
+#   拆解保真度脚本（在项目环境里跑、非后端代码）：trace_structure.py（真实结构真相）、
+#   trace_ir.py（由真实追踪生成 IR）、module_ctors_check.py（构造契约校验）
 
 # M4/M5 脚本化验收（19/19 通过；严口径——用真实入库模块 + env_manager 真建环境，首跑含装 torch
 #   约 5～10 分钟；产物保留在 data/_acceptance/m4_acceptance/，其中项目 git 仓库 git log 即 M5 版本证据）
@@ -98,6 +103,11 @@ cd backend; $env:PIP_INDEX_URL="https://mirrors.cloud.tencent.com/pypi/simple"; 
 
 # 一键启动（阶段6 便携形态 start.bat：自检 Python（优先项目内虚拟环境 backend\.venv / 本机 D:\python.exe）/后端依赖/前端产物/端口 → 后端同源服务前端 → 开浏览器）
 start.bat
+
+# 打包产物（6.6-b PyInstaller onedir → zip；先装一次 pyinstaller：D:\python.exe -m pip install pyinstaller）
+powershell -ExecutionPolicy Bypass -File packaging/build.ps1 -Version 0.1.0   # 产物落 D:\releases\DL-AI-skills-0.1.0-win64.zip
+#   自检打包产物（解压 zip → 干净环境起 exe → 同源/首启断言）：D:\python.exe scripts/ui_check_6b.py [zip路径] [--headful]
+#   直接跑打包结果（开发调试）：dist\DL-AI-skills\DL-AI-skills.exe --no-browser  （打印 SERVING http://127.0.0.1:<port>）
 ```
 
 ## 五、现在到哪一步了
@@ -173,7 +183,7 @@ ir 与标准节点混拼不支持、容器通道未实现、单位归一误判�
 （新增开发项）。实施落**阶段6 新增任务 6.6**。
 
 下一步：阶段6（联调与验收，M8；含 6.6 一键封装实施）——《阶段6实施方案》v1.1 已评审通过
-（K1～K3 已裁决），按方案开工（6.6-a → 6.1 → 6.2 → 6.3 → 6.4 → 6.6-b → 6.5）。
+（K1～K3 已裁决，现已推进至 v1.8），按方案开工（6.6-a → 6.1 → 6.2 → 6.3 → 6.4 → 6.6-b → 6.5）。
 本地主干与 BMJ520tc 远端同步；fork 远端待同步；推送交用户用图形客户端。
 
 **阶段6 进展（2026-10-05）**：6.6-a 一键启动、6.1/6.2/6.3 三条联调链（`scripts/m8_acceptance.py` **33/33**）、
@@ -236,6 +246,24 @@ API：`POST /arch-suggest`、`GET /arch-suggestions[/{task_id}]`、`POST /arch-a
 条目 `hyperparams`/`baselines` 的 **JSON 文本列在复现边界解码成对象**（否则脚本按对象取值崩）。
 **坑**：`reproduction_result.run_id` 是**运行** id 不是**任务** id，按它比绑定里的 `last_task_id` 永远比不中
 （要经 `run_record.task_id` 反查）。
+
+**一键封装 6.6-b（2026-10-08，未提交）**：PyInstaller **onedir 冻结 → zip**，**内置 `claude.exe`**（学生端无需自装
+Node/claude）。`config.resource_path`/`script_command` 统一冻结路径与 **exe 自派发**（`--run-py`/`--mcp-knowledge`）；
+`packaging/{DL-AI-skills.spec, launcher.py, build.ps1}`（入口自选空闲端口、首启数据目录迁移提示、就绪自检）；
+前端按 `VITE_API_BASE_URL="/"` **同源构建**（任意端口可用）；`scripts/ui_check_6b.py` 干净环境 **14/14**。产物
+`D:\releases\DL-AI-skills-0.1.0-win64.zip`（≈177.5 MiB，不进库）。**阶段6 至此只剩 6.5（四份文档升 v2.0）**。
+
+**运行面板与训练（2026-10-07，用户实测驱动，未提交）**：① **画布训练进度不再丢**——`NetworkRunPanel` 的
+`taskId` 原是组件本地 state，关面板/离开画布即丢（任务仍在跑、任务看板能看到）；现挂载时查
+`listTasks("board")` **接管**本项目活跃的 `network_train`/`network_autotune`。② **数据集摘要**——`run-options`
+每数据集补 `digest`（行数/划分/输入列/类别数/`input_kind`）与 `model_inputs` 契约（导出该图取回
+`MODEL_INPUTS`），前端给缺列/图像类 ⚠ 提示。③ **训练超时两级、由 env `TRAIN_TIMEOUT_S` 驱动**——脚本级
+`network_service.TRAIN_TIMEOUT_S`（默认 **10800s/3h**）**先到**，任务级 `TASK_TIMEOUTS["network_train"]`
+由它派生（+900s），`network_autotune` ×候选数；`task_manager._execute` 改用 `asyncio.wait` 区分「脚本级/
+任务级」两种超时（此前把 handler 自抛的脚本级超时误报成没到过的任务级上限、`run_record.error` 还是空串）。
+④ **长任务可观测**——`proc_util` 在用了 `on_line` 时给子进程设 `PYTHONUNBUFFERED=1`（否则块缓冲、逐行进度
+全空），超时/取消也落盘已收到的 `train.log`。⑤ 训练模板 **BatchNorm 单样本崩溃**修复（选输出头探针与训练
+尾批走 `eval()`）；**改 `templates/train.py` 不需重启后端**（训练时才读盘拷贝进 run 目录）。
 
 **普适性（2026-10-06，`cfeb1a0`）**：拿 **boltz** 实测「换任意仓库还成不成立」，为「真实追踪」补了两类
 **仓库外知识**，都做成**约定脚本 + agent 自动生成 + 可手改**：

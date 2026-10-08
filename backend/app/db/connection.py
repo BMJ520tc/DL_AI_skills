@@ -1,10 +1,9 @@
 """SQLite 连接与 schema 初始化。"""
 import sqlite3
-from pathlib import Path
 
-from app.config import DB_PATH
+from app.config import DB_PATH, resource_path
 
-_SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+_SCHEMA_PATH = resource_path("backend/app/db/schema.sql")
 
 
 def get_connection() -> sqlite3.Connection:

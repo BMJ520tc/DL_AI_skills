@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 
-from app.config import DATA_DIR
+from app.config import DATA_DIR, DEFAULT_ANTHROPIC_BASE_URL
 
 # 凭证文件里允许的字段；api_key 为空 = 未配置
 _ALLOWED = ("api_key", "base_url", "model", "small_model")
@@ -62,7 +62,7 @@ def status() -> dict:
             "configured": True,
             "source": "file",
             "key_mask": "***" + key[-4:] if len(key) > 4 else "***",
-            "base_url": data.get("base_url") or None,
+            "base_url": data.get("base_url") or DEFAULT_ANTHROPIC_BASE_URL,
             "model": data.get("model") or None,
             "small_model": data.get("small_model") or None,
         }
@@ -95,8 +95,8 @@ def apply_credentials_env() -> dict:
     if not data.get("api_key"):
         return {}
     os.environ["ANTHROPIC_API_KEY"] = data["api_key"]
-    if data.get("base_url"):
-        os.environ["ANTHROPIC_BASE_URL"] = data["base_url"]
+    # 留空即用缺省端点（DeepSeek 的 Anthropic 兼容端点），否则 CLI 会打 api.anthropic.com → DeepSeek key 401。
+    os.environ["ANTHROPIC_BASE_URL"] = data.get("base_url") or DEFAULT_ANTHROPIC_BASE_URL
     if data.get("model"):
         os.environ["ANTHROPIC_DEFAULT_MODEL"] = data["model"]
     if data.get("small_model"):

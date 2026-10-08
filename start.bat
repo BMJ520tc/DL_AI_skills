@@ -68,6 +68,9 @@ echo 正在启动后端（端口 %PORT%，Ctrl+C 或关闭本窗口即停止）...
 rem 延迟 2 秒后打开浏览器，避免后端未就绪页面空白
 start "" /b cmd /c "ping -n 3 127.0.0.1 >nul & start http://127.0.0.1:%PORT%"
 
+rem --- 4.1 启动就绪自检（等后端起来后打印 git/Python/conda/claude CLI/凭证 摘要，与开浏览器并行） ---
+start "" /b "%PY%" "%~dp0scripts\startup_check.py" "http://127.0.0.1:%PORT%"
+
 cd backend
 "%PY%" -m uvicorn app.main:app --host 127.0.0.1 --port %PORT%
 

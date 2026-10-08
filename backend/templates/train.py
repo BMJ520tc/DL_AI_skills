@@ -318,7 +318,11 @@ def main() -> None:
     else:
         print("[info] device=cpu（无可用 CUDA：装的是 CPU 版 torch 或本机没有 GPU）")
     model = GeneratedModel().to(device)
-    # 先探一次输出、选定输出头：多输出头模型按形状匹配选（选不出即明确报错，不猜）
+    # 先探一次输出、选定输出头：多输出头模型按形状匹配选（选不出即明确报错，不猜）。
+    # **必须 eval 模式**：探针只用 1 个样本，而含 BatchNorm 的模型在 train 模式下 batch=1 会直接抛
+    # `Expected more than 1 value per channel when training`（实测 GEARS 模块里的 BatchNorm1d）。
+    # eval 下 BN 用滑动统计，单样本可跑；选头只看形状，不受 eval 影响。
+    model.eval()
     with torch.no_grad():
         probe_xb, _ = make_batch((train_idx or [0])[:1], xs, dtypes, y, device)
         head_idx, head_kind = pick_output(model(*probe_xb), mode, num_classes)
@@ -338,10 +342,18 @@ def main() -> None:
         for start in range(0, len(order), batch_size):
             batch_idx = order[start:start + batch_size]
             xb, yb = make_batch(batch_idx, xs, dtypes, y, device)
+            # 尾批只剩 1 个样本时，含 BatchNorm 的模型在 train 模式会抛
+            # `Expected more than 1 value per channel`（BN 训练需要 >1 值/通道）→ 该批改走 eval
+            # （用滑动统计），跑完恢复 train。不丢样本、也不改其余批的行为。
+            single = len(batch_idx) < 2
+            if single:
+                model.eval()
             optimizer.zero_grad()
             loss = _loss_of(model(*xb), yb, head_idx, head_kind, mode, criterion)
             loss.backward()
             optimizer.step()
+            if single:
+                model.train()
             total += float(loss.item()) * len(batch_idx)
             count += len(batch_idx)
         last_loss = total / max(count, 1)

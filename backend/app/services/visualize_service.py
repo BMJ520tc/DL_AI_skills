@@ -11,20 +11,19 @@
 """
 import asyncio
 import json
-import sys
 from pathlib import Path
 
-from app.config import PROJECT_ROOT
+from app.config import resource_path, script_command
 from app.services import proc_util
 from app.contracts import ordered_metrics
 from app.services import knowledge_service, project_manager
 
 SCRIPTS = {
-    "performance": PROJECT_ROOT / "scripts" / "visualize_performance.py",
-    "error_dist": PROJECT_ROOT / "scripts" / "visualize_error_dist.py",
-    "cases": PROJECT_ROOT / "scripts" / "visualize_cases.py",
+    "performance": resource_path("scripts/visualize_performance.py"),
+    "error_dist": resource_path("scripts/visualize_error_dist.py"),
+    "cases": resource_path("scripts/visualize_cases.py"),
 }
-ECHARTS_PATH = PROJECT_ROOT / "backend" / "app" / "vendor" / "echarts.min.js"
+ECHARTS_PATH = resource_path("backend/app/vendor/echarts.min.js")
 
 MAX_CASES = 24
 MAX_SCATTER = 500
@@ -297,7 +296,7 @@ async def run(project_id: str, chart_type: str) -> dict:
     input_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     html_path = out_dir / f"{chart_type}.html"
-    cmd = [sys.executable, str(SCRIPTS[chart_type]), str(input_json), str(html_path), str(ECHARTS_PATH)]
+    cmd = script_command(SCRIPTS[chart_type], input_json, html_path, ECHARTS_PATH)
     try:
         rc, out = await proc_util.run_command(cmd, timeout=300)
     except asyncio.TimeoutError:

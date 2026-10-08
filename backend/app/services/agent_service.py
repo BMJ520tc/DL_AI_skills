@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -22,7 +23,7 @@ from claude_agent_sdk import (
     query,
 )
 
-from app.config import AGENT_TASKS_DIR, BACKEND_DIR, CLAUDE_CLI_PATH, DEFAULT_MODEL
+from app.config import AGENT_TASKS_DIR, BACKEND_DIR, CLAUDE_CLI_PATH, DEFAULT_MODEL, IS_FROZEN
 from app.ids import safe_id
 from app.services import task_manager
 
@@ -269,19 +270,19 @@ def _knowledge_mcp(session_key: Optional[str] = None, mode: Optional[str] = None
     `ASSISTANT_SESSION_KEY` 经 HTTP 回环向后端请求用户确认，`ASSISTANT_MODE` 决定是否
     暴露动作工具（只读模式不给）。
     """
-    env = {"PYTHONPATH": str(BACKEND_DIR)}
+    env = {}
     if session_key:
         env["ASSISTANT_SESSION_KEY"] = session_key
         env["ASSISTANT_MODE"] = mode or "read"
         env["DL_AI_BACKEND_URL"] = BACKEND_SELF_URL
-    return {
-        "knowledge": {
-            "type": "stdio",
-            "command": "python",
-            "args": ["-m", "app.mcp.knowledge_mcp"],
-            "env": env,
-        }
-    }
+    if IS_FROZEN:
+        # 冻结形态：机器上无独立 python、也无 `app` 包路径 —— 让 exe 自己当 MCP server
+        # （launcher 识别 `--mcp-knowledge` 跑 stdio 主循环）。
+        command = {"command": sys.executable, "args": ["--mcp-knowledge"], "env": env}
+    else:
+        env["PYTHONPATH"] = str(BACKEND_DIR)
+        command = {"command": "python", "args": ["-m", "app.mcp.knowledge_mcp"], "env": env}
+    return {"knowledge": {"type": "stdio", **command}}
 
 
 def _build_options(params: dict) -> ClaudeAgentOptions:
